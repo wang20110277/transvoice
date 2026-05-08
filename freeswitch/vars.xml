@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <profiles>
+    <profile name="internal">
+      <!-- 全局变量 -->
+      <variables>
+        <!-- SIP 配置 -->
+        <variable name="local_ip" value="10.0.0.10"/>
+        <variable name="external_rtp_ip" value="10.0.0.10"/>
+        <variable name="external_sip_ip" value="10.0.0.10"/>
+
+        <!-- 端口配置 -->
+        <variable name="sip_port" value="5060"/>
+        <variable name="rtp_start" value="16384"/>
+        <variable name="rtp_end" value="32768"/>
+
+        <!-- 编码优先级（G711优先，Opus备选） -->
+        <variable name=".codec" value="OPUS,G711U,G711A,PCMU,PCMA"/>
+
+        <!-- 全局超时设置 -->
+        <variable name="call_timeout" value="300"/>
+        <variable name="max_session_time" value="7200"/>
+
+        <!-- 录音配置 -->
+        <variable name="record_path" value="/nas/rec"/>
+        <variable name="record_format" value="wav"/>
+
+        <!-- MRCP 配置 -->
+        <variable name="unimrcp_profiles" value="asr_default_v1,tts_customer_service_v1,tts_collection_v1,tts_marketing_v1"/>
+
+        <!-- 业务变量默认值 -->
+        <variable name="biz_type" value=""/>
+        <variable name="task_id" value=""/>
+        <variable name="core_user_id" value=""/>
+        <variable name="user_key" value=""/>
+        <variable name="phone_hash" value=""/>
+        <variable name="phone_masked" value=""/>
+
+        <!-- 转接目标（内部分机） -->
+        <variable name="handoff_extension" value="1001"/>
+
+        <!-- 录音告知文件路径 -->
+        <variable name="legal_notice_file" value="/usr/local/freeswitch/sounds/legal_notice.wav"/>
+      </variables>
+    </profile>
+  </profiles>
+</configuration>

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <!-- ESL (Event Socket Layer) 配置 -->
+  <!-- 对接 Orchestrator Python 服务 -->
+
+  <settings>
+    <!-- 监听地址与端口 -->
+    <param name="listen-ip" value="127.0.0.1"/>
+    <param name="listen-port" value="8021"/>
+
+    <!-- 密码认证（生产环境必须修改） -->
+    <param name="password" value="ClueCon"/>
+
+    <!-- 允许的 IP 白名单（仅内网） -->
+    <param name="acl" value="127.0.0.1/32,10.0.0.0/24"/>
+
+    <!-- 事件格式：plain | json -->
+    <param name="format" value="json"/>
+
+    <!-- 事件过滤（按需订阅，减少带宽） -->
+    <!-- CHANNEL_* 通话生命周期 -->
+    <!-- DETECTED_SPEECH ASR 识别结果 -->
+    <!-- PLAYBACK_* TTS 播放状态 -->
+    <!-- RECORD_* 录音状态 -->
+    <param name="events" value="CHANNEL_CREATE,CHANNEL_ANSWER,CHANNEL_HANGUP,CHANNEL_HANGUP_COMPLETE,DETECTED_SPEECH,PLAYBACK_START,PLAYBACK_STOP,RECORD_START,RECORD_STOP,RECORD_COMPLETE"/>
+
+    <!-- 连接超时（秒） -->
+    <param name="timeout" value="30"/>
+
+    <!-- 自动重连 -->
+    <param name="reconnect" value="true"/>
+    <param name="reconnect-interval" value="5"/>
+  </settings>
+
+  <!-- 详细说明 -->
+  <!-- 1. 监听 IP 必须为内网地址，禁止监听 0.0.0.0 -->
+  <!-- 2. 密码生产环境必须修改为强密码 -->
+  <!-- 3. ACL 仅允许 Orchestrator 所在服务器 IP -->
+  <!-- 4. events 参数控制订阅的事件类型，按需调整 -->
+  <!-- 5. JSON 格式便于 Orchestrator 解析 -->
+</configuration>

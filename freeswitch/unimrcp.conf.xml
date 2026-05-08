@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <!-- UniMRCP 客户端配置 -->
+  <!-- 对接 UniMRCP Server (MRCPv2) -->
+
+  <profiles>
+    <!-- ============ ASR Profile ============ -->
+    <profile name="asr_default_v1" version="1">
+      <!-- MRCP 服务器地址 -->
+      <param name="server-ip" value="127.0.0.1"/>
+      <param name="server-port" value="8060"/>
+
+      <!-- 信令超时 -->
+      <param name="invite-timeout" value="30"/>
+      <param name="teardown-timeout" value="10"/>
+
+      <!-- 媒体配置 -->
+      <param name="codecs" value="PCMU PCMA L16"/>
+
+      <!-- ASR 识别参数 -->
+      <param name="recognition-timeout" value="5000"/>      <!-- 5秒静默超时 -->
+      <param name="start-input-timers" value="true"/>
+      <param name="speech-complete-timeout" value="500"/>   <!-- 句子结束静默时长 -->
+      <param name="n-best-list-size" value="1"/>
+      <param name="confidence-threshold" value="0.5"/>
+
+      <!-- VAD 参数 -->
+      <param name="vad-mode" value="workable"/>
+
+      <!-- 实时回调（必须开启，ESL 才能收到 DETECTED_SPEECH） -->
+      <param name="speech-recog-interval" value="0"/>       <!-- 0=实时回调 -->
+
+      <!-- 资源名称（UniMRCP 端匹配） -->
+      <param name="resource-name" value="speech_recog"/>
+    </profile>
+
+    <!-- ============ TTS Profile: 客服 ============ -->
+    <profile name="tts_customer_service_v1" version="1">
+      <param name="server-ip" value="127.0.0.1"/>
+      <param name="server-port" value="8060"/>
+      <param name="invite-timeout" value="30"/>
+      <param name="teardown-timeout" value="10"/>
+      <param name="codecs" value="PCMU PCMA L16"/>
+
+      <!-- TTS 参数 -->
+      <param name="voice-gender" value="female"/>
+      <param name="voice-name" value="cs_female_soft_01"/>
+      <param name="speech-rate" value="0"/>       <!-- 0=正常语速 -->
+      <param name="pitch" value="0"/>
+      <param name="volume" value="0"/>
+
+      <!-- 资源名称 -->
+      <param name="resource-name" value="speech_synth"/>
+    </profile>
+
+    <!-- ============ TTS Profile: 催收 ============ -->
+    <profile name="tts_collection_v1" version="1">
+      <param name="server-ip" value="127.0.0.1"/>
+      <param name="server-port" value="8060"/>
+      <param name="invite-timeout" value="30"/>
+      <param name="teardown-timeout" value="10"/>
+      <param name="codecs" value="PCMU PCMA L16"/>
+
+      <!-- TTS 参数 -->
+      <param name="voice-gender" value="male"/>
+      <param name="voice-name" value="col_male_serious_01"/>
+      <param name="speech-rate" value="-1"/>      <!-- -1=稍慢 -->
+      <param name="pitch" value="-1"/>
+      <param name="volume" value="1"/>            <!-- +1dB -->
+
+      <!-- 资源名称 -->
+      <param name="resource-name" value="speech_synth"/>
+    </profile>
+
+    <!-- ============ TTS Profile: 营销 ============ -->
+    <profile name="tts_marketing_v1" version="1">
+      <param name="server-ip" value="127.0.0.1"/>
+      <param name="server-port" value="8060"/>
+      <param name="invite-timeout" value="30"/>
+      <param name="teardown-timeout" value="10"/>
+      <param name="codecs" value="PCMU PCMA L16"/>
+
+      <!-- TTS 参数 -->
+      <param name="voice-gender" value="female"/>
+      <param name="voice-name" value="mkt_female_lively_01"/>
+      <param name="speech-rate" value="1"/>       <!-- +1=稍快 -->
+      <param name="pitch" value="1"/>
+      <param name="volume" value="0"/>
+
+      <!-- 资源名称 -->
+      <param name="resource-name" value="speech_synth"/>
+    </profile>
+  </profiles>
+
+  <!-- 全局设置 -->
+  <settings>
+    <!-- 媒体线程数 -->
+    <param name="media-thread-count" value="4"/>
+
+    <!-- 录音文件临时目录 -->
+    <param name="rtp-dir" value="/tmp/unimrcp"/>
+
+    <!-- 日志级别 -->
+    <param name="log-level" value="WARNING"/>
+  </settings>
+</configuration>
