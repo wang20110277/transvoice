@@ -135,14 +135,14 @@ class EventDispatcher:
 
         state.turn_history = result.get("turn_history", state.turn_history)
 
-        if action.type in ("say", "ask"):
+        if action.action in ("say", "ask"):
             self.actions.stop_detect_speech(fs_uuid)
             self.actions.tts_speak(fs_uuid, state.biz_type, action.text)
             state.status = "listening"
             self.actions.start_detect_speech(fs_uuid)
-        elif action.type == "handoff":
+        elif action.action == "handoff":
             self.actions.transfer(fs_uuid)
-        elif action.type == "end":
+        elif action.action == "end":
             self.actions.hangup(fs_uuid)
 
     def handle_channel_hangup(self, event: dict):

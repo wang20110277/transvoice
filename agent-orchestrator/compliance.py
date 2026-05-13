@@ -32,7 +32,7 @@ def compliance_check(
 ) -> LLMAction:
     if biz_type == "marketing" and do_not_call:
         logger.warning("营销 do_not_call 拦截")
-        return LLMAction(type="end", text="抱歉打扰了，再见")
+        return LLMAction(action="end", text="抱歉打扰了，再见")
 
     if biz_type == "collection" and not identity_verified:
         if contains_sensitive_fields(action.text):

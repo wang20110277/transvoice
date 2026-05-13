@@ -88,7 +88,7 @@ async def llm_decide_node(state: CallGraphState) -> dict:
         action = await llm.chat_for_action([m.model_dump() for m in messages])
     except Exception as e:
         logger.error(f"[{state['fs_uuid']}] LLM 调用失败: {e}")
-        action = LLMAction(type="say", text=FALLBACK_ACTION_TEXT)
+        action = LLMAction(action="say", text=FALLBACK_ACTION_TEXT)
 
     return {"llm_action": action}
 
@@ -113,9 +113,9 @@ async def execute_action_node(state: CallGraphState) -> dict:
     if action:
         turn_history.append({"role": "assistant", "text": action.text})
 
-    if action and action.type in ("end", "handoff"):
+    if action and action.action in ("end", "handoff"):
         return {
-            "handoff_reason": action.intent if action.type == "handoff" else "",
+            "handoff_reason": action.intent if action.action == "handoff" else "",
             "turn_history": turn_history,
         }
     return {"turn_history": turn_history}
@@ -134,7 +134,7 @@ def route_after_llm(state: CallGraphState) -> str:
 
 def route_after_execute(state: CallGraphState) -> str:
     action = state.get("llm_action")
-    if action and action.type in ("end", "handoff"):
+    if action and action.action in ("end", "handoff"):
         return "finalize"
     return END
 

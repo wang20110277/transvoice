@@ -8,12 +8,11 @@ asyncpg>=0.29
 alembic>=1.13
 pgvector>=0.3
 
-# AI/LLM
-langchain>=0.3
-langchain-openai>=0.3
-langchain-community>=0.3
-langgraph>=1.2
-langgraph-checkpoint>=1.2
+# AI/LLM - LangChain 1.2 生态
+langchain>=1.2,<2.0
+langchain-core>=1.2,<2.0
+langchain-openai>=1.2,<2.0
+langgraph>=1.2,<2.0
 
 # FreeSWITCH
 python-ESL>=0.1
