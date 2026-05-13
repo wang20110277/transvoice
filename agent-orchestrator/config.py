@@ -1,41 +1,51 @@
-import os
-from dataclasses import dataclass, field
+"""应用配置 - 基于 pydantic-settings，支持环境变量覆盖"""
+from pydantic_settings import BaseSettings
+from pydantic import Field
 
 
-@dataclass
-class Settings:
+class Settings(BaseSettings):
+    """智能外呼系统配置"""
+
     # FreeSWITCH ESL
-    fs_esl_host: str = os.getenv("FS_ESL_HOST", "127.0.0.1")
-    fs_esl_port: int = int(os.getenv("FS_ESL_PORT", "8021"))
-    fs_esl_password: str = os.getenv("FS_ESL_PASSWORD", "ClueCon")
+    fs_esl_host: str = "127.0.0.1"
+    fs_esl_port: int = 8021
+    fs_esl_password: str = "ClueCon"
+
+    # PostgreSQL (异步驱动用 asyncpg)
+    pg_dsn: str = "postgresql+asyncpg://postgres@127.0.0.1:5432/callbot"
+    pg_pool_size: int = 10
+    pg_max_overflow: int = 20
 
     # Redis
-    redis_url: str = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
-
-    # PostgreSQL
-    pg_dsn: str = os.getenv("PG_DSN", "postgresql://postgres@127.0.0.1:5432/callbot")
+    redis_url: str = "redis://127.0.0.1:6379/0"
 
     # MinIO
-    minio_endpoint: str = os.getenv("MINIO_ENDPOINT", "127.0.0.1:9000")
-    minio_access_key: str = os.getenv("MINIO_ACCESS_KEY", "admin")
-    minio_secret_key: str = os.getenv("MINIO_SECRET_KEY", "changeme123")
+    minio_endpoint: str = "127.0.0.1:9000"
+    minio_access_key: str = "admin"
+    minio_secret_key: str = "changeme123"
 
     # 业务
-    biz_types: list = field(default_factory=lambda: ["customer_service", "collection", "marketing"])
-    handoff_extension: str = os.getenv("HANDOFF_EXTENSION", "1001")
-    legal_notice_file: str = os.getenv("LEGAL_NOTICE_FILE", "/usr/local/freeswitch/sounds/legal_notice.wav")
+    biz_types: list[str] = Field(
+        default=["customer_service", "collection", "marketing"]
+    )
+    handoff_extension: str = "1001"
+    legal_notice_file: str = "/usr/local/freeswitch/sounds/legal_notice.wav"
 
     # 超时
-    llm_timeout_sec: float = float(os.getenv("LLM_TIMEOUT_SEC", "3.0"))
-    silence_timeout_sec: int = int(os.getenv("SILENCE_TIMEOUT_SEC", "5"))
-    max_silence_count: int = int(os.getenv("MAX_SILENCE_COUNT", "3"))
+    llm_timeout_sec: float = 3.0
+    silence_timeout_sec: int = 5
+    max_silence_count: int = 3
 
     # LLM
-    llm_engine: str = os.getenv("LLM_ENGINE", "qwen")
-    llm_base_url: str = os.getenv("LLM_BASE_URL", "http://127.0.0.1:8080")
+    llm_engine: str = "qwen"
+    llm_base_url: str = "http://127.0.0.1:8080"
+    llm_model: str = "qwen3.5-9b"
+    llm_embedding_model: str = "text-embedding-v3"
 
     # MCP
-    mcp_server_url: str = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:9090")
+    mcp_server_url: str = "http://127.0.0.1:9090"
+
+    model_config = {"env_prefix": "CALLBOT_", "env_file": ".env", "extra": "ignore"}
 
 
 settings = Settings()
