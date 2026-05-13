@@ -11,7 +11,6 @@ from memory.assembler import MemoryAssembler
 
 logger = logging.getLogger(__name__)
 
-# 模块级单例（由 main.py 初始化时创建）
 _assembler: MemoryAssembler | None = None
 
 
@@ -37,22 +36,30 @@ class CallGraphState(TypedDict, total=False):
 
 
 async def recall_memory_node(state: CallGraphState) -> dict:
-    if _assembler is None:
+    try:
+        if _assembler is None:
+            return {"memory_block": ""}
+        memory_block = await _assembler.assemble(
+            biz_type=state["biz_type"],
+            user_key=state["user_key"],
+            user_input=state["user_input"],
+        )
+        return {"memory_block": memory_block}
+    except Exception as e:
+        logger.error(f"[{state.get('fs_uuid', '?')}] 记忆召回失败: {e}")
         return {"memory_block": ""}
-    memory_block = await _assembler.assemble(
-        biz_type=state["biz_type"],
-        user_key=state["user_key"],
-        user_input=state["user_input"],
-    )
-    return {"memory_block": memory_block}
 
 
 async def rag_retrieve_node(state: CallGraphState) -> dict:
-    scripts = await retrieve_scripts(
-        biz_type=state["biz_type"],
-        user_input=state["user_input"],
-    )
-    return {"rag_block": build_rag_block(scripts)}
+    try:
+        scripts = await retrieve_scripts(
+            biz_type=state["biz_type"],
+            user_input=state["user_input"],
+        )
+        return {"rag_block": build_rag_block(scripts)}
+    except Exception as e:
+        logger.error(f"[{state.get('fs_uuid', '?')}] RAG 检索失败: {e}")
+        return {"rag_block": ""}
 
 
 async def llm_decide_node(state: CallGraphState) -> dict:

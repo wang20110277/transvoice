@@ -1,5 +1,6 @@
 """事件分发器 - 异步 LangGraph 集成 + MCP 身份核验"""
 import asyncio
+import threading
 import time
 import logging
 from datetime import datetime
@@ -18,7 +19,10 @@ class EventDispatcher:
         self.actions = actions
         self.graph = graph
         self.mcp_client = mcp_client
+        # 创建并运行独立 asyncio 事件循环（后台线程）
         self._loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(target=self._loop.run_forever, daemon=True)
+        self._loop_thread.start()
 
     def dispatch(self, event: dict):
         event_name = event.get("Event-Name", "")
@@ -53,6 +57,7 @@ class EventDispatcher:
         state.phone_hash = event.get("variable_phone_hash", "")
         state.user_key = f"{state.core_user_id}:{state.phone_hash}" if state.core_user_id else ""
 
+        # MCP 身份核验（异步，5s 超时）
         if self.mcp_client and state.phone_hash:
             try:
                 identity = asyncio.run_coroutine_threadsafe(
@@ -101,7 +106,7 @@ class EventDispatcher:
         state.turn_count += 1
 
         try:
-            result = asyncio.run_coroutine_threadsafe(
+            future = asyncio.run_coroutine_threadsafe(
                 self.graph.ainvoke({
                     "fs_uuid": state.fs_uuid,
                     "biz_type": state.biz_type,
@@ -114,11 +119,12 @@ class EventDispatcher:
                     "identity_verified": state.identity_verified,
                     "do_not_call": False,
                     "turn_count": state.turn_count,
-                    "turn_history": state.turn_history if hasattr(state, 'turn_history') else [],
+                    "turn_history": state.turn_history,
                     "handoff_reason": "",
                 }),
                 self._loop,
-            ).result(timeout=settings.llm_timeout_sec * 3)
+            )
+            result = future.result(timeout=settings.llm_timeout_sec * 3)
         except Exception as e:
             logger.error(f"[{fs_uuid}] LangGraph 调用失败: {e}")
             return
@@ -127,8 +133,6 @@ class EventDispatcher:
         if not action:
             return
 
-        if not hasattr(state, 'turn_history'):
-            state.turn_history = []
         state.turn_history = result.get("turn_history", state.turn_history)
 
         if action.type in ("say", "ask"):

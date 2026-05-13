@@ -1,7 +1,10 @@
+import re
 import logging
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+_SAFE_TEXT_RE = re.compile(r'[^\w\s一-鿿，。！？、；：""''（）,.!?;:\-\d]')
 
 
 class TTSProfileMap:
@@ -47,7 +50,8 @@ class FSActions:
 
     def tts_speak(self, uuid: str, biz_type: str, text: str):
         profile = TTSProfileMap.get(biz_type)
-        self.conn.api(f"uuid_playback {uuid} say:{text}^^{profile}")
+        safe_text = _SAFE_TEXT_RE.sub('', text)[:200]
+        self.conn.api(f"uuid_playback {uuid} say:{safe_text}^^{profile}")
 
     def transfer(self, uuid: str, extension: str = None):
         ext = extension or settings.handoff_extension

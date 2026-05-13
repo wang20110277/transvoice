@@ -1,8 +1,8 @@
 """SQLAlchemy 2.0 ORM 模型 - 与 init_db.sql 精确对齐"""
 from datetime import datetime
 from sqlalchemy import (
-    BigInteger, Boolean, DateTime, Float, Integer, String, Text,
-    CheckConstraint, Index, UniqueConstraint,
+    BigInteger, Boolean, DateTime, Float, Integer, String, Text, func,
+    CheckConstraint, Index, UniqueConstraint, PrimaryKeyConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -17,6 +17,7 @@ class CallSession(Base):
     """通话会话事实表"""
     __tablename__ = "call_session"
     __table_args__ = (
+        PrimaryKeyConstraint("id", "user_id", name="pk_call_session"),
         CheckConstraint(
             "biz_type IN ('customer_service','collection','marketing')",
             name="ck_call_session_biz_type",
@@ -29,8 +30,8 @@ class CallSession(Base):
         {"schema": "callbot"},
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    user_id: Mapped[str] = mapped_column(Text, primary_key=True, nullable=False)
+    id: Mapped[int] = mapped_column(BigInteger, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(Text, nullable=False)
     call_id: Mapped[str] = mapped_column(UUID, nullable=False)
     fs_uuid: Mapped[str] = mapped_column(UUID, nullable=False)
     biz_type: Mapped[str] = mapped_column(Text, nullable=False)
@@ -45,9 +46,9 @@ class CallSession(Base):
     identity_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     verify_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     recording_notice_played: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now)
+    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     create_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
-    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now, onupdate=datetime.now)
+    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     update_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
 
 
@@ -55,6 +56,7 @@ class CallTurn(Base):
     """逐轮对话表"""
     __tablename__ = "call_turn"
     __table_args__ = (
+        PrimaryKeyConstraint("id", "user_id", name="pk_call_turn"),
         CheckConstraint(
             "role IN ('user','assistant','system','tool')",
             name="ck_call_turn_role",
@@ -65,8 +67,8 @@ class CallTurn(Base):
         {"schema": "callbot"},
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    user_id: Mapped[str] = mapped_column(Text, primary_key=True, nullable=False)
+    id: Mapped[int] = mapped_column(BigInteger, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(Text, nullable=False)
     call_id: Mapped[str] = mapped_column(UUID, nullable=False)
     fs_uuid: Mapped[str] = mapped_column(UUID, nullable=False)
     biz_type: Mapped[str] = mapped_column(Text, nullable=False)
@@ -76,10 +78,10 @@ class CallTurn(Base):
     asr_conf: Mapped[float | None] = mapped_column(Float)
     start_ms: Mapped[int | None] = mapped_column(Integer)
     end_ms: Mapped[int | None] = mapped_column(Integer)
-    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now)
-    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
+    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     create_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
-    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now, onupdate=datetime.now)
+    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     update_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
 
 
@@ -87,6 +89,7 @@ class CallEvent(Base):
     """事件流表"""
     __tablename__ = "call_event"
     __table_args__ = (
+        PrimaryKeyConstraint("id", "user_id", name="pk_call_event"),
         Index("ix_call_event_call", "call_id", "ts"),
         Index("ix_call_event_user_ts", "user_id", "ts"),
         Index("ix_call_event_user_biz_ts", "user_id", "biz_type", "ts"),
@@ -94,18 +97,18 @@ class CallEvent(Base):
         {"schema": "callbot"},
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    user_id: Mapped[str] = mapped_column(Text, primary_key=True, nullable=False)
+    id: Mapped[int] = mapped_column(BigInteger, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(Text, nullable=False)
     call_id: Mapped[str] = mapped_column(UUID, nullable=False)
     fs_uuid: Mapped[str] = mapped_column(UUID, nullable=False)
     biz_type: Mapped[str] = mapped_column(Text, nullable=False)
     user_key: Mapped[str] = mapped_column(Text, nullable=False)
     event_type: Mapped[str] = mapped_column(Text, nullable=False)
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now)
-    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
+    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     create_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
-    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now, onupdate=datetime.now)
+    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     update_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
 
 
@@ -113,6 +116,7 @@ class CallArtifact(Base):
     """录音/音频产物表"""
     __tablename__ = "call_artifact"
     __table_args__ = (
+        PrimaryKeyConstraint("id", "user_id", name="pk_call_artifact"),
         CheckConstraint("storage IN ('nas','minio')", name="ck_call_artifact_storage"),
         Index("ix_artifact_call", "call_id", "kind"),
         Index("ix_artifact_user_ts", "user_id", "ts"),
@@ -120,8 +124,8 @@ class CallArtifact(Base):
         {"schema": "callbot"},
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    user_id: Mapped[str] = mapped_column(Text, primary_key=True, nullable=False)
+    id: Mapped[int] = mapped_column(BigInteger, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(Text, nullable=False)
     call_id: Mapped[str] = mapped_column(UUID, nullable=False)
     fs_uuid: Mapped[str] = mapped_column(UUID, nullable=False)
     biz_type: Mapped[str] = mapped_column(Text, nullable=False)
@@ -132,10 +136,10 @@ class CallArtifact(Base):
     sha256: Mapped[str | None] = mapped_column(Text)
     size_bytes: Mapped[int | None] = mapped_column(BigInteger)
     content_type: Mapped[str | None] = mapped_column(Text)
-    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now)
-    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
+    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     create_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
-    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now, onupdate=datetime.now)
+    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     update_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
 
 
@@ -159,10 +163,10 @@ class ConfigSnapshot(Base):
     tts_profile_version: Mapped[str | None] = mapped_column(Text)
     dialplan_version: Mapped[str | None] = mapped_column(Text)
     snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now)
-    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
+    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     create_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
-    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now, onupdate=datetime.now)
+    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     update_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
 
 
@@ -170,26 +174,27 @@ class UserMemoryFact(Base):
     """结构化记忆表（mem0 facts）"""
     __tablename__ = "user_memory_fact"
     __table_args__ = (
+        PrimaryKeyConstraint("id", "user_id", name="pk_user_memory_fact"),
         Index("ix_mem_fact_user", "user_id", "fact_type"),
         Index("ix_mem_fact_user_biz", "user_id", "biz_type"),
         Index("ix_mem_fact_lastseen", "biz_type", "user_key", "last_seen_ts"),
         {"schema": "callbot"},
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    user_id: Mapped[str] = mapped_column(Text, primary_key=True, nullable=False)
+    id: Mapped[int] = mapped_column(BigInteger, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(Text, nullable=False)
     biz_type: Mapped[str] = mapped_column(Text, nullable=False)
     user_key: Mapped[str] = mapped_column(Text, nullable=False)
     fact_type: Mapped[str] = mapped_column(Text, nullable=False)
     fact_value: Mapped[dict] = mapped_column(JSONB, nullable=False)
     confidence: Mapped[float | None] = mapped_column(Float)
-    first_seen_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now)
-    last_seen_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now)
+    first_seen_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
+    last_seen_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
     source_call_id: Mapped[str | None] = mapped_column(UUID)
     expire_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now)
+    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     create_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
-    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now, onupdate=datetime.now)
+    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     update_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
 
 
@@ -197,13 +202,14 @@ class UserMemoryVector(Base):
     """向量记忆表（pgvector 语义检索）"""
     __tablename__ = "user_memory_vector"
     __table_args__ = (
+        PrimaryKeyConstraint("id", "user_id", name="pk_user_memory_vector"),
         Index("ix_mem_vec_user_ts", "user_id", "ts"),
         Index("ix_mem_vec_user_biz_ts", "user_id", "biz_type", "ts"),
         {"schema": "callbot"},
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    user_id: Mapped[str] = mapped_column(Text, primary_key=True, nullable=False)
+    id: Mapped[int] = mapped_column(BigInteger, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(Text, nullable=False)
     biz_type: Mapped[str] = mapped_column(Text, nullable=False)
     user_key: Mapped[str] = mapped_column(Text, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
@@ -211,10 +217,10 @@ class UserMemoryVector(Base):
     tags: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     source_call_id: Mapped[str | None] = mapped_column(UUID)
     source_turn_id: Mapped[int | None] = mapped_column(BigInteger)
-    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now)
-    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=func.now())
+    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     create_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
-    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now, onupdate=datetime.now)
+    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     update_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
 
 
@@ -237,7 +243,7 @@ class ScriptLibrary(Base):
     embedding = mapped_column(Vector(1536))
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now)
+    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     create_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
-    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.now, onupdate=datetime.now)
+    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     update_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
