@@ -101,14 +101,37 @@ class EventDispatcher:
         state.silence_count = 0
         state.turn_count += 1
 
-        # Phase 3: 规则引擎
-        reply = RULES.get(state.biz_type, DEFAULT_REPLY)
+        # LangGraph 流程
+        import asyncio
+        from graph_flow import create_call_graph
 
-        self.actions.stop_detect_speech(fs_uuid)
-        self.actions.tts_speak(fs_uuid, state.biz_type, reply)
+        graph = create_call_graph()
+        loop = asyncio.get_event_loop()
+        result = loop.run_until_complete(graph.ainvoke({
+            "fs_uuid": state.fs_uuid,
+            "biz_type": state.biz_type,
+            "user_key": state.user_key,
+            "user_input": speech_text,
+            "memory_block": "",
+            "rag_block": "",
+            "llm_action": None,
+            "identity_verified": state.identity_verified,
+            "turn_count": state.turn_count,
+            "handoff_reason": "",
+        }))
+        action = result.get("llm_action")
+        if not action:
+            return
 
-        state.status = "listening"
-        self.actions.start_detect_speech(fs_uuid)
+        if action.type in ("say", "ask"):
+            self.actions.stop_detect_speech(fs_uuid)
+            self.actions.tts_speak(fs_uuid, state.biz_type, action.text)
+            state.status = "listening"
+            self.actions.start_detect_speech(fs_uuid)
+        elif action.type == "handoff":
+            self.actions.transfer(fs_uuid)
+        elif action.type == "end":
+            self.actions.hangup(fs_uuid)
 
     def handle_channel_hangup(self, event: dict):
         fs_uuid = event["Unique-ID"]
