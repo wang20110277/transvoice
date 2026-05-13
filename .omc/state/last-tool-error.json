@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"ls /Users/lindaw/Documents/aiphone/agent-orchestrator/storage/ /Users/lindaw/Documents/aiphone/agent-orchestrator/memory/ /Users/lindaw/Documents/aiphone/agent-orchestrator/rag/ 2>&1\",\"des...",
-  "error": "Exit code 1\nls: /Users/lindaw/Documents/aiphone/agent-orchestrator/rag/: No such file or directory\n/Users/lindaw/Documents/aiphone/agent-orchestrator/memory/:\n__init__.py\nassembler.py\npg_facts.py\npg_vector.py\nredis_memory.py\n\n/Users/lindaw/Documents/aiphone/agent-orchestrator/storage/:\n__init__.py\ndb_pg.py",
-  "timestamp": "2026-05-13T09:06:27.815Z",
-  "retry_count": 1
-}
