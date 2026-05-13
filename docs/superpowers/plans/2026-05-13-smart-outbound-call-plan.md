@@ -23,53 +23,73 @@
 
 ```sql
 -- deploy/init_db.sql
-CREATE SCHEMA IF NOT EXISTS callbot;
-CREATE EXTENSION IF NOT EXISTS vector;
+-- 智能外呼系统 数据库初始化脚本
+-- Schema: callbot
+-- 依赖: PostgreSQL 17 + pgvector 扩展
 
--- 通话会话表
+-- ========================================
+-- 1. 创建 Schema 和扩展
+-- ========================================
+CREATE SCHEMA IF NOT EXISTS callbot;          -- 业务专属 schema
+CREATE EXTENSION IF NOT EXISTS vector;        -- pgvector 向量检索扩展
+
+-- ========================================
+-- 2. 通话会话表（事实主表）
+--    记录每通通话的完整生命周期
+-- ========================================
 CREATE TABLE IF NOT EXISTS callbot.call_session (
-  call_id            UUID PRIMARY KEY,
-  fs_uuid            UUID UNIQUE NOT NULL,
-  biz_type           TEXT NOT NULL CHECK (biz_type IN ('customer_service','collection','marketing')),
-  task_id            TEXT,
-  core_user_id       TEXT NOT NULL,
-  phone_hash         TEXT NOT NULL,
-  user_key           TEXT NOT NULL,
-  phone_masked       TEXT,
-  start_ts           TIMESTAMPTZ NOT NULL,
-  end_ts             TIMESTAMPTZ,
-  result_code        TEXT,
-  hangup_cause       TEXT,
-  identity_verified  BOOLEAN NOT NULL DEFAULT FALSE,
-  verify_attempts    INT NOT NULL DEFAULT 0,
-  recording_notice_played BOOLEAN NOT NULL DEFAULT FALSE,
-  created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+  call_id            UUID PRIMARY KEY,        -- 通话唯一标识（系统生成）
+  fs_uuid            UUID UNIQUE NOT NULL,    -- FreeSWITCH 会话唯一标识
+  biz_type           TEXT NOT NULL CHECK (biz_type IN ('customer_service','collection','marketing')),  -- 业务类型：客服/催收/营销
+  task_id            TEXT,                     -- 外呼任务 ID（来自任务调度系统）
+  core_user_id       TEXT NOT NULL,           -- 核心用户 ID（来自用户中心）
+  phone_hash         TEXT NOT NULL,           -- 手机号加盐哈希（不存明文）
+  user_key           TEXT NOT NULL,           -- 复合用户标识：core_user_id:phone_hash
+  phone_masked       TEXT,                     -- 脱敏手机号（如 138****1234）
+  start_ts           TIMESTAMPTZ NOT NULL,    -- 通话开始时间
+  end_ts             TIMESTAMPTZ,             -- 通话结束时间（挂断时更新）
+  result_code        TEXT,                     -- 通话结果编码（normal_end/user_busy/no_answer 等）
+  hangup_cause       TEXT,                     -- 挂机原因（对应 SIP Hangup-Cause）
+  identity_verified  BOOLEAN NOT NULL DEFAULT FALSE,  -- 身份核验是否通过
+  verify_attempts    INT NOT NULL DEFAULT 0,  -- 核验尝试次数
+  recording_notice_played BOOLEAN NOT NULL DEFAULT FALSE,  -- 录音告知是否已播放（合规关键）
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now()  -- 记录创建时间
 );
+
+-- 索引：按业务类型 + 用户 + 时间范围查询通话历史
 CREATE INDEX IF NOT EXISTS idx_call_session_biz_user_start
   ON callbot.call_session (biz_type, user_key, start_ts DESC);
+-- 索引：按任务维度查询通话记录
 CREATE INDEX IF NOT EXISTS idx_call_session_task_start
   ON callbot.call_session (biz_type, task_id, start_ts DESC);
 
--- 逐轮对话表（按月分区）
+-- ========================================
+-- 3. 逐轮对话表（按月分区）
+--    记录每通通话中的每一轮用户/助手交互
+-- ========================================
 CREATE TABLE IF NOT EXISTS callbot.call_turn (
-  turn_id        BIGSERIAL,
-  call_id        UUID NOT NULL,
-  fs_uuid        UUID NOT NULL,
-  biz_type       TEXT NOT NULL,
-  user_key       TEXT NOT NULL,
-  role           TEXT NOT NULL CHECK (role IN ('user','assistant','system','tool')),
-  text           TEXT,
-  asr_conf       REAL,
-  start_ms       INT,
-  end_ms         INT,
-  ts             TIMESTAMPTZ NOT NULL,
+  turn_id        BIGSERIAL,                   -- 轮次自增 ID
+  call_id        UUID NOT NULL,               -- 关联通话会话
+  fs_uuid        UUID NOT NULL,               -- FreeSWITCH 会话标识（便于排查）
+  biz_type       TEXT NOT NULL,               -- 业务类型（冗余，加速查询）
+  user_key       TEXT NOT NULL,               -- 复合用户标识
+  role           TEXT NOT NULL CHECK (role IN ('user','assistant','system','tool')),  -- 角色：用户/助手/系统/工具
+  text           TEXT,                         -- 对话文本内容
+  asr_conf       REAL,                         -- ASR 识别置信度（0.0~1.0）
+  start_ms       INT,                          -- 轮次开始毫秒偏移（相对通话开始）
+  end_ms         INT,                          -- 轮次结束毫秒偏移
+  ts             TIMESTAMPTZ NOT NULL,         -- 时间戳（分区键）
   PRIMARY KEY (turn_id, ts)
 ) PARTITION BY RANGE (ts);
+
+-- 索引：按通话维度查询所有轮次
 CREATE INDEX IF NOT EXISTS idx_call_turn_call
   ON callbot.call_turn (call_id, ts);
+-- 索引：按用户维度查询对话历史
 CREATE INDEX IF NOT EXISTS idx_call_turn_biz_user_ts
   ON callbot.call_turn (biz_type, user_key, ts DESC);
 
+-- 按月分区（示例：2026年5月、6月）
 CREATE TABLE IF NOT EXISTS callbot.call_turn_202605
   PARTITION OF callbot.call_turn
   FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
@@ -77,105 +97,139 @@ CREATE TABLE IF NOT EXISTS callbot.call_turn_202606
   PARTITION OF callbot.call_turn
   FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
 
--- 事件流表（按月分区）
+-- ========================================
+-- 4. 事件流表（按月分区）
+--    记录通话生命周期中的所有事件（状态变更、告警、动作等）
+-- ========================================
 CREATE TABLE IF NOT EXISTS callbot.call_event (
-  event_id      BIGSERIAL,
-  call_id       UUID NOT NULL,
-  fs_uuid       UUID NOT NULL,
-  biz_type      TEXT NOT NULL,
-  user_key      TEXT NOT NULL,
-  event_type    TEXT NOT NULL,
-  payload       JSONB NOT NULL DEFAULT '{}'::jsonb,
-  ts            TIMESTAMPTZ NOT NULL,
+  event_id      BIGSERIAL,                    -- 事件自增 ID
+  call_id       UUID NOT NULL,                -- 关联通话会话
+  fs_uuid       UUID NOT NULL,                -- FreeSWITCH 会话标识
+  biz_type      TEXT NOT NULL,                -- 业务类型
+  user_key      TEXT NOT NULL,                -- 复合用户标识
+  event_type    TEXT NOT NULL,                -- 事件类型（如 LEGAL_NOTICE_FAILED, HANDOFF, SENSITIVE_FIELD_BLOCKED）
+  payload       JSONB NOT NULL DEFAULT '{}'::jsonb,  -- 事件详情（JSON 格式，灵活扩展）
+  ts            TIMESTAMPTZ NOT NULL,         -- 事件时间戳（分区键）
   PRIMARY KEY (event_id, ts)
 ) PARTITION BY RANGE (ts);
+
+-- 索引：按通话维度查询事件流
 CREATE INDEX IF NOT EXISTS idx_call_event_call
   ON callbot.call_event (call_id, ts);
+-- 索引：按用户维度查询事件历史
 CREATE INDEX IF NOT EXISTS idx_call_event_biz_user_ts
   ON callbot.call_event (biz_type, user_key, ts DESC);
+-- 索引：按事件类型查询（用于告警统计）
+CREATE INDEX IF NOT EXISTS idx_call_event_type_ts
+  ON callbot.call_event (biz_type, event_type, ts DESC);
 
+-- 按月分区（示例：2026年5月）
 CREATE TABLE IF NOT EXISTS callbot.call_event_202605
   PARTITION OF callbot.call_event
   FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
 
--- 录音/音频产物表
+-- ========================================
+-- 5. 录音/音频产物表
+--    记录所有录音文件和 TTS 音频的存储位置与元数据
+-- ========================================
 CREATE TABLE IF NOT EXISTS callbot.call_artifact (
-  artifact_id   BIGSERIAL PRIMARY KEY,
-  call_id       UUID NOT NULL,
-  fs_uuid       UUID NOT NULL,
-  biz_type      TEXT NOT NULL,
-  user_key      TEXT NOT NULL,
-  kind          TEXT NOT NULL,
-  storage       TEXT NOT NULL CHECK (storage IN ('nas','minio')),
-  uri           TEXT NOT NULL,
-  sha256        TEXT,
-  size_bytes    BIGINT,
-  content_type  TEXT,
-  ts            TIMESTAMPTZ NOT NULL DEFAULT now()
+  artifact_id   BIGSERIAL PRIMARY KEY,        -- 产物自增 ID
+  call_id       UUID NOT NULL,                -- 关联通话会话
+  fs_uuid       UUID NOT NULL,                -- FreeSWITCH 会话标识
+  biz_type      TEXT NOT NULL,                -- 业务类型
+  user_key      TEXT NOT NULL,                -- 复合用户标识
+  kind          TEXT NOT NULL,                -- 文件类型：caller_wav(主叫录音)/bot_wav(机器人录音)/mix_wav(混音)/tts_wav(TTS音频)/meta_json(元数据)
+  storage       TEXT NOT NULL CHECK (storage IN ('nas','minio')),  -- 存储介质：NAS 热存/MinIO 归档
+  uri           TEXT NOT NULL,                -- 文件路径或对象 key
+  sha256        TEXT,                          -- 文件哈希（完整性校验）
+  size_bytes    BIGINT,                        -- 文件大小（字节）
+  content_type  TEXT,                          -- MIME 类型（如 audio/wav）
+  ts            TIMESTAMPTZ NOT NULL DEFAULT now()  -- 创建时间
 );
+
+-- 索引：按通话+文件类型查询录音
 CREATE INDEX IF NOT EXISTS idx_artifact_call
   ON callbot.call_artifact (call_id, kind);
+-- 索引：按业务+时间查询录音列表
 CREATE INDEX IF NOT EXISTS idx_artifact_biz_ts
   ON callbot.call_artifact (biz_type, ts DESC);
 
--- 配置快照表
+-- ========================================
+-- 6. 配置快照表
+--    每通通话开始时冻结 Prompt/Flow/TTS/Dialplan 版本，确保可追溯
+-- ========================================
 CREATE TABLE IF NOT EXISTS callbot.config_snapshot (
-  snapshot_id   BIGSERIAL PRIMARY KEY,
-  call_id       UUID NOT NULL,
-  fs_uuid       UUID NOT NULL,
-  biz_type      TEXT NOT NULL,
-  user_key      TEXT NOT NULL,
-  prompt_version TEXT,
-  flow_version   TEXT,
-  tts_profile_version TEXT,
-  dialplan_version TEXT,
-  snapshot      JSONB NOT NULL,
-  ts            TIMESTAMPTZ NOT NULL DEFAULT now()
+  snapshot_id   BIGSERIAL PRIMARY KEY,        -- 快照自增 ID
+  call_id       UUID NOT NULL,                -- 关联通话会话
+  fs_uuid       UUID NOT NULL,                -- FreeSWITCH 会话标识
+  biz_type      TEXT NOT NULL,                -- 业务类型
+  user_key      TEXT NOT NULL,                -- 复合用户标识
+  prompt_version TEXT,                         -- Prompt 模板版本号
+  flow_version   TEXT,                         -- LangGraph 流程版本号
+  tts_profile_version TEXT,                    -- TTS 配置版本号
+  dialplan_version TEXT,                       -- 拨号计划版本号
+  snapshot      JSONB NOT NULL,               -- 完整配置快照（JSON 格式）
+  ts            TIMESTAMPTZ NOT NULL DEFAULT now()  -- 快照时间
 );
+
+-- 索引：按通话维度查询配置快照
 CREATE INDEX IF NOT EXISTS idx_snapshot_call
   ON callbot.config_snapshot (call_id, ts DESC);
 
--- 结构化记忆（mem0 facts）
+-- ========================================
+-- 7. 结构化记忆表（mem0 facts）
+--    存储从对话中抽取的结构化事实（用户偏好、核验状态等）
+-- ========================================
 CREATE TABLE IF NOT EXISTS callbot.user_memory_fact (
-  id            BIGSERIAL PRIMARY KEY,
-  biz_type      TEXT NOT NULL,
-  user_key      TEXT NOT NULL,
-  fact_type     TEXT NOT NULL,
-  fact_value    JSONB NOT NULL,
-  confidence    REAL,
-  first_seen_ts TIMESTAMPTZ NOT NULL,
-  last_seen_ts  TIMESTAMPTZ NOT NULL,
-  source_call_id UUID,
-  expire_ts     TIMESTAMPTZ
+  id            BIGSERIAL PRIMARY KEY,        -- 记忆自增 ID
+  biz_type      TEXT NOT NULL,                -- 业务类型（记忆按业务隔离）
+  user_key      TEXT NOT NULL,                -- 复合用户标识
+  fact_type     TEXT NOT NULL,                -- 事实类型（如 do_not_call/preferred_contact_time/identity_verified）
+  fact_value    JSONB NOT NULL,               -- 事实内容（JSON 格式，支持复杂结构）
+  confidence    REAL,                          -- 置信度（规则抽取=1.0，LLM 抽取<1.0）
+  first_seen_ts TIMESTAMPTZ NOT NULL,         -- 首次发现时间
+  last_seen_ts  TIMESTAMPTZ NOT NULL,         -- 最近确认时间（每次命中时更新）
+  source_call_id UUID,                         -- 来源通话 ID（可追溯）
+  expire_ts     TIMESTAMPTZ                    -- 过期时间（NULL=永不过期）
 );
+
+-- 索引：按用户+类型查询记忆
 CREATE INDEX IF NOT EXISTS idx_mem_fact_user
   ON callbot.user_memory_fact (biz_type, user_key, fact_type);
+-- 索引：按最近确认时间排序（用于召回最新记忆）
 CREATE INDEX IF NOT EXISTS idx_mem_fact_lastseen
   ON callbot.user_memory_fact (biz_type, user_key, last_seen_ts DESC);
 
--- 向量记忆（pgvector，按月分区）
+-- ========================================
+-- 8. 向量记忆表（pgvector，按月分区）
+--    存储对话摘要、用户异议、处理片段的向量嵌入，支持相似度召回
+-- ========================================
 CREATE TABLE IF NOT EXISTS callbot.user_memory_vector (
-  id            BIGSERIAL,
-  biz_type      TEXT NOT NULL,
-  user_key      TEXT NOT NULL,
-  content       TEXT NOT NULL,
-  embedding     vector(1536) NOT NULL,
-  tags          JSONB NOT NULL DEFAULT '{}'::jsonb,
-  source_call_id UUID,
-  source_turn_id BIGINT,
-  ts            TIMESTAMPTZ NOT NULL,
+  id            BIGSERIAL,                    -- 向量自增 ID
+  biz_type      TEXT NOT NULL,                -- 业务类型
+  user_key      TEXT NOT NULL,                -- 复合用户标识
+  content       TEXT NOT NULL,                -- 原始文本内容
+  embedding     vector(1536) NOT NULL,        -- 向量嵌入（1536维，与 OpenAI embedding 对齐）
+  tags          JSONB NOT NULL DEFAULT '{}'::jsonb,  -- 标签（如情绪/异议类型/话术有效性）
+  source_call_id UUID,                         -- 来源通话 ID
+  source_turn_id BIGINT,                       -- 来源轮次 ID
+  ts            TIMESTAMPTZ NOT NULL,         -- 时间戳（分区键）
   PRIMARY KEY (id, ts)
 ) PARTITION BY RANGE (ts);
+
+-- 索引：按用户+时间范围查询向量记忆
 CREATE INDEX IF NOT EXISTS idx_mem_vec_user_ts
   ON callbot.user_memory_vector (biz_type, user_key, ts DESC);
 
+-- 按月分区（示例：2026年5月）
 CREATE TABLE IF NOT EXISTS callbot.user_memory_vector_202605
   PARTITION OF callbot.user_memory_vector
   FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
 
+-- HNSW 向量索引（必须在分区上创建，支持高效近似最近邻检索）
 CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
   ON callbot.user_memory_vector_202605
-  USING hnsw (embedding vector_cosine_ops);
+  USING hnsw (embedding vector_cosine_ops);   -- 余弦相似度索引
 ```
 
 - [ ] **Step 2: Commit**
