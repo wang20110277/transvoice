@@ -374,6 +374,39 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_p2_hnsw
   ON callbot.user_memory_vector_p2 USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS idx_mem_vec_p3_hnsw
   ON callbot.user_memory_vector_p3 USING hnsw (embedding vector_cosine_ops);
+
+-- ========================================
+-- 9. 话术知识库表（Agentic RAG，共享知识库不分库分表）
+--    存储各业务线的话术模板、FAQ、异议处理策略，LLM 实时检索匹配
+--    按业务线 + 场景分类，向量嵌入支持语义相似度召回
+-- ========================================
+CREATE TABLE IF NOT EXISTS callbot.script_library (
+  id              BIGSERIAL PRIMARY KEY,             -- 主键自增 ID
+  biz_type        TEXT NOT NULL,                     -- 业务类型（customer_service/collection/marketing）
+  scene           TEXT NOT NULL,                     -- 场景标签（如 opening/probing/objection_handling/closing/compliance_notice）
+  title           TEXT NOT NULL,                     -- 话术标题（如 "催收-承诺还款确认"）
+  content         TEXT NOT NULL,                     -- 话术正文（完整话术内容）
+  conditions      JSONB NOT NULL DEFAULT '{}'::jsonb,  -- 触发条件（如 {"intent":"promise_to_pay","turn_range":[3,8]}）
+  tags            JSONB NOT NULL DEFAULT '{}'::jsonb,  -- 扩展标签（如 {"emotion":"empathy","priority":1}）
+  embedding       vector(1536),                      -- 话术向量嵌入（1536维，由 embedding 服务异步生成）
+  version         INT NOT NULL DEFAULT 1,            -- 话术版本号（支持灰度更新）
+  is_active       BOOLEAN NOT NULL DEFAULT TRUE,     -- 是否启用（软删除用）
+  create_time     TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 创建时间
+  create_user     TEXT NOT NULL DEFAULT 'system',       -- 创建人
+  update_time     TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 最后更新时间
+  update_user     TEXT NOT NULL DEFAULT 'system'        -- 最后更新人
+);
+
+-- 业务索引：按 biz_type + scene 查询某业务线某场景的所有话术
+CREATE INDEX IF NOT EXISTS idx_script_biz_scene
+  ON callbot.script_library (biz_type, scene) WHERE is_active = TRUE;
+-- 业务索引：按 biz_type + version 查询最新版本话术
+CREATE INDEX IF NOT EXISTS idx_script_biz_version
+  ON callbot.script_library (biz_type, version DESC) WHERE is_active = TRUE;
+-- HNSW 向量索引（语义相似度召回，仅索引已生成嵌入的活跃话术）
+CREATE INDEX IF NOT EXISTS idx_script_hnsw
+  ON callbot.script_library USING hnsw (embedding vector_cosine_ops)
+  WHERE embedding IS NOT NULL AND is_active = TRUE;
 ```
 
 - [ ] **Step 2: Commit**
@@ -1995,7 +2028,31 @@ class LLMEngine(ABC):
         """调用 LLM，返回原始文本响应"""
 
     @abstractmethod
+    async def embed(self, text: str) -> list[float]:
+        """调用 Embedding 模型，返回向量"""
+
+    @abstractmethod
     async def health_check(self) -> bool: ...
+
+
+# 全局引擎实例（由 main.py 初始化）
+_llm_engine: LLMEngine | None = None
+
+
+def set_llm_engine(engine: LLMEngine) -> None:
+    global _llm_engine
+    _llm_engine = engine
+
+
+async def get_embedding(text: str) -> list[float] | None:
+    """获取文本向量嵌入（供 RAG 检索使用）"""
+    if _llm_engine is None:
+        return None
+    try:
+        return await _llm_engine.embed(text)
+    except Exception:
+        logger.warning(f"embedding failed for text: {text[:50]}")
+        return None
 
 
 def parse_llm_response(raw: str) -> LLMAction:
@@ -2060,6 +2117,15 @@ class QwenEngine(LLMEngine):
             return resp.status_code == 200
         except Exception:
             return False
+
+    async def embed(self, text: str) -> list[float]:
+        """调用 Qwen Embedding 接口（或外部 Embedding 服务）"""
+        resp = await self._client.post("/v1/embeddings", json={
+            "model": "text-embedding-v3",
+            "input": text,
+        })
+        resp.raise_for_status()
+        return resp.json()["data"][0]["embedding"]
 ```
 
 ```python
@@ -2104,6 +2170,7 @@ def test_build_prompt_basic():
         system_prompt="你是营销助手",
         user_input="我想了解产品",
         memory_block="",
+        rag_block="",
         turn_history=[],
     )
     assert "你是营销助手" in result
@@ -2116,9 +2183,23 @@ def test_build_prompt_with_memory():
         system_prompt="你是营销助手",
         user_input="你好",
         memory_block="## 用户记忆\n- 偏好: 周末联系",
+        rag_block="",
         turn_history=[],
     )
     assert "偏好: 周末联系" in result
+
+
+def test_build_prompt_with_rag():
+    result = build_prompt(
+        biz_type="marketing",
+        system_prompt="你是营销助手",
+        user_input="产品怎么样",
+        memory_block="",
+        rag_block="## 参考话术\n1. 产品优势介绍（相关度: 0.95）\n   我们的产品具有...",
+        turn_history=[],
+    )
+    assert "参考话术" in result
+    assert "产品优势" in result
 
 
 def test_build_prompt_with_history():
@@ -2127,6 +2208,7 @@ def test_build_prompt_with_history():
         system_prompt="你是客服",
         user_input="谢谢",
         memory_block="",
+        rag_block="",
         turn_history=[
             {"role": "user", "text": "你好"},
             {"role": "assistant", "text": "您好，请问有什么可以帮您？"},
@@ -2151,10 +2233,14 @@ def build_prompt(
     system_prompt: str,
     user_input: str,
     memory_block: str = "",
+    rag_block: str = "",
     turn_history: list[dict] | None = None,
     max_history_turns: int = 10,
 ) -> str:
     parts = [system_prompt]
+
+    if rag_block:
+        parts.append(f"\n{rag_block}")
 
     if memory_block:
         parts.append(f"\n{memory_block}")
@@ -2184,6 +2270,147 @@ cd agent-orchestrator && python -m pytest tests/test_prompt_builder.py -v
 ```bash
 git add agent-orchestrator/prompt_builder.py agent-orchestrator/tests/test_prompt_builder.py
 git commit -m "feat(orchestrator): add prompt context assembler"
+```
+
+---
+
+### Task 17.5: Agentic RAG 话术检索服务
+
+**Files:**
+- Create: `agent-orchestrator/rag_retriever.py`
+- Test: `agent-orchestrator/tests/test_rag_retriever.py`
+
+- [ ] **Step 1: 编写 RAG 检索测试**
+
+```python
+# agent-orchestrator/tests/test_rag_retriever.py
+import pytest
+from rag_retriever import retrieve_scripts, build_rag_block
+
+
+@pytest.mark.asyncio
+async def test_retrieve_scripts_returns_matching():
+    results = await retrieve_scripts(
+        biz_type="collection",
+        user_input="我下周一定还",
+        top_k=3,
+    )
+    assert isinstance(results, list)
+    assert len(results) <= 3
+    for item in results:
+        assert "title" in item
+        assert "content" in item
+        assert "score" in item
+
+
+def test_build_rag_block_empty():
+    result = build_rag_block([])
+    assert result == ""
+
+
+def test_build_rag_block_with_scripts():
+    scripts = [
+        {"title": "承诺还款确认", "content": "感谢您的承诺，我们将记录...", "score": 0.92},
+        {"title": "还款方式引导", "content": "您可以选择以下还款方式...", "score": 0.85},
+    ]
+    result = build_rag_block(scripts)
+    assert "承诺还款确认" in result
+    assert "还款方式引导" in result
+    assert "0.92" in result
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+```bash
+cd agent-orchestrator && python -m pytest tests/test_rag_retriever.py -v
+```
+
+- [ ] **Step 3: 实现 RAG 检索服务**
+
+```python
+# agent-orchestrator/rag_retriever.py
+import logging
+import asyncio
+import asyncpg
+from llm_base import get_embedding
+
+logger = logging.getLogger(__name__)
+
+PG_DSN = "postgresql://callbot:callbot@localhost:5432/callbot_0"
+TOP_K = 3
+SIMILARITY_THRESHOLD = 0.7
+
+
+async def retrieve_scripts(
+    biz_type: str,
+    user_input: str,
+    top_k: int = TOP_K,
+    pool: asyncpg.Pool | None = None,
+) -> list[dict]:
+    """Agentic RAG: 根据用户输入和业务类型检索最相关话术"""
+    query_embedding = await get_embedding(user_input)
+    if not query_embedding:
+        logger.warning("embedding generation failed, skipping RAG")
+        return []
+
+    own_pool = pool is None
+    if own_pool:
+        pool = await asyncpg.create_pool(PG_DSN, min_size=1, max_size=4)
+
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT title, content, scene, conditions, tags,
+                   1 - (embedding <=> $1::vector) AS score
+            FROM callbot.script_library
+            WHERE biz_type = $2
+              AND is_active = TRUE
+              AND embedding IS NOT NULL
+            ORDER BY embedding <=> $1::vector
+            LIMIT $3
+            """,
+            str(query_embedding),
+            biz_type,
+            top_k,
+        )
+        results = []
+        for r in rows:
+            if r["score"] >= SIMILARITY_THRESHOLD:
+                results.append({
+                    "title": r["title"],
+                    "content": r["content"],
+                    "scene": r["scene"],
+                    "score": round(float(r["score"]), 4),
+                })
+        return results
+    finally:
+        if own_pool:
+            await pool.close()
+
+
+def build_rag_block(scripts: list[dict]) -> str:
+    """将检索到的话术格式化为 Prompt 注入块"""
+    if not scripts:
+        return ""
+    lines = ["## 参考话术（按相关度排序）"]
+    for i, s in enumerate(scripts, 1):
+        lines.append(f"{i}. [{s['scene']}] {s['title']}（相关度: {s['score']}）")
+        lines.append(f"   {s['content']}")
+    lines.append("\n请参考以上话术风格和内容回复用户，可根据实际情况灵活调整措辞。")
+    return "\n".join(lines)
+```
+
+- [ ] **Step 4: 运行测试确认通过**
+
+```bash
+cd agent-orchestrator && python -m pytest tests/test_rag_retriever.py -v
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add agent-orchestrator/rag_retriever.py agent-orchestrator/tests/test_rag_retriever.py
+git commit -m "feat(orchestrator): add Agentic RAG script retrieval service"
 ```
 
 ---
@@ -2218,6 +2445,7 @@ async def test_graph_runs_recall_to_execute():
         "user_key": "user1:hash1",
         "user_input": "你好",
         "memory_block": "",
+        "rag_block": "",
         "llm_action": None,
         "identity_verified": False,
         "turn_count": 1,
@@ -2252,6 +2480,7 @@ class CallGraphState(TypedDict):
     user_key: str
     user_input: str
     memory_block: str
+    rag_block: str
     llm_action: Optional[LLMAction]
     identity_verified: bool
     turn_count: int
@@ -2263,6 +2492,16 @@ class CallGraphState(TypedDict):
 async def recall_memory_node(state: CallGraphState) -> dict:
     # Phase 6 实现实际记忆召回
     return {"memory_block": ""}
+
+
+async def rag_retrieve_node(state: CallGraphState) -> dict:
+    """Agentic RAG: 根据用户输入检索最相关话术"""
+    from rag_retriever import retrieve_scripts, build_rag_block
+    scripts = await retrieve_scripts(
+        biz_type=state["biz_type"],
+        user_input=state["user_input"],
+    )
+    return {"rag_block": build_rag_block(scripts)}
 
 
 async def llm_decide_node(state: CallGraphState) -> dict:
@@ -2320,13 +2559,15 @@ def create_call_graph():
     graph = StateGraph(CallGraphState)
 
     graph.add_node("recall_memory", recall_memory_node)
+    graph.add_node("rag_retrieve", rag_retrieve_node)
     graph.add_node("llm_decide", llm_decide_node)
     graph.add_node("compliance_check", compliance_check_node)
     graph.add_node("execute_action", execute_action_node)
     graph.add_node("finalize", finalize_node)
 
     graph.set_entry_point("recall_memory")
-    graph.add_edge("recall_memory", "llm_decide")
+    graph.add_edge("recall_memory", "rag_retrieve")
+    graph.add_edge("rag_retrieve", "llm_decide")
     graph.add_conditional_edges("llm_decide", route_after_llm, {
         "compliance_check": "compliance_check",
         "execute_action": "execute_action",
