@@ -11,28 +11,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Test
 ```bash
 # ASR adapter (must cd first)
-cd mrcp-asr && PYTHONPATH=$(pwd) pytest tests/ -v
+cd agent-asr && PYTHONPATH=$(pwd) pytest tests/ -v
 
 # TTS adapter (must cd first)
-cd mrcp-tts && PYTHONPATH=$(pwd) pytest tests/ -v
+cd agent-tts && PYTHONPATH=$(pwd) pytest tests/ -v
 
 # Orchestrator
 cd agent-orchestrator && PYTHONPATH=$(pwd) pytest tests/ -v
 
 # Run single test file
-cd mrcp-asr && PYTHONPATH=$(pwd) pytest tests/engines/sensevoice/test_engine.py -v
+cd agent-asr && PYTHONPATH=$(pwd) pytest tests/engines/sensevoice/test_engine.py -v
 ```
 
 ### Run
 ```bash
 # ASR adapter (port 8080)
-cd mrcp-asr/adapter && PYTHONPATH=$(cd .. && pwd) uvicorn main:app --host 0.0.0.0 --port 8080
+cd agent-asr/adapter && PYTHONPATH=$(cd .. && pwd) uvicorn main:app --host 0.0.0.0 --port 8080
 
 # TTS adapter (port 8081)
-cd mrcp-tts/adapter && PYTHONPATH=$(cd .. && pwd) uvicorn main:app --host 0.0.0.0 --port 8081
+cd agent-tts/adapter && PYTHONPATH=$(cd .. && pwd) uvicorn main:app --host 0.0.0.0 --port 8081
 
 # Orchestrator
-cd agent-orchestrator && python main.py
+cd agent-orchestrator && PYTHONPATH=$(pwd) uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 ### DB Migrations
@@ -45,21 +45,38 @@ cd agent-orchestrator && alembic upgrade head
 ```
 SIP Caller → FreeSWITCH (mod_sofia, SIP/RTP)
     ├─ mod_unimrcp (MRCPv2 client) → UniMRCP Server (:8060)
-    │    ├─ ASR resource → HTTP POST → mrcp-asr adapter (:8080)
-    │    └─ TTS resource → HTTP POST → mrcp-tts adapter (:8081)
-    └─ mod_event_socket (ESL, :8021) → agent-orchestrator
-         ├─ CHANNEL_ANSWER → play legal notice → start recording → start detect_speech
-         ├─ DETECTED_SPEECH → LangGraph flow → LLM decision → TTS speak
-         └─ CHANNEL_HANGUP → cleanup
+    │    ├─ ASR resource → HTTP POST → agent-asr adapter (:8080)
+    │    └─ TTS resource → HTTP POST → agent-tts adapter (:8081)
+    └─ 外部调度系统 → HTTP POST /call/speech → agent-orchestrator (:8000)
+         ├─ 7-node LangGraph pipeline → LLM decision → TTS via HTTP
+         └─ Returns: {action, text, tts_audio, tts_minio_key}
+```
+
+Data flow per turn:
+```
+呼入: FreeSWITCH → UniMRCP → agent-asr → 外部调度 → POST /call/speech → orchestrator
+呼出: orchestrator → POST /tts/synthesize_json → agent-tts → UniMRCP → FreeSWITCH
 ```
 
 ### Three Components
 
-**mrcp-asr** — FastAPI adapter with pluggable ASR engines. Receives audio from UniMRCP, uploads to MinIO, forwards to engine for recognition. Endpoints: `POST /asr/recognize`, `GET /asr/audio/{call_id}`, `GET /healthz`.
+**agent-asr** — FastAPI adapter with pluggable ASR engines. Receives audio from UniMRCP, uploads to MinIO, forwards to engine for recognition. Endpoints: `POST /asr/recognize`, `GET /asr/audio/{call_id}`, `GET /healthz`.
 
-**mrcp-tts** — FastAPI adapter with pluggable TTS engines. Receives text from UniMRCP/orchestrator, synthesizes audio, uploads to MinIO. Endpoints: `POST /tts/synthesize` (binary), `POST /tts/synthesize_json` (JSON with base64 audio + minio_key), `GET /healthz`.
+**agent-tts** — FastAPI adapter with pluggable TTS engines. Receives text from UniMRCP/orchestrator, synthesizes audio, uploads to MinIO. Endpoints: `POST /tts/synthesize` (binary), `POST /tts/synthesize_json` (JSON with base64 audio + minio_key), `GET /healthz`.
 
-**agent-orchestrator** — FastAPI HTTP service. Receives ASR text via `POST /call/speech`, runs 7-node LangGraph pipeline (`receive_asr → mcp_identity → [credit_query] → recall_memory → rag_retrieve → llm_decide → tts_synthesize`), returns TTS audio. LLM via LangChain ChatOpenAI with structured output (`LLMAction`). Conversation history via langchain-redis `RedisChatMessageHistory`.
+**agent-orchestrator** — FastAPI HTTP service. Receives ASR text via `POST /call/speech`, runs 7-node LangGraph pipeline, returns TTS audio. LLM via LangChain ChatOpenAI with structured output (`LLMAction`). Conversation history via langchain-redis `RedisChatMessageHistory`. Agentic RAG with adaptive retrieval + document grading + query rewriting.
+
+### LangGraph 7-Node Pipeline
+
+```
+① receive_asr    — 接收 ASR 文本，加载 Redis 对话历史
+② mcp_identity   — 查询用户中心（身份/姓名/性别）
+③ [条件] credit_query — 仅 marketing 查询征信
+④ recall_memory  — Redis 热记忆 + PG 长期记忆
+⑤ rag_retrieve   — Agentic RAG (自适应检索 → 文档评分 → 查询改写)
+⑥ llm_decide     — LLM 结构化输出
+⑦ tts_synthesize — 调用 TTS adapter，保存对话历史
+```
 
 ### Engine Plugin Pattern (ASR & TTS)
 
@@ -79,7 +96,15 @@ Three biz_types: `customer_service`, `collection`, `marketing`. Isolated at:
 - Redis: key prefix `cb:{biz_type}:...`
 - PostgreSQL: `biz_type` column on all tables, HASH partitioning
 - Prompts: `prompts/{biz_type}.yaml`
-- Compliance: biz_type-specific rules (marketing do_not_call, collection field sanitization)
+- Credit query: only marketing biz_type
+
+### Agentic RAG (node ⑤)
+
+Full adaptive + corrective RAG inside `rag_retrieve_node`:
+1. **Adaptive** — `should_retrieve()`: LLM decides if query needs knowledge base (skips greetings/closings)
+2. **Retrieve** — `retrieve_scripts()`: pgvector cosine similarity on `callbot.script_library`
+3. **Grade** — `grade_documents()`: LLM evaluates each script's relevance
+4. **Rewrite** — `rewrite_query()`: if all docs irrelevant, LLM rewrites query and retries (max 2 retries)
 
 ### Configuration
 
@@ -87,25 +112,57 @@ Three biz_types: `customer_service`, `collection`, `marketing`. Isolated at:
 - **ASR/TTS adapters**: `config.yaml` for engine name + env vars for API URLs and MinIO
 - **MinIO**: `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, `MINIO_BUCKET` (optional, disabled when empty)
 - **Engine URLs**: `SENSEVOICE_API_URL`, `COSYVOICE_API_URL`, `VIBEVOICE_ASR_API_URL`, `VIBEVOICE_TTS_API_URL`
+- **RAG**: `CALLBOT_RAG_TOP_K` (default 3), `CALLBOT_RAG_SIMILARITY_THRESHOLD` (default 0.7), `CALLBOT_RAG_MAX_RETRIES` (default 2)
 
 ### Key Orchestrator Modules
 
 | Module | Role |
 |--------|------|
 | `config.py` | pydantic-settings, all config via `CALLBOT_` env prefix |
+| `database.py` | SQLAlchemy 2.0 async engine + session factory |
 | `main.py` | FastAPI app with lifespan init, `POST /call/speech`, `GET /healthz` |
 | `graph/flow.py` | LangGraph 7-node StateGraph pipeline |
 | `graph/prompt.py` | System prompt + RAG + memory + chat history assembly |
 | `clients/mcp.py` | MCP user center (identity/credit query) |
 | `clients/tts.py` | TTS adapter HTTP client |
-| `llm/service.py` | LangChain ChatOpenAI with structured output |
-| `memory/assembler.py` | Aggregates Redis hot facts + PG facts |
+| `llm/service.py` | LangChain ChatOpenAI with structured output + embeddings |
+| `memory/assembler.py` | Aggregates Redis hot facts + PG long-term facts |
 | `memory/chat_history.py` | langchain-redis `RedisChatMessageHistory` conversation memory |
 | `memory/redis_memory.py` | Per-user hot fact storage (Redis hash) |
 | `memory/store.py` | PG fact + vector data access |
-| `rag/retriever.py` | pgvector cosine similarity on script_library |
-| `db/models.py` | SQLAlchemy 2.0 ORM models (callbot schema) |
+| `rag/retriever.py` | Agentic RAG: adaptive retrieval + document grading + query rewriting |
+| `db/models.py` | SQLAlchemy 2.0 ORM models (callbot schema, 9 tables) |
 | `storage/repository.py` | Async repository for sessions/turns/events/artifacts |
+
+### Project Structure
+
+```
+aiphone/
+├── agent-asr/           # ASR adapter (FastAPI, pluggable engines)
+│   ├── adapter/         # main.py, base.py, config.py, storage.py
+│   │   └── engines/     # sensevoice/, vibevoice/
+│   └── tests/
+├── agent-tts/           # TTS adapter (FastAPI, pluggable engines)
+│   ├── adapter/         # main.py, base.py, config.py, storage.py
+│   │   └── engines/     # cosyvoice/, vibevoice/
+│   └── tests/
+├── agent-orchestrator/  # LangGraph 7-node pipeline (FastAPI HTTP service)
+│   ├── main.py          # FastAPI entry point
+│   ├── config.py        # pydantic-settings
+│   ├── database.py      # SQLAlchemy async engine
+│   ├── clients/         # mcp.py, tts.py
+│   ├── graph/           # flow.py, prompt.py
+│   ├── llm/             # service.py (ChatOpenAI + structured output)
+│   ├── memory/          # assembler.py, chat_history.py, redis_memory.py, store.py
+│   ├── rag/             # retriever.py (Agentic RAG)
+│   ├── db/              # models.py (ORM)
+│   ├── storage/         # repository.py
+│   ├── prompts/         # {biz_type}.yaml
+│   └── alembic/         # DB migrations
+├── deploy/              # systemd services, install scripts, monitoring
+├── freeswitch/          # FreeSWITCH + UniMRCP configs
+└── docs/                # design specs, implementation plans
+```
 
 ### Infrastructure
 
