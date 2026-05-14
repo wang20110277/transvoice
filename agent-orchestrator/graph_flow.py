@@ -200,8 +200,12 @@ async def tts_synthesize_node(state: CallGraphState) -> dict:
         return {}
 
     tts_result = None
-    if _tts_client is not None and action.text:
-        tts_result = await _tts_client.synthesize(action.text, state["call_id"], state["biz_type"])
+    try:
+        if _tts_client is not None and action.text:
+            tts_result = await _tts_client.synthesize(action.text, state["call_id"], state["biz_type"])
+    except Exception as e:
+        logger.error(f"[{state.get('call_id', '?')}] TTS 合成异常: {e}")
+        tts_result = None
 
     turn_history = list(state.get("turn_history", []))
     turn_history.append({"role": "user", "text": state["user_input"]})
