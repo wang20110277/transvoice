@@ -28,7 +28,8 @@ async def lifespan(app: FastAPI):
     global _graph, _initialized
 
     assembler = MemoryAssembler()
-    mcp = MCPClient(settings.mcp_server_url)
+    mcp = MCPClient(settings.mcp_server_url, settings.mcp_transport)
+    await mcp.initialize()
     tts = TTSClient(settings.tts_adapter_url)
     set_services(assembler, mcp, tts)
 
@@ -38,6 +39,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    await mcp.close()
     _initialized = False
     logger.info("=== Agent Orchestrator 关闭 ===")
 

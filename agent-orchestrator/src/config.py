@@ -37,7 +37,8 @@ class Settings(BaseSettings):
     llm_embedding_model: str = "text-embedding-v3"
 
     # MCP
-    mcp_server_url: str = "http://127.0.0.1:9090"
+    mcp_server_url: str = "http://127.0.0.1:9090/mcp/"
+    mcp_transport: str = "http"
 
     # RAG
     rag_top_k: int = 3
