@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Form
 from fastapi.responses import Response, JSONResponse
 from ttsadapter.config import load_tts_engine
-from ttsadapter import storage
+from ttsadapter.store import storage
 
 logger = logging.getLogger(__name__)
 

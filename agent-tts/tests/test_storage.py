@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import patch, MagicMock
-from ttsadapter import storage
+from ttsadapter.store import storage
 
 
 def test_upload_audio_no_endpoint():
@@ -21,7 +21,7 @@ def test_upload_audio_success():
         mock_client = MagicMock()
         mock_client.bucket_exists.return_value = True
 
-        with patch("ttsadapter.storage._client", return_value=mock_client):
+        with patch("ttsadapter.store.storage._client", return_value=mock_client):
             result = storage.upload_audio(b"fake_audio", prefix="tts", call_id="call123")
 
         assert result is not None
@@ -40,7 +40,7 @@ def test_upload_audio_minio_error():
         mock_client.bucket_exists.return_value = True
         mock_client.put_object.side_effect = Exception("minio error")
 
-        with patch("ttsadapter.storage._client", return_value=mock_client):
+        with patch("ttsadapter.store.storage._client", return_value=mock_client):
             result = storage.upload_audio(b"fake_audio")
 
         assert result is None

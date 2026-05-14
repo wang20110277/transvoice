@@ -21,7 +21,7 @@ async def test_synthesize_json():
     mock_engine.synthesize = AsyncMock(return_value=TTSResult(audio=b"fake_audio_bytes", content_type="audio/wav"))
     main_mod.engine = mock_engine
 
-    with patch("ttsadapter.main.storage.upload_audio", return_value="tts/20260514/call123.wav"):
+    with patch("ttsadapter.store.storage.upload_audio", return_value="tts/20260514/call123.wav"):
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.post("/tts/synthesize_json", data={"text": "你好", "params": '{"call_id":"call123"}'})
