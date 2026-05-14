@@ -1,13 +1,14 @@
-"""智能外呼 Orchestrator 入口 - 异步初始化 + 全组件集成"""
+"""Agent Orchestrator — FastAPI HTTP 服务"""
 import logging
-from fs_esl import ESLEventLoop
-from event_handlers import EventDispatcher
-from call_state import CallStateManager
-from fs_actions import FSActions
-from graph_flow import create_call_graph, set_memory_assembler
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+from config import settings
+from graph_flow import create_call_graph, set_services, CallGraphState
 from memory.assembler import MemoryAssembler
 from mcp_client import MCPClient
-from config import settings
+from tts_client import TTSClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,42 +16,70 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_graph = None
+_initialized = False
 
-def main():
-    logger.info("=== 智能外呼 Orchestrator 启动 ===")
 
-    # 初始化记忆聚合器
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _graph, _initialized
+
     assembler = MemoryAssembler()
-    set_memory_assembler(assembler)
+    mcp = MCPClient(settings.mcp_server_url)
+    tts = TTSClient(settings.tts_adapter_url)
+    set_services(assembler, mcp, tts)
 
-    # 编译 LangGraph（一次编译，复用）
-    graph = create_call_graph()
-    logger.info("LangGraph 编译完成")
+    _graph = create_call_graph()
+    _initialized = True
+    logger.info("=== Agent Orchestrator 启动 ===")
 
-    # MCP 客户端
-    mcp_client = MCPClient(settings.mcp_server_url)
+    yield
 
-    # ESL 事件循环
-    state_mgr = CallStateManager()
-    loop = ESLEventLoop(settings.fs_esl_host, settings.fs_esl_port, settings.fs_esl_password)
-    if not loop.connect():
-        logger.error("初始连接失败，将在循环中重连")
-
-    actions = FSActions(loop.conn)
-    dispatcher = EventDispatcher(
-        state_mgr=state_mgr,
-        conn=loop.conn,
-        actions=actions,
-        graph=graph,
-        mcp_client=mcp_client,
-    )
-
-    try:
-        loop.run(dispatcher)
-    except KeyboardInterrupt:
-        logger.info("收到中断信号，正在关闭...")
-        loop.stop()
+    _initialized = False
+    logger.info("=== Agent Orchestrator 关闭 ===")
 
 
-if __name__ == "__main__":
-    main()
+app = FastAPI(title="Agent Orchestrator", lifespan=lifespan)
+
+
+class SpeechRequest(BaseModel):
+    call_id: str
+    biz_type: str
+    user_key: str
+    text: str
+    minio_key: str | None = None
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok" if _initialized else "initializing"}
+
+
+@app.post("/call/speech")
+async def handle_speech(request: SpeechRequest):
+    initial_state: CallGraphState = {
+        "call_id": request.call_id,
+        "biz_type": request.biz_type,
+        "user_key": request.user_key,
+        "user_input": request.text,
+        "asr_minio_key": request.minio_key,
+        "identity": None,
+        "credit_result": None,
+        "memory_block": "",
+        "rag_block": "",
+        "llm_action": None,
+        "tts_minio_key": None,
+        "tts_audio": None,
+        "turn_count": 0,
+        "turn_history": [],
+    }
+
+    result = await _graph.ainvoke(initial_state)
+
+    action = result.get("llm_action")
+    return {
+        "action": action.action if action else "say",
+        "text": action.text if action else "",
+        "tts_minio_key": result.get("tts_minio_key"),
+        "tts_audio": result.get("tts_audio"),
+    }
