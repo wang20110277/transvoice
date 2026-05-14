@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
-from tts_client import TTSClient
+from clients.tts import TTSClient
 
 
 @pytest.mark.asyncio
@@ -14,7 +14,7 @@ async def test_synthesize_success():
     }
     mock_resp.raise_for_status = MagicMock()
 
-    with patch("tts_client.httpx.AsyncClient") as mock_client_cls:
+    with patch("clients.tts.httpx.AsyncClient") as mock_client_cls:
         mock_client = AsyncMock()
         mock_client.post.return_value = mock_resp
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -30,7 +30,7 @@ async def test_synthesize_success():
 
 @pytest.mark.asyncio
 async def test_synthesize_failure_returns_none():
-    with patch("tts_client.httpx.AsyncClient") as mock_client_cls:
+    with patch("clients.tts.httpx.AsyncClient") as mock_client_cls:
         mock_client = AsyncMock()
         mock_client.post.side_effect = Exception("connection refused")
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)

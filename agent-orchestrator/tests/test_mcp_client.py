@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import AsyncMock, patch
-from mcp_client import MCPClient, IdentityResult, CreditResult
+from clients.mcp import MCPClient, IdentityResult, CreditResult
 
 
 @pytest.mark.asyncio

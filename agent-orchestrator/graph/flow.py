@@ -7,10 +7,10 @@ from langgraph.graph import StateGraph, END
 
 from llm.service import LLMAction, FALLBACK_ACTION_TEXT, get_llm_service
 from rag.retriever import retrieve_scripts, build_rag_block
-from prompt_builder import build_messages
+from graph.prompt import build_messages
 from memory.assembler import MemoryAssembler
-from mcp_client import MCPClient
-from tts_client import TTSClient
+from clients.mcp import MCPClient
+from clients.tts import TTSClient
 
 logger = logging.getLogger(__name__)
 

@@ -8,10 +8,10 @@ from fastapi import HTTPException
 
 from config import settings
 from database import engine as db_engine
-from graph_flow import create_call_graph, set_services, CallGraphState
+from graph.flow import create_call_graph, set_services, CallGraphState
 from memory.assembler import MemoryAssembler
-from mcp_client import MCPClient
-from tts_client import TTSClient
+from clients.mcp import MCPClient
+from clients.tts import TTSClient
 
 logging.basicConfig(
     level=logging.INFO,
