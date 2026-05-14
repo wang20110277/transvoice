@@ -1,5 +1,5 @@
 """Prompt 组装 - LangChain 消息列表格式"""
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
 
 
 def build_messages(
@@ -8,8 +8,7 @@ def build_messages(
     user_input: str,
     memory_block: str = "",
     rag_block: str = "",
-    turn_history: list[dict] | None = None,
-    max_history_turns: int = 10,
+    chat_history: list[BaseMessage] | None = None,
 ) -> list:
     """组装 LangChain 消息列表：system + RAG + memory + history + user"""
     parts = [system_prompt]
@@ -23,15 +22,8 @@ def build_messages(
     system_content = "\n\n".join(parts)
     messages = [SystemMessage(content=system_content)]
 
-    if turn_history:
-        recent = turn_history[-max_history_turns:]
-        for turn in recent:
-            role = turn.get("role", "user")
-            text = turn.get("text", "")
-            if role == "user":
-                messages.append(HumanMessage(content=text))
-            elif role == "assistant":
-                messages.append(AIMessage(content=text))
+    if chat_history:
+        messages.extend(chat_history)
 
     messages.append(HumanMessage(content=user_input))
     return messages

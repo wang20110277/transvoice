@@ -59,7 +59,7 @@ SIP Caller → FreeSWITCH (mod_sofia, SIP/RTP)
 
 **mrcp-tts** — FastAPI adapter with pluggable TTS engines. Receives text from UniMRCP/orchestrator, synthesizes audio, uploads to MinIO. Endpoints: `POST /tts/synthesize` (binary), `POST /tts/synthesize_json` (JSON with base64 audio + minio_key), `GET /healthz`.
 
-**agent-orchestrator** — Python event loop connected to FreeSWITCH via ESL. Uses LangGraph StateGraph: `recall_memory → rag_retrieve → llm_decide → [compliance_check] → execute_action → [finalize]`. LLM via LangChain ChatOpenAI with structured output (`LLMAction`).
+**agent-orchestrator** — FastAPI HTTP service. Receives ASR text via `POST /call/speech`, runs 7-node LangGraph pipeline (`receive_asr → mcp_identity → [credit_query] → recall_memory → rag_retrieve → llm_decide → tts_synthesize`), returns TTS audio. LLM via LangChain ChatOpenAI with structured output (`LLMAction`). Conversation history via langchain-redis `RedisChatMessageHistory`.
 
 ### Engine Plugin Pattern (ASR & TTS)
 
@@ -93,13 +93,16 @@ Three biz_types: `customer_service`, `collection`, `marketing`. Isolated at:
 | Module | Role |
 |--------|------|
 | `config.py` | pydantic-settings, all config via `CALLBOT_` env prefix |
-| `fs_esl.py` | ESL connection with reconnect loop |
-| `fs_actions.py` | FreeSWITCH commands (play, record, detect_speech, tts_speak) |
-| `event_handlers.py` | ESL event dispatch → LangGraph invoke |
-| `graph_flow.py` | LangGraph StateGraph definition |
+| `main.py` | FastAPI app with lifespan init, `POST /call/speech`, `GET /healthz` |
+| `graph/flow.py` | LangGraph 7-node StateGraph pipeline |
+| `graph/prompt.py` | System prompt + RAG + memory + chat history assembly |
+| `clients/mcp.py` | MCP user center (identity/credit query) |
+| `clients/tts.py` | TTS adapter HTTP client |
 | `llm/service.py` | LangChain ChatOpenAI with structured output |
-| `prompt_builder.py` | System prompt + RAG + memory + history assembly |
 | `memory/assembler.py` | Aggregates Redis hot facts + PG facts |
+| `memory/chat_history.py` | langchain-redis `RedisChatMessageHistory` conversation memory |
+| `memory/redis_memory.py` | Per-user hot fact storage (Redis hash) |
+| `memory/store.py` | PG fact + vector data access |
 | `rag/retriever.py` | pgvector cosine similarity on script_library |
 | `db/models.py` | SQLAlchemy 2.0 ORM models (callbot schema) |
 | `storage/repository.py` | Async repository for sessions/turns/events/artifacts |
@@ -107,7 +110,7 @@ Three biz_types: `customer_service`, `collection`, `marketing`. Isolated at:
 ### Infrastructure
 
 - **PostgreSQL 17** with pgvector extension, schema `callbot`, 9 tables
-- **Redis** for hot memory, session state
+- **Redis** for hot memory, conversation history (langchain-redis), session state
 - **MinIO** for audio archiving
 - **FreeSWITCH 1.10.12** compiled from source with mod_unimrcp
 - **UniMRCP** compiled from source

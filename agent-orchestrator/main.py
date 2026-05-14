@@ -76,8 +76,7 @@ async def handle_speech(request: SpeechRequest):
         "llm_action": None,
         "tts_minio_key": None,
         "tts_audio": None,
-        "turn_count": 0,
-        "turn_history": [],
+        "chat_history": [],
     }
 
     result = await _graph.ainvoke(initial_state)

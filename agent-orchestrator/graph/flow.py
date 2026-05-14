@@ -5,10 +5,13 @@ import os
 from typing import TypedDict
 from langgraph.graph import StateGraph, END
 
+from langchain_core.messages import BaseMessage
+
 from llm.service import LLMAction, FALLBACK_ACTION_TEXT, get_llm_service
 from rag.retriever import retrieve_scripts, build_rag_block
 from graph.prompt import build_messages
 from memory.assembler import MemoryAssembler
+from memory.chat_history import get_chat_history, save_turn
 from clients.mcp import MCPClient
 from clients.tts import TTSClient
 
@@ -40,56 +43,22 @@ class CallGraphState(TypedDict, total=False):
     llm_action: LLMAction | None
     tts_minio_key: str | None
     tts_audio: str | None
-    turn_count: int
-    turn_history: list[dict]
-
-
-# ── Redis context helpers ──
-
-async def load_context(call_id: str) -> dict:
-    import json
-    import redis.asyncio as aioredis
-    from config import settings
-    r = aioredis.from_url(settings.redis_url, decode_responses=True)
-    try:
-        raw = await r.get(f"cb:ctx:{call_id}")
-        if raw:
-            return json.loads(raw)
-    except Exception as e:
-        logger.warning(f"Redis context load fail for {call_id}: {e}")
-    finally:
-        await r.aclose()
-    return {"turn_history": [], "turn_count": 0, "identity": None}
-
-
-async def save_context(call_id: str, state: CallGraphState) -> None:
-    import json
-    import redis.asyncio as aioredis
-    from config import settings
-    r = aioredis.from_url(settings.redis_url, decode_responses=True)
-    try:
-        ctx = {
-            "turn_history": state.get("turn_history", []),
-            "turn_count": state.get("turn_count", 0),
-            "identity": state.get("identity"),
-        }
-        await r.set(f"cb:ctx:{call_id}", json.dumps(ctx, ensure_ascii=False), ex=3600)
-    except Exception as e:
-        logger.warning(f"Redis context save fail for {call_id}: {e}")
-    finally:
-        await r.aclose()
+    chat_history: list[BaseMessage]
 
 
 # ── Node ①: receive_asr ──
 
 async def receive_asr_node(state: CallGraphState) -> dict:
-    ctx = await load_context(state["call_id"])
+    try:
+        history = get_chat_history(state["call_id"], state["biz_type"])
+        chat_history = list(await history.aget_messages())
+    except Exception as e:
+        logger.warning(f"[{state.get('call_id', '?')}] 对话历史加载失败: {e}")
+        chat_history = []
     return {
         "user_input": state["user_input"],
         "asr_minio_key": state.get("asr_minio_key"),
-        "turn_history": ctx.get("turn_history", []),
-        "turn_count": ctx.get("turn_count", 0),
-        "identity": ctx.get("identity"),
+        "chat_history": chat_history,
     }
 
 
@@ -180,7 +149,7 @@ async def llm_decide_node(state: CallGraphState) -> dict:
         user_input=state["user_input"],
         memory_block=state.get("memory_block", ""),
         rag_block=state.get("rag_block", ""),
-        turn_history=state.get("turn_history", []),
+        chat_history=state.get("chat_history", []),
     )
 
     try:
@@ -207,19 +176,15 @@ async def tts_synthesize_node(state: CallGraphState) -> dict:
         logger.error(f"[{state.get('call_id', '?')}] TTS 合成异常: {e}")
         tts_result = None
 
-    turn_history = list(state.get("turn_history", []))
-    turn_history.append({"role": "user", "text": state["user_input"]})
-    turn_history.append({"role": "assistant", "text": action.text})
-    turn_count = state.get("turn_count", 0) + 1
-
-    new_state = {**state, "turn_history": turn_history, "turn_count": turn_count}
-    await save_context(state["call_id"], new_state)
+    try:
+        history = get_chat_history(state["call_id"], state["biz_type"])
+        await save_turn(history, state["user_input"], action.text)
+    except Exception as e:
+        logger.warning(f"[{state.get('call_id', '?')}] 对话历史保存失败: {e}")
 
     return {
         "tts_audio": tts_result.get("audio") if tts_result else None,
         "tts_minio_key": tts_result.get("minio_key") if tts_result else None,
-        "turn_history": turn_history,
-        "turn_count": turn_count,
     }
 
 
