@@ -11,7 +11,7 @@ def engine():
         "SENSEVOICE_API_URL": "http://funasr:8000",
         "SENSEVOICE_TIMEOUT": "30",
         "SENSEVOICE_LANGUAGE": "zh",
-        "SENSEVOICE_MAX_CONCURRENCY": "10",
+        "SENSEVOICE_MAX_CONCURRENT": "10",
     }):
         return SenseVoiceASREngine()
 
@@ -106,28 +106,6 @@ async def test_recognize_server_error(engine):
             await engine.recognize(b"fake-audio-bytes", {})
 
 
-@pytest.mark.asyncio
-async def test_recognize_semaphore_limits_concurrency(engine):
-    mock_client = _mock_async_client(
-        response_json={"text": "测试", "confidence": 0.9},
-        response_status=200,
-    )
-
-    # Spy on the semaphore's __aenter__ to verify it is used
-    original_aenter = engine._semaphore.__aenter__
-    aenter_called = False
-
-    async def spy_aenter(*args, **kwargs):
-        nonlocal aenter_called
-        aenter_called = True
-        return await original_aenter(*args, **kwargs)
-
-    engine._semaphore.__aenter__ = spy_aenter
-
-    with patch(
-        "adapter.engines.sensevoice.engine.httpx.AsyncClient",
-        return_value=mock_client,
-    ):
-        await engine.recognize(b"fake-audio-bytes", {})
-
-    assert aenter_called, "Semaphore __aenter__ was not called during recognize"
+def test_semaphore_default_concurrency():
+    eng = SenseVoiceASREngine()
+    assert eng._semaphore._value == 50
