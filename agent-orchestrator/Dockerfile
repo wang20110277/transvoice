@@ -1,31 +1,21 @@
-# Qwen3.5-9B LLM via vLLM
-# OpenAI-compatible server
-# Exposes: POST /v1/chat/completions, POST /v1/embeddings, GET /health
-# GPU: 2
+# agent-orchestrator — FastAPI HTTP + LangGraph 7-node 管线
+# 接收 ASR 文本，驱动 LLM 对话决策，返回 TTS 音频
+# Port: 8000
+# 依赖: PostgreSQL (pgvector), Redis, MinIO, LLM/ASR/TTS 引擎
 
-FROM vllm/vllm-openai:latest
+FROM python:3.11-slim
 
-# Model will be downloaded at build time
-# Mount a host cache volume to avoid re-downloading on rebuild:
-#   -v ~/.cache/huggingface:/root/.cache/huggingface
+WORKDIR /app
 
-ARG MODEL_NAME=Qwen/Qwen3.5-9B
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download model (optional — remove to download at runtime)
-RUN --mount=type=cache,target=/root/.cache/huggingface \
-    python -c "from huggingface_hub import snapshot_download; snapshot_download('${MODEL_NAME}')"
+COPY src/ src/
+COPY alembic/ alembic/
+COPY alembic.ini .
 
-ENV MODEL_NAME=${MODEL_NAME}
-ENV PORT=8080
-ENV MAX_MODEL_LEN=4096
-ENV GPU_MEMORY_UTILIZATION=0.9
+ENV PYTHONPATH=/app/src
+EXPOSE 8000
 
-EXPOSE ${PORT}
-
-CMD ["--model", "Qwen/Qwen3.5-9B", \
-     "--served-model-name", "qwen3.5-9b", \
-     "--host", "0.0.0.0", \
-     "--port", "8080", \
-     "--max-model-len", "4096", \
-     "--gpu-memory-utilization", "0.9", \
-     "--trust-remote-code"]
+# 启动前自动迁移数据库，然后启动服务
+CMD ["sh", "-c", "alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8000"]

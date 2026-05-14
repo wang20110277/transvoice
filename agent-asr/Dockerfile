@@ -1,35 +1,21 @@
-# SenseVoice ASR Inference Server
-# FunASR + SenseVoiceSmall model
-# Exposes: POST /asr, GET /health
-# GPU: 0
+# agent-asr adapter — FastAPI HTTP 服务
+# 接收 UniMRCP 音频，转发 ASR 引擎，上传 MinIO
+# Port: 8080
 
-FROM pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime
+FROM python:3.11-slim
 
-WORKDIR /opt/sensevoice
+WORKDIR /app
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg libsndfile1 && \
+    apt-get install -y --no-install-recommends ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir \
-    funasr==1.2.3 \
-    modelscope==1.22.0 \
-    torch-complex \
-    fastapi==0.115.0 \
-    uvicorn[standard]==0.30.0 \
-    python-multipart
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py .
+COPY asradapter/ asradapter/
 
-RUN python -c "from modelscope import snapshot_download; snapshot_download('iic/SenseVoiceSmall', local_dir='/opt/sensevoice/models/SenseVoiceSmall')"
+ENV PYTHONPATH=/app
+EXPOSE 8080
 
-ENV MODEL_DIR=/opt/sensevoice/models/SenseVoiceSmall
-ENV AUDIO_DIR=/data/audio
-ENV PORT=10095
-
-RUN mkdir -p ${AUDIO_DIR}
-VOLUME ${AUDIO_DIR}
-
-EXPOSE ${PORT}
-
-CMD ["python", "server.py"]
+CMD ["uvicorn", "asradapter.main:app", "--host", "0.0.0.0", "--port", "8080"]

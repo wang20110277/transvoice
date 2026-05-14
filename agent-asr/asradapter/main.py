@@ -5,8 +5,8 @@ import logging
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, Form
-from adapter.config import load_asr_engine
-from adapter import storage
+from asradapter.config import load_asr_engine
+from asradapter import storage
 
 logger = logging.getLogger(__name__)
 

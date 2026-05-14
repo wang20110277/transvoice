@@ -4,7 +4,7 @@ import os
 
 import httpx
 
-from adapter.base import ASREngine, ASRResult
+from asradapter.base import ASREngine, ASRResult
 
 logger = logging.getLogger(__name__)
 

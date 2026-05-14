@@ -5,7 +5,7 @@ import os
 
 import httpx
 
-from adapter.base import TTSEngine, TTSResult
+from ttsadapter.base import TTSEngine, TTSResult
 
 logger = logging.getLogger(__name__)
 

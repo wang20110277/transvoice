@@ -1,5 +1,5 @@
 import pytest
-from adapter.base import TTSEngine, TTSResult
+from ttsadapter.base import TTSEngine, TTSResult
 
 
 def test_tts_result_creation():

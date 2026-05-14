@@ -26,10 +26,10 @@ cd agent-asr && PYTHONPATH=$(pwd) pytest tests/engines/sensevoice/test_engine.py
 ### Run
 ```bash
 # ASR adapter (port 8080)
-cd agent-asr/adapter && PYTHONPATH=$(cd .. && pwd) uvicorn main:app --host 0.0.0.0 --port 8080
+cd agent-asr/asradapter && PYTHONPATH=$(cd .. && pwd) uvicorn main:app --host 0.0.0.0 --port 8080
 
 # TTS adapter (port 8081)
-cd agent-tts/adapter && PYTHONPATH=$(cd .. && pwd) uvicorn main:app --host 0.0.0.0 --port 8081
+cd agent-tts/ttsadapter && PYTHONPATH=$(cd .. && pwd) uvicorn main:app --host 0.0.0.0 --port 8081
 
 # Orchestrator (source in src/)
 cd agent-orchestrator && PYTHONPATH=$(pwd)/src uvicorn main:app --host 0.0.0.0 --port 8000
@@ -80,10 +80,10 @@ Data flow per turn:
 
 ### Engine Plugin Pattern (ASR & TTS)
 
-1. `adapter/base.py` defines ABC (`ASREngine` / `TTSEngine`)
-2. `adapter/engines/{name}/engine.py` implements ABC, exports `Engine = ConcreteClass`
-3. `adapter/config.yaml` selects active engine by name
-4. `adapter/config.py` loads via `importlib.import_module(f"adapter.engines.{name}.engine")`
+1. `asradapter/base.py` / `ttsadapter/base.py` defines ABC (`ASREngine` / `TTSEngine`)
+2. `asradapter/engines/{name}/engine.py` implements ABC, exports `Engine = ConcreteClass`
+3. `asradapter/config.yaml` / `ttsadapter/config.yaml` selects active engine by name
+4. `asradapter/config.py` / `ttsadapter/config.py` loads via `importlib`
 
 To add a new engine: create engine directory + `engine.py` implementing the ABC, update `config.yaml`.
 
@@ -139,13 +139,15 @@ Full adaptive + corrective RAG inside `rag_retrieve_node`:
 ```
 aiphone/
 ├── agent-asr/           # ASR adapter (FastAPI, pluggable engines)
-│   ├── adapter/         # main.py, base.py, config.py, storage.py
+│   ├── asradapter/      # main.py, base.py, config.py, storage.py
 │   │   └── engines/     # sensevoice/, vibevoice/
-│   └── tests/
+│   ├── asrengine/       # SenseVoice 推理引擎 (Dockerfile + server.py)
+│   └── tests/           # test_base, test_main, test_storage, engines/
 ├── agent-tts/           # TTS adapter (FastAPI, pluggable engines)
-│   ├── adapter/         # main.py, base.py, config.py, storage.py
+│   ├── ttsadapter/      # main.py, base.py, config.py, storage.py
 │   │   └── engines/     # cosyvoice/, vibevoice/
-│   └── tests/
+│   ├── ttsengine/       # CosyVoice 推理引擎 (Dockerfile + server.py)
+│   └── tests/           # test_base, test_main, test_storage, engines/
 ├── agent-orchestrator/  # LangGraph 7-node pipeline (FastAPI HTTP service)
 │   ├── src/             # 核心源码 (PYTHONPATH=src)
 │   │   ├── main.py      # FastAPI entry point
@@ -158,6 +160,7 @@ aiphone/
 │   │   ├── rag/         # retriever.py (Agentic RAG)
 │   │   ├── db/          # models.py (ORM)
 │   │   └── storage/     # repository.py
+│   ├── llm/             # Qwen LLM 推理引擎 Dockerfile
 │   ├── alembic/         # DB migrations
 │   └── tests/           # test suite
 ├── deploy/              # systemd services, install scripts, monitoring

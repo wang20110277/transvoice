@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
-from adapter.base import ASREngine
-from adapter.engines.vibevoice.engine import VibeVoiceASREngine
+from asradapter.base import ASREngine
+from asradapter.engines.vibevoice.engine import VibeVoiceASREngine
 
 
 @pytest.fixture
@@ -10,14 +10,14 @@ def engine():
 
 
 def test_engine_inherits_base():
-    from adapter.base import ASREngine
+    from asradapter.base import ASREngine
     eng = VibeVoiceASREngine()
     assert isinstance(eng, ASREngine)
 
 
 @pytest.mark.asyncio
 async def test_health_check_success(engine):
-    with patch("adapter.engines.vibevoice.engine.httpx.AsyncClient") as mock_client_cls:
+    with patch("asradapter.engines.vibevoice.engine.httpx.AsyncClient") as mock_client_cls:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_client = AsyncMock()
@@ -32,7 +32,7 @@ async def test_health_check_success(engine):
 
 @pytest.mark.asyncio
 async def test_health_check_failure(engine):
-    with patch("adapter.engines.vibevoice.engine.httpx.AsyncClient") as mock_client_cls:
+    with patch("asradapter.engines.vibevoice.engine.httpx.AsyncClient") as mock_client_cls:
         mock_client = AsyncMock()
         mock_client.get.side_effect = Exception("connection refused")
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -45,7 +45,7 @@ async def test_health_check_failure(engine):
 
 @pytest.mark.asyncio
 async def test_recognize_success(engine):
-    with patch("adapter.engines.vibevoice.engine.httpx.AsyncClient") as mock_client_cls:
+    with patch("asradapter.engines.vibevoice.engine.httpx.AsyncClient") as mock_client_cls:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.json.return_value = {"text": "你好", "confidence": 0.9}
@@ -63,7 +63,7 @@ async def test_recognize_success(engine):
 
 @pytest.mark.asyncio
 async def test_recognize_server_error(engine):
-    with patch("adapter.engines.vibevoice.engine.httpx.AsyncClient") as mock_client_cls:
+    with patch("asradapter.engines.vibevoice.engine.httpx.AsyncClient") as mock_client_cls:
         mock_client = AsyncMock()
         mock_client.post.side_effect = Exception("server error")
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)

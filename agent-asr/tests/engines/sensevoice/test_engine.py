@@ -1,8 +1,8 @@
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
-from adapter.base import ASREngine, ASRResult
-from adapter.engines.sensevoice.engine import SenseVoiceASREngine
+from asradapter.base import ASREngine, ASRResult
+from asradapter.engines.sensevoice.engine import SenseVoiceASREngine
 
 
 @pytest.fixture
@@ -50,7 +50,7 @@ async def test_health_check_success(engine):
     mock_client = _mock_async_client(response_status=200)
 
     with patch(
-        "adapter.engines.sensevoice.engine.httpx.AsyncClient",
+        "asradapter.engines.sensevoice.engine.httpx.AsyncClient",
         return_value=mock_client,
     ):
         result = await engine.health_check()
@@ -64,7 +64,7 @@ async def test_health_check_failure(engine):
     mock_client = _mock_async_client(side_effect=Exception("connection refused"))
 
     with patch(
-        "adapter.engines.sensevoice.engine.httpx.AsyncClient",
+        "asradapter.engines.sensevoice.engine.httpx.AsyncClient",
         return_value=mock_client,
     ):
         result = await engine.health_check()
@@ -80,7 +80,7 @@ async def test_recognize_success(engine):
     )
 
     with patch(
-        "adapter.engines.sensevoice.engine.httpx.AsyncClient",
+        "asradapter.engines.sensevoice.engine.httpx.AsyncClient",
         return_value=mock_client,
     ):
         result = await engine.recognize(b"fake-audio-bytes", {})
@@ -99,7 +99,7 @@ async def test_recognize_server_error(engine):
     )
 
     with patch(
-        "adapter.engines.sensevoice.engine.httpx.AsyncClient",
+        "asradapter.engines.sensevoice.engine.httpx.AsyncClient",
         return_value=mock_client,
     ):
         with pytest.raises(RuntimeError, match="SenseVoice recognition failed"):

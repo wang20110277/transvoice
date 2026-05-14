@@ -1,5 +1,5 @@
 import pytest
-from adapter.base import ASREngine, ASRResult
+from asradapter.base import ASREngine, ASRResult
 
 
 def test_asr_result_creation():
@@ -15,6 +15,6 @@ def test_asr_engine_is_abstract():
 
 
 def test_load_unknown_engine_raises():
-    from adapter.config import load_asr_engine
+    from asradapter.config import load_asr_engine
     with pytest.raises(ValueError, match="Unknown ASR engine"):
         load_asr_engine("nonexistent_engine")

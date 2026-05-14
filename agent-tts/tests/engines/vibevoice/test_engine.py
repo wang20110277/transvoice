@@ -1,8 +1,8 @@
 import os
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
-from adapter.base import TTSEngine, TTSResult
-from adapter.engines.vibevoice.engine import VibeVoiceTTSEngine
+from ttsadapter.base import TTSEngine, TTSResult
+from ttsadapter.engines.vibevoice.engine import VibeVoiceTTSEngine
 
 
 @pytest.fixture
@@ -16,7 +16,7 @@ def test_engine_inherits_base():
 
 
 def test_biz_type_profiles():
-    from adapter.engines.vibevoice.engine import BIZ_TYPE_PROFILES
+    from ttsadapter.engines.vibevoice.engine import BIZ_TYPE_PROFILES
     assert "customer_service" in BIZ_TYPE_PROFILES
     assert "collection" in BIZ_TYPE_PROFILES
     assert "marketing" in BIZ_TYPE_PROFILES
@@ -34,7 +34,7 @@ def test_get_profile_collection(engine):
 
 @pytest.mark.asyncio
 async def test_health_check_success(engine):
-    with patch("adapter.engines.vibevoice.engine.httpx.AsyncClient") as mock_client_cls:
+    with patch("ttsadapter.engines.vibevoice.engine.httpx.AsyncClient") as mock_client_cls:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_client = AsyncMock()
@@ -49,7 +49,7 @@ async def test_health_check_success(engine):
 
 @pytest.mark.asyncio
 async def test_health_check_failure(engine):
-    with patch("adapter.engines.vibevoice.engine.httpx.AsyncClient") as mock_client_cls:
+    with patch("ttsadapter.engines.vibevoice.engine.httpx.AsyncClient") as mock_client_cls:
         mock_client = AsyncMock()
         mock_client.get.side_effect = Exception("connection refused")
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -64,7 +64,7 @@ async def test_health_check_failure(engine):
 async def test_synthesize_cache_miss(engine, tmp_path):
     engine._cache_dir = str(tmp_path)
 
-    with patch("adapter.engines.vibevoice.engine.httpx.AsyncClient") as mock_client_cls:
+    with patch("ttsadapter.engines.vibevoice.engine.httpx.AsyncClient") as mock_client_cls:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.content = b"fake_wav_audio"
@@ -83,7 +83,7 @@ async def test_synthesize_cache_miss(engine, tmp_path):
 async def test_synthesize_cache_hit(engine, tmp_path):
     engine._cache_dir = str(tmp_path)
 
-    with patch("adapter.engines.vibevoice.engine.httpx.AsyncClient") as mock_client_cls:
+    with patch("ttsadapter.engines.vibevoice.engine.httpx.AsyncClient") as mock_client_cls:
         mock_client = AsyncMock()
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
@@ -105,7 +105,7 @@ async def test_synthesize_cache_hit(engine, tmp_path):
 async def test_synthesize_server_error(engine, tmp_path):
     engine._cache_dir = str(tmp_path)
 
-    with patch("adapter.engines.vibevoice.engine.httpx.AsyncClient") as mock_client_cls:
+    with patch("ttsadapter.engines.vibevoice.engine.httpx.AsyncClient") as mock_client_cls:
         mock_client = AsyncMock()
         mock_client.post.side_effect = Exception("server error")
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
