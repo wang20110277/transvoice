@@ -33,6 +33,67 @@
 # 更新后完整Mermaid时序图代码
 ![时序图](assert/时序图.svg)
 
+## 项目代码结构
+
+```
+aiphone/
+├── agent-asr/              # ASR 适配器 (FastAPI, 可插拔引擎)
+│   ├── asradapter/         # 适配器核心: main.py, base.py, config.py, storage.py
+│   │   └── engines/        # sensevoice/, vibevoice/
+│   ├── asrengine/          # SenseVoice 推理引擎服务 (Dockerfile + server.py)
+│   ├── deploy/             # 部署配置
+│   ├── Dockerfile          # 适配器镜像
+│   └── tests/              # test_base, test_main, test_storage, engines/*/
+├── agent-tts/              # TTS 适配器 (FastAPI, 可插拔引擎)
+│   ├── ttsadapter/         # 适配器核心: main.py, base.py, config.py, storage.py
+│   │   └── engines/        # cosyvoice/, vibevoice/
+│   ├── ttsengine/          # CosyVoice 推理引擎服务 (Dockerfile + server.py)
+│   ├── deploy/             # 部署配置
+│   ├── Dockerfile          # 适配器镜像
+│   └── tests/              # test_base, test_main, test_storage, engines/*/
+├── agent-orchestrator/     # LangGraph 7 节点编排 (FastAPI HTTP 服务)
+│   ├── src/                # 核心源码 (PYTHONPATH=src)
+│   │   ├── main.py         # FastAPI 入口: POST /call/speech, GET /healthz
+│   │   ├── config.py       # pydantic-settings, CALLBOT_ 环境变量前缀
+│   │   ├── database.py     # SQLAlchemy 2.0 async engine
+│   │   ├── clients/        # mcp.py (用户中心), tts.py (TTS HTTP 客户端)
+│   │   ├── graph/          # flow.py (7 节点 StateGraph), prompt.py, prompts/
+│   │   ├── llm/            # service.py (ChatOpenAI + 结构化输出 + embeddings)
+│   │   ├── memory/         # assembler.py, chat_history.py, redis_memory.py, store.py
+│   │   ├── rag/            # retriever.py (Agentic RAG: 自适应检索+文档评分+查询改写)
+│   │   ├── db/             # models.py (SQLAlchemy ORM, callbot schema, 9 表)
+│   │   └── storage/        # repository.py (异步仓储层)
+│   ├── llm/                # Qwen LLM 推理引擎 Dockerfile
+│   ├── alembic/            # 数据库迁移
+│   ├── Dockerfile          # 应用镜像 (含 alembic 自动迁移)
+│   └── tests/              # test suite
+├── deploy/                 # systemd 服务, 安装脚本, Prometheus 监控
+├── freeswitch/             # FreeSWITCH + UniMRCP 配置文件
+├── docs/                   # 设计规范, 实现方案
+└── assert/                 # 架构图, 时序图
+```
+
+### 引擎插件模式 (ASR & TTS)
+
+1. `asradapter/base.py` / `ttsadapter/base.py` 定义 ABC (`ASREngine` / `TTSEngine`)
+2. `engines/{name}/engine.py` 实现抽象基类，导出 `Engine = ConcreteClass`
+3. `config.yaml` 按名称选择活跃引擎
+4. `config.py` 通过 `importlib.import_module` 动态加载
+
+当前引擎: SenseVoice (ASR), VibeVoice (ASR), CosyVoice (TTS), VibeVoice (TTS)
+
+### LangGraph 7 节点流水线
+
+```
+① receive_asr    — 接收 ASR 文本，加载 Redis 对话历史
+② mcp_identity   — 查询用户中心（身份/姓名/性别）
+③ [条件] credit_query — 仅 marketing 查询征信
+④ recall_memory  — Redis 热记忆 + PG 长期记忆
+⑤ rag_retrieve   — Agentic RAG (自适应检索 → 文档评分 → 查询改写)
+⑥ llm_decide     — LLM 结构化输出 (LLMAction)
+⑦ tts_synthesize — 调用 TTS adapter，保存对话历史
+```
+
 
 ## 1. 系统整体架构图(文字拓扑) [1]
 
@@ -40,8 +101,8 @@
 **媒体流（必须走 MRCPv2，不允许绕过）**  
 - 被叫用户 ⇄ FreeSWITCH（SIP/RTP）  
 - FreeSWITCH（`mod_unimrcp`） ⇄ UniMRCP Server（MRCPv2）  
-  - ASR Resource → VibeVoice ASR（GPU0）  
-  - TTS Resource → VibeVoice TTS（GPU1）  
+  - ASR Resource → agent-asr adapter(:8080) → SenseVoice/VibeVoice ASR 引擎（GPU0）
+  - TTS Resource → agent-tts adapter(:8081) → CosyVoice/VibeVoice TTS 引擎（GPU1）  
 
 **控制流（ESL 事件驱动编排）**  
 - Orchestrator（Python，LangGraph） ⇄ FreeSWITCH（`mod_event_socket` / ESL）  
@@ -101,6 +162,7 @@
 - modelscope download --model microsoft/VibeVoice-Realtime-0.5B
 - Qwen3.5-9B（GPU2）：GPU×1、CPU 32C、内存 128GB
 - modelscope download --model Qwen/Qwen3.5-9B
+- 推理引擎: `agent-orchestrator/llm/Dockerfile`
 
 ### 2.4 数据与存储
 - PostgreSQL 17：CPU 16–32C、内存 128GB、NVMe（高 IOPS）
@@ -110,9 +172,7 @@
 
 ---
 
-## 3. VibeVoice ASR+TTS 完整安装步骤 [1]
-
-> 未提供你们 VibeVoice 的具体版本/安装包细节，这里给“可落地的部署标准与验收点”。Codex 落地时应将命令替换为你们内部 VibeVoice 安装说明。
+## 3. ASR/TTS 引擎部署步骤 [1]
 
 ### 3.1 通用准备
 1) 安装 NVIDIA Driver 与 CUDA（与模型要求匹配）
@@ -121,28 +181,39 @@
 - ASR：`CUDA_VISIBLE_DEVICES=0`
 - TTS：`CUDA_VISIBLE_DEVICES=1`
 
-### 3.2 ASR（GPU0）部署与验收
-- 启动常驻服务（供 UniMRCP 的 ASR Resource 调用）
-- 必须提供：
-  - 健康检查 `/healthz`
-  - 指标 `/metrics`（Prometheus）
-  - 识别服务接口（由 UniMRCP 适配）
+### 3.2 ASR 引擎部署 (GPU0)
+当前支持引擎: **SenseVoice** (默认), **VibeVoice**
 
-验收：
-- UniMRCP 能调用 ASR 服务完成识别（MRCP链路端到端通）
+**SenseVoice ASR** (基于 FunASR):
+- 模型下载: `modelscope download --model iic/SenseVoiceSmall`
+- 推理服务: `agent-asr/asrengine/` (Dockerfile + server.py)
+- 适配器: `agent-asr/asradapter/` (FastAPI HTTP 服务, port 8080)
+- 切换引擎: 修改 `asradapter/config.yaml` 中 `engine: sensevoice`
 
-### 3.3 TTS（GPU1）部署与验收
-- 启动常驻服务（供 UniMRCP 的 TTS Resource 调用）
-- 三业务 Profile 强隔离：
-  - 配置文件：`/etc/vibevoice-tts/{biz_type}/profile.yaml`
-  - 日志目录：`/var/log/vibevoice-tts/{biz_type}/`
-  - 缓存目录：`/data/tts_cache/{biz_type}/{tts_profile_version}/`
-- 必须提供：
-  - `/healthz`、`/metrics`
-  - 合成接口（由 UniMRCP 适配）
+**VibeVoice ASR**:
+- 模型下载: `modelscope download --model microsoft/VibeVoice-ASR`
 
-验收：
-- FreeSWITCH→MRCPv2→UniMRCP→TTS 能播报文字，且不同 biz_type 播报音色/语速等严格符合配置隔离
+验收:
+- UniMRCP → agent-asr adapter → ASR 引擎: 识别链路端到端通
+
+### 3.3 TTS 引擎部署 (GPU1)
+当前支持引擎: **CosyVoice** (默认), **VibeVoice**
+
+**CosyVoice TTS**:
+- 模型下载: `modelscope download --model iic/CosyVoice2-0.5B`
+- 推理服务: `agent-tts/ttsengine/` (Dockerfile + server.py)
+- 适配器: `agent-tts/ttsadapter/` (FastAPI HTTP 服务, port 8081)
+- 切换引擎: 修改 `ttsadapter/config.yaml` 中 `engine: cosyvoice`
+
+**VibeVoice TTS**:
+- 模型下载: `modelscope download --model microsoft/VibeVoice-Realtime-0.5B`
+
+三业务 Profile 强隔离:
+- TTS 引擎内置 `BIZ_TYPE_PROFILES` (voice_id/speed/volume/pitch 按 biz_type 隔离)
+
+验收:
+- FreeSWITCH → MRCPv2 → UniMRCP → agent-tts adapter → TTS 引擎: 播报链路端到端通
+- 不同 biz_type 播报音色/语速等严格符合配置隔离
 
 ---
 
@@ -217,7 +288,7 @@
 
 ---
 
-## 7. Python AI对话完整源码(对接Qwen3.6+ASR+TTS) [1]
+## 7. Python AI对话完整源码(对接Qwen3.5-9B+ASR+TTS) [1]
 
 你要交给 Codex “完整落地”，这里给**可直接生成代码的实现规范**（模块、函数、状态机、ESL事件处理、DB/Redis/记忆写入、错误处理都明确）。Codex 只需按此规范补齐具体库调用与配置文件即可。
 
@@ -238,7 +309,7 @@
   - `tts_speak(uuid, tts_profile, text)`
   - `transfer(uuid, dest)`
 - `graph_flow.py`：LangGraph StateGraph（强流程）
-- `llm_qwen.py`：Qwen3.6调用 + JSON schema 校验 + 超时重试 + 降级
+- `llm_qwen.py`：Qwen3.5-9B调用 + JSON schema 校验 + 超时重试 + 降级
 - `mq_identity.py`：RocketMQ req/resp（request_id=fs_uuid）
 - `storage_artifacts.py`：NAS落盘、MinIO归档、artifact元数据
 - `db_pg.py`：PG17 DDL对应的插入/查询
@@ -255,7 +326,7 @@
 - `DETECTED_SPEECH`：
   1) 落库 user turn（含置信度）
   2) 召回记忆块（mem0+Redis+pgvector）
-  3) Qwen3.6 决策输出结构化动作
+  3) Qwen3.5-9B 决策输出结构化动作
   4) 二次校验合规/门禁（催收敏感字段仅核验后允许）
   5) 执行动作：
      - say/ask：TTS播报（或命中缓存播音频）
@@ -278,10 +349,12 @@
 必须服务化拆分：
 - `freeswitch.service`
 - `unimrcp.service`
-- `vibevoice-asr.service`（GPU0）
-- `vibevoice-tts.service`（GPU1）
-- `qwen36.service`（GPU2）
-- `orchestrator.service`
+- `asr-engine.service`（GPU0, SenseVoice/FunASR Server）
+- `asr-adapter.service`（agent-asr FastAPI adapter）
+- `tts-engine.service`（GPU1, CosyVoice Server）
+- `tts-adapter.service`（agent-tts FastAPI adapter）
+- `llm-engine.service`（GPU2, Qwen3.5-9B）
+- `orchestrator.service`（agent-orchestrator FastAPI）
 - `postgresql.service` `redis.service` `minio.service`（如自建）
 
 关键要求：
@@ -685,6 +758,21 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 │   └── unimrcpserver.xml          # UniMRCP 服务端配置
 └── orchestrator/
     └── event_handling_spec.md     # 事件处理规范
+
+应用服务组件/
+├── agent-asr/
+│   ├── asradapter/    # ASR 适配器 (FastAPI, port 8080)
+│   ├── asrengine/     # ASR 推理引擎 (SenseVoice)
+│   └── Dockerfile
+├── agent-tts/
+│   ├── ttsadapter/    # TTS 适配器 (FastAPI, port 8081)
+│   ├── ttsengine/     # TTS 推理引擎 (CosyVoice)
+│   └── Dockerfile
+├── agent-orchestrator/
+│   ├── src/           # 核心源码 (LangGraph 7 节点, port 8000)
+│   ├── llm/           # LLM 推理引擎 (Qwen3.5-9B)
+│   ├── alembic/       # 数据库迁移
+│   └── Dockerfile
 ```
 
 ## 部署顺序
@@ -739,12 +827,12 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
     │
     ├─→ FreeSWITCH (mod_sofia)
     │       │
-    │       ├─→ mod_unimrcp ──→ UniMRCP ──→ VibeVoice ASR (GPU0)
-    │       │                                  VibeVoice TTS (GPU1)
+    │       ├─→ mod_unimrcp ──→ UniMRCP ──→ agent-asr adapter (:8080) ──→ SenseVoice/VibeVoice ASR (GPU0)
+    │       │                                  agent-tts adapter (:8081) ──→ CosyVoice/VibeVoice TTS (GPU1)
     │       │
     │       ├─→ mod_event_socket ──→ ESL ──→ Orchestrator (Python)
     │       │                                        │
-    │       │                                        ├─→ Qwen3.6 (GPU2)
+    │       │                                        ├─→ Qwen3.5-9B (GPU2)
     │       │                                        ├─→ Redis
     │       │                                        ├─→ PG17 (pgvector)
     │       │                                        ├─→ RocketMQ
@@ -793,9 +881,12 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 | FS | ESL 端口 | 8021 |
 | FS | ESL 密码 | ClueCon |
 | UniMRCP | MRCP 端口 | 8060 |
-| ASR | 服务地址 | 10.0.0.20:8080 |
-| TTS | 服务地址 | 10.0.0.21:8080 |
-| LLM | 服务地址 | 10.0.0.22:8080 |
+| ASR adapter | 服务地址 | :8080 |
+| ASR engine | 推理地址 | SENSEVOICE_API_URL |
+| TTS adapter | 服务地址 | :8081 |
+| TTS engine | 推理地址 | COSYVOICE_API_URL |
+| LLM | 推理地址 | Qwen3.5-9B (GPU2) |
+| Orchestrator | 服务地址 | :8000 |
 | Redis | 地址 | 10.0.0.30:6379 |
 | PG | 地址 | 10.0.0.31:5432 |
 | MinIO | 地址 | 10.0.0.32:9000 |
