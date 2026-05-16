@@ -1,0 +1,33 @@
+# 生产环境覆盖 — GPU 推理 + vLLM
+# 用法: docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile vllm up -d
+
+services:
+  agent-asr:
+    build:
+      context: ./agent-asr
+      dockerfile: Dockerfile
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${ASR_GPU_ID:-0}"]
+              capabilities: [gpu]
+
+  agent-tts:
+    build:
+      context: ./agent-tts
+      dockerfile: Dockerfile
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${TTS_GPU_ID:-1}"]
+              capabilities: [gpu]
+
+  agent-flow:
+    environment:
+      CALLBOT_LLM_BASE_URL: ${CALLBOT_LLM_BASE_URL:-http://vllm:8083/v1}
+      CALLBOT_LLM_MODEL: ${VLLM_SERVED_NAME:-qwen3.5-9b}
+      CALLBOT_MCP_SERVER_URL: ${CALLBOT_MCP_SERVER_URL:-http://mcp-server:9090/mcp/}
