@@ -1,4 +1,4 @@
-"""LLM 服务层 - LangChain 1.2 ChatOpenAI + 结构化输出"""
+"""LLM 服务层 - 根据 llm_device 自动适配 Ollama(CPU) / vLLM(GPU)"""
 import json
 import logging
 from pydantic import BaseModel, Field
@@ -20,25 +20,37 @@ class LLMAction(BaseModel):
 
 
 class LLMService:
-    """LLM 服务封装 - LangChain 1.2 结构化输出"""
+    """LLM 服务封装 — 自动适配 Ollama(CPU) / vLLM(GPU)"""
 
     def __init__(self):
+        is_gpu = settings.llm_device == "gpu"
+        backend = "vLLM(GPU)" if is_gpu else "Ollama(CPU)"
+        logger.info("LLM 后端: %s, model=%s, base_url=%s", backend, settings.llm_model, settings.llm_base_url)
+
+        # GPU 超时短、token 多；CPU 超时长、token 少
+        timeout = settings.llm_timeout_sec
+        max_tokens = 512 if is_gpu else 256
+
         self._chat = ChatOpenAI(
             base_url=settings.llm_base_url,
             model=settings.llm_model,
-            timeout=settings.llm_timeout_sec,
-            max_tokens=256,
+            timeout=timeout,
+            max_tokens=max_tokens,
             temperature=0.7,
         )
-        # 结构化输出绑定（LangChain 1.2 with_structured_output）
+
+        # vLLM 支持 json_schema 精确约束；Ollama 用 json_mode 兜底
+        method = "json_schema" if is_gpu else "json_mode"
         self._structured_chat = self._chat.with_structured_output(
             LLMAction,
-            method="json_mode",
+            method=method,
         )
+
         self._embeddings = OpenAIEmbeddings(
             base_url=settings.llm_base_url,
             model=settings.llm_embedding_model,
         )
+        self._is_gpu = is_gpu
 
     async def chat(self, messages: list) -> str:
         """发送对话消息，返回文本响应"""
@@ -47,16 +59,18 @@ class LLMService:
         return response.content
 
     async def chat_for_action(self, messages: list) -> LLMAction:
-        """发送对话并解析为结构化动作（LangChain 1.2 结构化输出）"""
+        """发送对话并解析为结构化动作"""
         lc_messages = self._to_lc_messages(messages)
         try:
             result = await self._structured_chat.ainvoke(lc_messages)
             if isinstance(result, LLMAction):
                 return result
-            # 兜底：如果返回非结构化结果，手动解析
             return self._parse_fallback(str(result))
         except Exception as e:
-            logger.error(f"结构化输出失败，尝试手动解析: {e}")
+            logger.error("结构化输出失败: %s", e)
+            # GPU 失败不重试直接降级；CPU 尝试纯文本再解析
+            if self._is_gpu:
+                return LLMAction(action="say", text=FALLBACK_ACTION_TEXT)
             try:
                 raw = await self.chat(messages)
                 return self._parse_fallback(raw)
@@ -77,7 +91,7 @@ class LLMService:
             response = await self._chat.ainvoke([HumanMessage(content="ping")])
             return bool(response.content)
         except Exception as e:
-            logger.error(f"LLM 健康检查失败: {e}")
+            logger.error("LLM 健康检查失败: %s", e)
             return False
 
     @staticmethod
@@ -118,7 +132,7 @@ class LLMService:
         if action_match and text_match:
             return LLMAction(action=action_match.group(1), text=text_match.group(1))
 
-        logger.warning(f"LLM 响应解析失败，使用兜底: {raw[:100]}")
+        logger.warning("LLM 响应解析失败，使用兜底: %s", raw[:100])
         return LLMAction(action="say", text=FALLBACK_ACTION_TEXT)
 
 

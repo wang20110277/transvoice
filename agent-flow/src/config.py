@@ -34,9 +34,9 @@ class Settings(BaseSettings):
     llm_timeout_sec: float = 3.0
 
     # LLM
-    llm_engine: str = "qwen"
+    llm_device: str = "cpu"  # cpu=Ollama, gpu=vLLM
     llm_base_url: str = "http://127.0.0.1:8083/v1"
-    llm_model: str = "qwen3.5-9b"
+    llm_model: str = "qwen3:8b"
     llm_embedding_model: str = "text-embedding-v3"
 
     # MCP
