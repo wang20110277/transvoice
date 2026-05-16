@@ -105,7 +105,7 @@ Current engines: SenseVoice (ASR, built-in FunASR GPU inference), VibeVoice (ASR
 Three biz_types: `customer_service`, `collection`, `marketing`. Isolated at:
 - TTS: voice profiles per engine (`BIZ_TYPE_PROFILES` dict with voice_id/speed/volume/pitch)
 - Redis: key prefix `cb:{biz_type}:...`
-- PostgreSQL: `biz_type` column on all tables, HASH partitioning
+- PostgreSQL: `biz_type` column on all tables; sharding strategy: 单表起步，后期 Citus/pgcat 水平扩展，分布键 `user_id`（非 biz_type）
 - Prompts: `prompts/{biz_type}.yaml`
 - Credit query: only marketing biz_type
 
