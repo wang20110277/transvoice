@@ -1,54 +1,56 @@
 import asyncio
 import logging
 import os
-
-import httpx
+import tempfile
+import uuid
 
 from asradapter.base import ASREngine, ASRResult
 
 logger = logging.getLogger(__name__)
 
-SENSEVOICE_API_URL = os.environ.get("SENSEVOICE_API_URL", "http://127.0.0.1:10095")
-SENSEVOICE_TIMEOUT = int(os.environ.get("SENSEVOICE_TIMEOUT", "30"))
+MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/sensevoice/models/SenseVoiceSmall")
 SENSEVOICE_LANGUAGE = os.environ.get("SENSEVOICE_LANGUAGE", "zh")
 SENSEVOICE_MAX_CONCURRENT = int(os.environ.get("SENSEVOICE_MAX_CONCURRENT", "50"))
 
 
 class SenseVoiceASREngine(ASREngine):
     def __init__(self):
-        self._api_url = SENSEVOICE_API_URL
-        self._timeout = SENSEVOICE_TIMEOUT
         self._language = SENSEVOICE_LANGUAGE
         self._semaphore = asyncio.Semaphore(SENSEVOICE_MAX_CONCURRENT)
+        self._model = None
+
+    async def load_model(self):
+        from funasr import AutoModel
+        logger.info("Loading SenseVoice model from %s", MODEL_DIR)
+        self._model = AutoModel(model=MODEL_DIR, disable_update=True)
+        logger.info("SenseVoice model loaded")
 
     async def recognize(self, audio_stream: bytes, params: dict) -> ASRResult:
+        if self._model is None:
+            raise RuntimeError("SenseVoice model not loaded")
+
         async with self._semaphore:
+            tmp_path = os.path.join(tempfile.gettempdir(), f"asr_{uuid.uuid4().hex}.wav")
             try:
-                async with httpx.AsyncClient(timeout=self._timeout) as client:
-                    resp = await client.post(
-                        f"{self._api_url}/asr",
-                        files={"audio": ("audio.wav", audio_stream, "audio/wav")},
-                        data={"language": params.get("language", self._language)},
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    return ASRResult(
-                        text=data.get("text", ""),
-                        confidence=data.get("confidence", 0.0),
-                        is_final=True,
-                    )
+                with open(tmp_path, "wb") as f:
+                    f.write(audio_stream)
+
+                result = self._model.generate(
+                    input=tmp_path,
+                    language=params.get("language", self._language),
+                    batch_size_s=300,
+                )
+                text = result[0]["text"] if result else ""
+                return ASRResult(text=text, confidence=0.95, is_final=True)
             except Exception as e:
-                logger.error(f"SenseVoice recognition failed: {e}")
+                logger.error("SenseVoice recognition failed: %s", e)
                 raise RuntimeError(f"SenseVoice recognition failed: {e}") from e
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
 
     async def health_check(self) -> bool:
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                resp = await client.get(f"{self._api_url}/health")
-                return resp.status_code == 200
-        except Exception as e:
-            logger.warning(f"SenseVoice health check failed: {e}")
-            return False
+        return self._model is not None
 
 
 Engine = SenseVoiceASREngine

@@ -1,16 +1,15 @@
 import asyncio
 import hashlib
+import io
 import logging
 import os
 
-import httpx
-
 from ttsadapter.base import TTSEngine, TTSResult
+from cosyvoice.cli.cosyvoice import CosyVoice2
 
 logger = logging.getLogger(__name__)
 
-COSYVOICE_API_URL = os.environ.get("COSYVOICE_API_URL", "http://127.0.0.1:10096")
-COSYVOICE_TIMEOUT = int(os.environ.get("COSYVOICE_TIMEOUT", "30"))
+MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/cosyvoice/pretrained_models/CosyVoice2-0.5B")
 COSYVOICE_MAX_CONCURRENT = int(os.environ.get("COSYVOICE_MAX_CONCURRENT", "30"))
 
 BIZ_TYPE_PROFILES = {
@@ -24,10 +23,18 @@ DEFAULT_PROFILE = BIZ_TYPE_PROFILES["customer_service"]
 
 class CosyVoiceTTSEngine(TTSEngine):
     def __init__(self):
-        self._api_url = COSYVOICE_API_URL
-        self._timeout = COSYVOICE_TIMEOUT
         self._cache_dir = "/data/tts_cache"
         self._semaphore = asyncio.Semaphore(COSYVOICE_MAX_CONCURRENT)
+        self._model = None
+
+    async def load_model(self):
+        import sys
+        runtime_path = os.environ.get("COSYVOICE_RUNTIME", "/opt/cosyvoice/runtime")
+        if runtime_path not in sys.path:
+            sys.path.insert(0, runtime_path)
+        logger.info("Loading CosyVoice2 model from %s", MODEL_DIR)
+        self._model = CosyVoice2(MODEL_DIR)
+        logger.info("CosyVoice2 model loaded")
 
     def _get_profile(self, params: dict) -> dict:
         biz_type = params.get("biz_type", "customer_service")
@@ -41,6 +48,9 @@ class CosyVoiceTTSEngine(TTSEngine):
         return os.path.join(self._cache_dir, biz_type, f"{key}.wav")
 
     async def synthesize(self, text: str, params: dict) -> TTSResult:
+        if self._model is None:
+            raise RuntimeError("CosyVoice model not loaded")
+
         async with self._semaphore:
             profile = self._get_profile(params)
             biz_type = params.get("biz_type", "customer_service")
@@ -51,19 +61,14 @@ class CosyVoiceTTSEngine(TTSEngine):
                     return TTSResult(audio=f.read())
 
             try:
-                async with httpx.AsyncClient(timeout=self._timeout) as client:
-                    resp = await client.post(
-                        f"{self._api_url}/tts",
-                        json={
-                            "text": text,
-                            "speaker_id": profile["voice_id"],
-                            "speed": profile["speed"],
-                            "volume": profile["volume"],
-                            "pitch": profile["pitch"],
-                        },
-                    )
-                    resp.raise_for_status()
-                    audio = resp.content
+                import soundfile as sf
+                buffer = io.BytesIO()
+                for chunk in self._model.inference_sft(text, profile["voice_id"], stream=False):
+                    sf.write(buffer, chunk["tts_speech"].numpy().flatten(), 22050, format="WAV")
+                    break
+
+                buffer.seek(0)
+                audio = buffer.read()
 
                 os.makedirs(os.path.dirname(cache_path), exist_ok=True)
                 with open(cache_path, "wb") as f:
@@ -71,17 +76,11 @@ class CosyVoiceTTSEngine(TTSEngine):
 
                 return TTSResult(audio=audio)
             except Exception as e:
-                logger.error(f"CosyVoice synthesis failed: {e}")
+                logger.error("CosyVoice synthesis failed: %s", e)
                 raise RuntimeError(f"CosyVoice synthesis failed: {e}") from e
 
     async def health_check(self) -> bool:
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                resp = await client.get(f"{self._api_url}/health")
-                return resp.status_code == 200
-        except Exception as e:
-            logger.warning(f"CosyVoice health check failed: {e}")
-            return False
+        return self._model is not None
 
 
 Engine = CosyVoiceTTSEngine

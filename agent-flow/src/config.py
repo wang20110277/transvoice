@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     minio_access_key: str = "admin"
     minio_secret_key: str = "changeme123"
 
+    # ASR adapter
+    asr_adapter_url: str = "http://127.0.0.1:8080"
+
     # TTS adapter
     tts_adapter_url: str = "http://127.0.0.1:8081"
 
@@ -44,6 +47,9 @@ class Settings(BaseSettings):
     rag_top_k: int = 3
     rag_similarity_threshold: float = 0.7
     rag_max_retries: int = 2
+
+    # Audio temp
+    temp_dir: str = "/tmp/aiphone_tts"
 
     model_config = {"env_prefix": "CALLBOT_", "env_file": ".env", "extra": "ignore"}
 

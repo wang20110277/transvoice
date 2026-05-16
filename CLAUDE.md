@@ -53,29 +53,27 @@ cd mcp-server/java-mcp-server && JAVA_HOME=/opt/homebrew/opt/openjdk ./mvnw spri
 
 ```
 SIP Caller → FreeSWITCH (mod_sofia, SIP/RTP)
-    └─ mod_unimrcp (MRCPv2) → UniMRCP Server (:8060)
-         ├─ ASR: 音频 → agent-asr (:8080) → 识别文本
-         ├─ 决策: 文本 → agent-flow (:8000) → 7-node pipeline → LLM → 回复文本
-         │    ├─ Node ②/③: MCP client → java-mcp-server (:9090) 用户中心
-         │    └─ Node ⑦: → agent-tts (:8081) → 合成音频
-         └─ TTS: 音频 → FreeSWITCH → SIP Caller（全程对客户无感）
+    └─ mod_audio_fork (WebSocket) → agent-flow (:8000)
+         ├─ Node ①: agent-asr (:8080) 内置 GPU 推理 → 识别文本
+         ├─ Node ②/③: MCP client → java-mcp-server (:9090) 用户中心
+         ├─ Node ⑥: Qwen LLM (GPU2 :8083) → 回复文本
+         └─ Node ⑦: agent-tts (:8081) 内置 GPU 推理 → 合成音频 → 回传 FreeSWITCH
 ```
 
 Data flow per turn:
 ```
-呼入: FreeSWITCH → UniMRCP → agent-asr → 识别文本
-决策: UniMRCP → agent-flow → LangGraph 7节点 → MCP/LLM/记忆/RAG → 回复文本
-合成: agent-flow → agent-tts → 音频
-呼出: 音频 → UniMRCP → FreeSWITCH → SIP Caller
+呼入: FreeSWITCH → mod_audio_fork → agent-flow WebSocket → ASR → 识别文本
+决策: agent-flow → LangGraph 7节点 → MCP/LLM/记忆/RAG → 回复文本
+合成: agent-flow → agent-tts → 音频 → WebSocket → FreeSWITCH → SIP Caller
 ```
 
-### Four Components
+### Three Components
 
-**agent-asr** — FastAPI adapter with pluggable ASR engines. Receives audio from UniMRCP, uploads to MinIO, forwards to engine for recognition. Endpoints: `POST /asr/recognize`, `GET /asr/audio/{call_id}`, `GET /healthz`.
+**agent-asr** — FastAPI service with pluggable ASR engines and built-in GPU inference. Loads SenseVoice (FunASR) model directly in-process, no separate inference server needed. Receives audio from agent-flow, runs recognition, uploads to MinIO. Endpoints: `POST /asr/recognize`, `GET /asr/audio/{call_id}`, `GET /healthz`.
 
-**agent-tts** — FastAPI adapter with pluggable TTS engines. Receives text from orchestrator, synthesizes audio, uploads to MinIO. Endpoints: `POST /tts/synthesize` (binary), `POST /tts/synthesize_json` (JSON with base64 audio + minio_key), `GET /healthz`.
+**agent-tts** — FastAPI service with pluggable TTS engines and built-in GPU inference. Loads CosyVoice2 model directly in-process, no separate inference server needed. Receives text from orchestrator, synthesizes audio, uploads to MinIO. Disk cache keyed by voice+text hash, biz_type voice profiles. Endpoints: `POST /tts/synthesize` (binary), `POST /tts/synthesize_json` (JSON with base64 audio + minio_key), `GET /healthz`.
 
-**agent-flow** — FastAPI HTTP service. Receives ASR text from UniMRCP via `POST /call/speech`, runs 7-node LangGraph pipeline, calls agent-tts to synthesize audio, returns result to UniMRCP. LLM via LangChain ChatOpenAI with structured output (`LLMAction`). Conversation history via langchain-redis `RedisChatMessageHistory`. Agentic RAG with adaptive retrieval + document grading + query rewriting.
+**agent-flow** — FastAPI HTTP + WebSocket service. FreeSWITCH connects via mod_audio_fork WebSocket (`/ws/call`) for bidirectional audio streaming. Also exposes HTTP endpoints: `POST /call/speech` (text input), `POST /call/turn` (audio input). Runs 7-node LangGraph pipeline with LLM structured output (`LLMAction`). Conversation history via langchain-redis. Agentic RAG with adaptive retrieval + document grading + query rewriting. VAD-based silence detection for end-of-speech.
 
 **java-mcp-server** — Spring Boot 3.5 + Spring AI 1.1.6 stateless MCP server (WebMVC transport). Serves as the user center backend for orchestrator nodes ② and ③. Exposes two MCP tools: `user_identity_query` (phone + biz_type → user_id, phone_masked, id_card_last_four) and `user_credit_query` (user_id → credit_qualified, risk_level). Endpoint: `POST /mcp` on port 9090.
 
@@ -100,7 +98,7 @@ Data flow per turn:
 
 To add a new engine: create engine directory + `engine.py` implementing the ABC, update `config.yaml`.
 
-Current engines: SenseVoice (ASR, calls FunASR Server), VibeVoice (ASR), CosyVoice (TTS), VibeVoice (TTS). All call external model servers via httpx AsyncClient.
+Current engines: SenseVoice (ASR, built-in FunASR GPU inference), VibeVoice (ASR, remote HTTP), CosyVoice (TTS, built-in CosyVoice2 GPU inference), VibeVoice (TTS, remote HTTP).
 
 ### Business Type Isolation
 
@@ -122,9 +120,11 @@ Full adaptive + corrective RAG inside `rag_retrieve_node`:
 ### Configuration
 
 - **Orchestrator**: `pydantic-settings` with `CALLBOT_` env prefix, reads `.env`
-- **ASR/TTS adapters**: `config.yaml` for engine name + env vars for API URLs and MinIO
+- **ASR/TTS**: `config.yaml` for engine name + env vars for model paths, API URLs and MinIO
 - **MinIO**: `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, `MINIO_BUCKET` (optional, disabled when empty)
-- **Engine URLs**: `SENSEVOICE_API_URL`, `COSYVOICE_API_URL`, `VIBEVOICE_ASR_API_URL`, `VIBEVOICE_TTS_API_URL`
+- **ASR model**: `MODEL_DIR` (SenseVoice path), `SENSEVOICE_LANGUAGE`
+- **TTS model**: `MODEL_DIR` (CosyVoice2 path), `COSYVOICE_RUNTIME`
+- **Remote engines**: `VIBEVOICE_ASR_API_URL`, `VIBEVOICE_TTS_API_URL`
 - **RAG**: `CALLBOT_RAG_TOP_K` (default 3), `CALLBOT_RAG_SIMILARITY_THRESHOLD` (default 0.7), `CALLBOT_RAG_MAX_RETRIES` (default 2)
 - **MCP Server**: `application.yaml` with `spring.ai.mcp.server.*` properties, STATELESS protocol, WebMVC transport, port 9090
 
@@ -132,13 +132,16 @@ Full adaptive + corrective RAG inside `rag_retrieve_node`:
 
 | Module | Role |
 |--------|------|
-| `main.py` | FastAPI app with lifespan init, `POST /call/speech` (from UniMRCP), `GET /healthz` |
+| `main.py` | FastAPI app with lifespan init, `POST /call/speech`, `POST /call/turn`, `WS /ws/call`, `GET /healthz` |
 | `src/config.py` | pydantic-settings, all config via `CALLBOT_` env prefix |
 | `src/database.py` | SQLAlchemy 2.0 async engine + session factory |
 | `src/graph/flow.py` | LangGraph 7-node StateGraph pipeline |
 | `src/graph/prompt.py` | System prompt + RAG + memory + chat history assembly |
 | `src/clients/mcp.py` | MCP client → java-mcp-server (identity/credit query via langchain-mcp-adapters) |
 | `src/clients/tts.py` | TTS adapter HTTP client |
+| `src/clients/asr.py` | ASR adapter HTTP client |
+| `src/ws/handler.py` | WebSocket bidirectional audio handler (mod_audio_fork) |
+| `src/ws/vad.py` | VAD (Voice Activity Detection) with RMS energy silence detection |
 | `src/llm/service.py` | LangChain ChatOpenAI with structured output + embeddings |
 | `src/memory/assembler.py` | Aggregates Redis hot facts + PG long-term facts |
 | `src/memory/chat_history.py` | langchain-redis `RedisChatMessageHistory` conversation memory |
@@ -152,24 +155,25 @@ Full adaptive + corrective RAG inside `rag_retrieve_node`:
 
 ```
 aiphone/
-├── agent-asr/           # ASR adapter (FastAPI, pluggable engines)
+├── agent-asr/           # ASR service (FastAPI, built-in GPU inference)
 │   ├── asradapter/      # main.py, base.py, config.py
 │   │   ├── store/       # storage.py (MinIO upload)
-│   │   └── engines/     # sensevoice/, vibevoice/
-│   ├── asrengine/       # SenseVoice 推理引擎 (Dockerfile + server.py)
+│   │   └── engines/     # sensevoice/ (GPU), vibevoice/ (remote HTTP)
+│   ├── Dockerfile       # PyTorch GPU image, model download
 │   └── tests/           # test_base, test_main, test_storage, engines/
-├── agent-tts/           # TTS adapter (FastAPI, pluggable engines)
+├── agent-tts/           # TTS service (FastAPI, built-in GPU inference)
 │   ├── ttsadapter/      # main.py, base.py, config.py
 │   │   ├── store/       # storage.py (MinIO upload)
-│   │   └── engines/     # cosyvoice/, vibevoice/
-│   ├── ttsengine/       # CosyVoice 推理引擎 (Dockerfile + server.py)
+│   │   └── engines/     # cosyvoice/ (GPU), vibevoice/ (remote HTTP)
+│   ├── Dockerfile       # PyTorch GPU image, model download
 │   └── tests/           # test_base, test_main, test_storage, engines/
-├── agent-flow/  # LangGraph 7-node pipeline (FastAPI HTTP service)
-│   ├── main.py          # FastAPI entry point
+├── agent-flow/  # LangGraph 7-node pipeline (FastAPI HTTP + WebSocket)
+│   ├── main.py          # FastAPI entry point (HTTP + WebSocket)
 │   ├── src/             # 核心源码 (PYTHONPATH includes src/)
 │   │   ├── config.py    # pydantic-settings
 │   │   ├── database.py  # SQLAlchemy async engine
-│   │   ├── clients/     # mcp.py, tts.py
+│   │   ├── clients/     # mcp.py, tts.py, asr.py
+│   │   ├── ws/          # handler.py (WebSocket), vad.py (VAD)
 │   │   ├── graph/       # flow.py, prompt.py, prompts/
 │   │   ├── llm/         # service.py (ChatOpenAI + structured output)
 │   │   ├── memory/      # assembler.py, chat_history.py, redis_memory.py, store.py
@@ -188,7 +192,7 @@ aiphone/
 │       └── src/main/resources/
 │           └── application.yaml        # MCP server config (STATELESS, /mcp endpoint)
 ├── deploy/              # systemd services, install scripts, monitoring
-├── freeswitch/          # FreeSWITCH + UniMRCP configs
+├── freeswitch/          # FreeSWITCH configs (mod_audio_fork WebSocket)
 └── docs/                # design specs, implementation plans
 ```
 
@@ -197,7 +201,6 @@ aiphone/
 - **PostgreSQL 17** with pgvector extension, schema `callbot`, 9 tables
 - **Redis** for hot memory, conversation history (langchain-redis), session state
 - **MinIO** for audio archiving
-- **FreeSWITCH 1.10.12** compiled from source with mod_unimrcp
+- **FreeSWITCH 1.10.12** compiled from source with mod_audio_fork
 - **Java MCP Server** Spring Boot 3.5 + Spring AI 1.1.6, Java 25, Maven build
-- **UniMRCP** compiled from source
-- **GPU allocation**: ASR=GPU0, TTS=GPU1, LLM(Qwen)=GPU2(:8083)
+- **GPU allocation**: ASR=GPU0 (agent-asr内置), TTS=GPU1 (agent-tts内置), LLM(Qwen)=GPU2(:8083)

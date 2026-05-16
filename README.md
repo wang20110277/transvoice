@@ -3,25 +3,24 @@
 
 1. **接入层**：SIP User发起外呼通话，通话媒体流、通话唯一标识CallID、主叫/被叫用户手机号同步上行传输
 2. **语音交换层**：通话接入FreeSWITCH软交换，负责媒体流转发、通话事件调度、上下行语音流中转，全程携带CallID+手机号
-3. **语音识别层**：FreeSWITCH基于UniMRCP协议对接MRCP ASR语音识别引擎，通过事件通知机制传输实时用户语音流，ASR引擎完成语音转文字，生成**同时携带CallID与用户手机号**的ASR识别文本
-4. **编排接入层**：UniMRCP Server将ASR识别文本通过HTTP JSON接口推送至LangGraph流程编排调度器，**文本、CallID、手机号统一存入LangGraph全局状态State中持久留存**，不丢失原始用户对话与身份标识数据，整个过程对客户无感
+3. **WebSocket音频流层**：FreeSWITCH通过mod_audio_fork建立与agent-flow的WebSocket双向音频流，**上行传输用户语音PCM流，下行接收TTS合成音频**，全程携带CallID与用户手机号
+4. **语音识别层**：agent-flow首节点调用agent-asr（内置GPU推理引擎），完成语音转文字，生成**同时携带CallID与用户手机号**的ASR识别文本
 5. **LangGraph第一业务节点（用户身份核验）**
 编排引擎内置MCP Client，通过HTTP Streamable传输协议调用java-mcp-server用户中心MCP服务，**传入用户手机号**调用`user_identity_query`工具；查询获取用户ID、脱敏手机号、身份证后四位，流程全程保留State内ASR文本、CallID、手机号
 6. **LangGraph第二业务节点（征信合规核验）**
 复用MCP Client调用java-mcp-server，**使用用户ID**调用`user_credit_query`工具，获取用户征信档案数据，校验征信资质与风险等级（仅marketing业务类型触发），征信不合规直接触发风控预警，以上两个业务节点执行全程保留LangGraph状态内的ASR原始文本、CallID、手机号
 7. **LangGraph第三业务节点（LLM智能应答 + TTS语音合成）**
-**从LangGraph全局State中提取完整ASR用户识别文本、CallID、用户手机号、用户ID**，统一送入LLM大模型；LLM解析用户语音文本语义，结合用户手机号绑定的历史用户数据，自主判定是否调取RAG知识库匹配业务标准话术，最终生成标准化外呼应答话术文本；编排器调用agent-tts将话术文本合成语音音频，归档至MinIO；依托LangChain Memory记忆体系做分层数据存储：Redis存储短期会话记忆、PostgreSQL(PG)存储长期业务会话数据、Mem0存储永久全域对话记忆，同步记录实时对话内容、语音文件存储路径、绑定手机号与CallID关联关系，支持客户二次呼入时通过**用户ID/手机号/CallID**双维度调取全量历史会话数据，结合历史对话信息生成连贯应答话术
-8. **终端播放层**：UniMRCP将合成语音流回调至FreeSWITCH，FreeSWITCH下行推送至SIP User通话终端，完成整通智能外呼语音交互闭环。整个ASR识别→编排决策→TTS合成的处理链路对客户完全无感
-9. **引擎联动通知层**：TTS语音合成完成后，主动发送事件通知至MRCP TTS引擎，由MRCP TTS引擎回调通知FreeSWITCH软交换服务器，回调信息携带对应CallID与用户手机号
+**从LangGraph全局State中提取完整ASR用户识别文本、CallID、用户手机号、用户ID**，统一送入LLM大模型；LLM解析用户语音文本语义，结合用户手机号绑定的历史用户数据，自主判定是否调取RAG知识库匹配业务标准话术，最终生成标准化外呼应答话术文本；编排器调用agent-tts（内置GPU推理引擎）将话术文本合成语音音频，归档至MinIO；依托LangChain Memory记忆体系做分层数据存储：Redis存储短期会话记忆、PostgreSQL(PG)存储长期业务会话数据，同步记录实时对话内容、语音文件存储路径、绑定手机号与CallID关联关系，支持客户二次呼入时通过**用户ID/手机号/CallID**双维度调取全量历史会话数据，结合历史对话信息生成连贯应答话术
+8. **终端播放层**：agent-flow通过WebSocket将TTS音频回传FreeSWITCH，FreeSWITCH下行推送至SIP User通话终端，完成整通智能外呼语音交互闭环
 
 ## 统一绘图强制规范
 1. 整体布局：数据流从左至右分层排布，层级从上至下划分清晰
-2. 明确标注所有协议：SIP、UniMRCP、HTTP JSON、MCP
-3. 重点高亮：**UniMRCP 串联 ASR→orchestrator→TTS 完整链路，对客户无感**
-4. 区分交互模式：事件通知回调、HTTP接口推送、远程服务调用、状态内存取
+2. 明确标注所有协议：SIP、WebSocket、HTTP JSON、MCP
+3. 重点高亮：**FreeSWITCH mod_audio_fork WebSocket 直连 agent-flow，双向音频流**
+4. 区分交互模式：WebSocket双向音频流、HTTP接口推送、远程服务调用、状态内存取
 5. 清晰标注三大风控预警点、三层记忆存储介质、音文件存储介质NAS/OSS
 6. **强制标注：CallID、用户手机号双标识全链路全局透传**，业务查询优先依托手机号作为核心查询维度
-7. 拆分独立模块：通信接入模块、MRCP语音识别模块、LangGraph编排模块、MCP用户中心模块、LLM+RAG智能话术模块、多级记忆存储模块、MRCP语音合成播放模块
+7. 拆分独立模块：通信接入模块、WebSocket音频流模块、LangGraph编排模块、MCP用户中心模块、LLM+RAG智能话术模块、多级记忆存储模块、GPU推理模块(ASR/TTS内置)
 8. 标注身份查询逻辑：手机号查用户中心获取用户ID和身份证，再用用户ID查征信
 
 ---
@@ -36,26 +35,25 @@
 
 ```
 aiphone/
-├── agent-asr/              # ASR 适配器 (FastAPI, 可插拔引擎)
-│   ├── asradapter/         # 适配器核心: main.py, base.py, config.py, storage.py
-│   │   └── engines/        # sensevoice/, vibevoice/
-│   ├── asrengine/          # SenseVoice 推理引擎服务 (Dockerfile + server.py)
+├── agent-asr/              # ASR 服务 (FastAPI, 内置 GPU 推理)
+│   ├── asradapter/         # 服务核心: main.py, base.py, config.py, storage.py
+│   │   └── engines/        # sensevoice/ (GPU), vibevoice/ (远程 HTTP)
 │   ├── deploy/             # 部署配置
-│   ├── Dockerfile          # 适配器镜像
+│   ├── Dockerfile          # PyTorch GPU 镜像, 模型下载
 │   └── tests/              # test_base, test_main, test_storage, engines/*/
-├── agent-tts/              # TTS 适配器 (FastAPI, 可插拔引擎)
-│   ├── ttsadapter/         # 适配器核心: main.py, base.py, config.py, storage.py
-│   │   └── engines/        # cosyvoice/, vibevoice/
-│   ├── ttsengine/          # CosyVoice 推理引擎服务 (Dockerfile + server.py)
+├── agent-tts/              # TTS 服务 (FastAPI, 内置 GPU 推理)
+│   ├── ttsadapter/         # 服务核心: main.py, base.py, config.py, storage.py
+│   │   └── engines/        # cosyvoice/ (GPU), vibevoice/ (远程 HTTP)
 │   ├── deploy/             # 部署配置
-│   ├── Dockerfile          # 适配器镜像
+│   ├── Dockerfile          # PyTorch GPU 镜像, 模型下载
 │   └── tests/              # test_base, test_main, test_storage, engines/*/
-├── agent-flow/     # LangGraph 7 节点编排 (FastAPI HTTP 服务)
+├── agent-flow/     # LangGraph 7 节点编排 (FastAPI HTTP + WebSocket)
 │   ├── src/                # 核心源码 (PYTHONPATH=src)
-│   │   ├── main.py         # FastAPI 入口: POST /call/speech, GET /healthz
+│   │   ├── main.py         # FastAPI 入口: POST /call/speech, WS /ws/call, GET /healthz
 │   │   ├── config.py       # pydantic-settings, CALLBOT_ 环境变量前缀
 │   │   ├── database.py     # SQLAlchemy 2.0 async engine
-│   │   ├── clients/        # mcp.py (用户中心), tts.py (TTS HTTP 客户端)
+│   │   ├── clients/        # mcp.py (用户中心), tts.py (TTS), asr.py (ASR)
+│   │   ├── ws/             # handler.py (WebSocket 双向音频), vad.py (VAD)
 │   │   ├── graph/          # flow.py (7 节点 StateGraph), prompt.py, prompts/
 │   │   ├── llm/            # service.py (ChatOpenAI + 结构化输出 + embeddings)
 │   │   ├── memory/         # assembler.py, chat_history.py, redis_memory.py, store.py
@@ -75,7 +73,7 @@ aiphone/
 │       └── src/main/resources/
 │           └── application.yaml        # MCP 配置 (STATELESS, /mcp, :9090)
 ├── deploy/                 # systemd 服务, 安装脚本, Prometheus 监控
-├── freeswitch/             # FreeSWITCH + UniMRCP 配置文件
+├── freeswitch/             # FreeSWITCH 配置文件 (mod_audio_fork)
 ├── docs/                   # 设计规范, 实现方案
 └── assert/                 # 架构图, 时序图
 ```
@@ -87,7 +85,7 @@ aiphone/
 3. `config.yaml` 按名称选择活跃引擎
 4. `config.py` 通过 `importlib.import_module` 动态加载
 
-当前引擎: SenseVoice (ASR), VibeVoice (ASR), CosyVoice (TTS), VibeVoice (TTS)
+当前引擎: SenseVoice (ASR, 内置 FunASR GPU 推理), VibeVoice (ASR, 远程 HTTP), CosyVoice (TTS, 内置 CosyVoice2 GPU 推理), VibeVoice (TTS, 远程 HTTP)
 
 ### LangGraph 7 节点流水线
 
@@ -105,22 +103,22 @@ aiphone/
 ## 1. 系统整体架构图(文字拓扑) [1]
 
 ### 1.1 逻辑拓扑（数据流/控制流/媒体流）
-**媒体流（必须走 MRCPv2，不允许绕过）**  
-- 被叫用户 ⇄ FreeSWITCH（SIP/RTP）  
-- FreeSWITCH（`mod_unimrcp`） ⇄ UniMRCP Server（MRCPv2）  
-  - ASR Resource → agent-asr adapter(:8080) → SenseVoice/VibeVoice ASR 引擎（GPU0）
-  - TTS Resource → agent-tts adapter(:8081) → CosyVoice/VibeVoice TTS 引擎（GPU1）  
+**媒体流（WebSocket 双向音频）**
+- 被叫用户 ⇄ FreeSWITCH（SIP/RTP）
+- FreeSWITCH（`mod_audio_fork`）⇄ agent-flow（WebSocket :8000）
+  - 上行：用户语音 PCM → agent-flow → agent-asr(:8080) 内置 GPU 推理
+  - 下行：agent-tts(:8081) 内置 GPU 推理 → 音频 → FreeSWITCH → 用户
 
-**控制流（UniMRCP 统一调度）**
-- UniMRCP Server 串联 ASR → Orchestrator → TTS 完整链路（对客户无感）
-  - ASR 识别结果自动转发至 agent-flow
-  - orchestrator 决策结果自动调用 agent-tts 合成
-  - TTS 音频通过 UniMRCP → FreeSWITCH 播放  
+**控制流（agent-flow 统一调度）**
+- agent-flow 串联 ASR → LLM → TTS 完整链路（对客户无感）
+  - Node ①：调用 agent-asr 识别音频
+  - Node ②~⑥：MCP 查询 + 记忆 + RAG + LLM 决策
+  - Node ⑦：调用 agent-tts 合成音频，WebSocket 回传
 
-**决策流（本地LLM）**  
-- Orchestrator → Qwen3.5-9B 推理服务（GPU2，独立部署）  
-  - 输入：业务域 Prompt + 会话状态 + 记忆召回块 + 用户最新文本  
-  - 输出：结构化动作（say/ask/handoff/end）+ 文本 + 标签  
+**决策流（本地LLM）**
+- Orchestrator → Qwen3.5-9B 推理服务（GPU2，独立部署）
+  - 输入：业务域 Prompt + 会话状态 + 记忆召回块 + 用户最新文本
+  - 输出：结构化动作（say/ask/handoff/end）+ 文本 + 标签
 
 **核心数据流（MCP 协议）**
 - Orchestrator → java-mcp-server(:9090)：`user_identity_query`（phone + biz_type → user_id, phone_masked, id_card_last_four）
@@ -139,9 +137,9 @@ aiphone/
 
 ### 1.2 物理拓扑（推荐生产）
 - FS 节点×2（主备或水平扩容）
-- UniMRCP 节点×2
-- ASR GPU 节点（GPU0）×1
-- TTS GPU 节点（GPU1）×1
+- agent-asr GPU 节点（GPU0）×1（内置推理引擎）
+- agent-tts GPU 节点（GPU1）×1（内置推理引擎）
+- agent-flow 节点×1（CPU，WebSocket + LangGraph 编排）
 - LLM GPU 节点（GPU2）×1
 - 数据节点：PG17、Redis、MinIO（可拆分）
 - NAS（独立存储）
@@ -164,10 +162,10 @@ aiphone/
 
 ### 2.3 ASR/TTS/LLM GPU 节点
 - pip install modelscope
-- ASR（GPU0）：GPU×1、CPU 16C、内存 64GB
-- modelscope download --model microsoft/VibeVoice-ASR
-- TTS（GPU1）：GPU×1、CPU 16C、内存 64GB
-- modelscope download --model microsoft/VibeVoice-Realtime-0.5B
+- ASR（GPU0）：GPU×1、CPU 16C、内存 64GB（agent-asr 内置推理）
+- modelscope download --model iic/SenseVoiceSmall
+- TTS（GPU1）：GPU×1、CPU 16C、内存 64GB（agent-tts 内置推理）
+- modelscope download --model iic/CosyVoice2-0.5B
 - Qwen3.5-9B（GPU2）：GPU×1、CPU 32C、内存 128GB
 - modelscope download --model Qwen/Qwen3.5-9B
 - 推理引擎: `agent-flow/llm/Dockerfile`
@@ -189,97 +187,76 @@ aiphone/
 - ASR：`CUDA_VISIBLE_DEVICES=0`
 - TTS：`CUDA_VISIBLE_DEVICES=1`
 
-### 3.2 ASR 引擎部署 (GPU0)
-当前支持引擎: **SenseVoice** (默认), **VibeVoice**
+### 3.2 ASR 服务部署 (GPU0)
+当前支持引擎: **SenseVoice** (默认, 内置GPU推理), **VibeVoice** (远程HTTP)
 
-**SenseVoice ASR** (基于 FunASR):
+**SenseVoice ASR** (内置 FunASR GPU 推理):
+- 单服务部署: `agent-asr/` (Dockerfile 内置 PyTorch + 模型下载)
 - 模型下载: `modelscope download --model iic/SenseVoiceSmall`
-- 推理服务: `agent-asr/asrengine/` (Dockerfile + server.py)
-- 适配器: `agent-asr/asradapter/` (FastAPI HTTP 服务, port 8080)
 - 切换引擎: 修改 `asradapter/config.yaml` 中 `engine: sensevoice`
 
-**VibeVoice ASR**:
-- 模型下载: `modelscope download --model microsoft/VibeVoice-ASR`
+**VibeVoice ASR** (远程 HTTP):
+- 需独立部署 VibeVoice ASR 推理服务
+- 环境变量: `VIBEVOICE_ASR_API_URL`
 
 验收:
-- UniMRCP → agent-asr adapter → ASR 引擎: 识别链路端到端通
+- agent-flow → agent-asr: 识别链路端到端通
 
-### 3.3 TTS 引擎部署 (GPU1)
-当前支持引擎: **CosyVoice** (默认), **VibeVoice**
+### 3.3 TTS 服务部署 (GPU1)
+当前支持引擎: **CosyVoice** (默认, 内置GPU推理), **VibeVoice** (远程HTTP)
 
-**CosyVoice TTS**:
+**CosyVoice TTS** (内置 CosyVoice2 GPU 推理):
+- 单服务部署: `agent-tts/` (Dockerfile 内置 PyTorch + CosyVoice 运行时 + 模型下载)
 - 模型下载: `modelscope download --model iic/CosyVoice2-0.5B`
-- 推理服务: `agent-tts/ttsengine/` (Dockerfile + server.py)
-- 适配器: `agent-tts/ttsadapter/` (FastAPI HTTP 服务, port 8081)
 - 切换引擎: 修改 `ttsadapter/config.yaml` 中 `engine: cosyvoice`
 
-**VibeVoice TTS**:
-- 模型下载: `modelscope download --model microsoft/VibeVoice-Realtime-0.5B`
+**VibeVoice TTS** (远程 HTTP):
+- 需独立部署 VibeVoice TTS 推理服务
+- 环境变量: `VIBEVOICE_TTS_API_URL`
 
 三业务 Profile 强隔离:
 - TTS 引擎内置 `BIZ_TYPE_PROFILES` (voice_id/speed/volume/pitch 按 biz_type 隔离)
 
 验收:
-- FreeSWITCH → MRCPv2 → UniMRCP → agent-tts adapter → TTS 引擎: 播报链路端到端通
+- agent-flow → agent-tts: 播报链路端到端通
 - 不同 biz_type 播报音色/语速等严格符合配置隔离
 
 ---
 
-## 4. UniMRCP 编译安装+MRCPv2配置 [1]
+## 4. mod_audio_fork WebSocket 配置 [1]
 
-### 4.1 编译安装（建议 codex 脚本化）
-- 依赖：apr/apr-util、sofia-sip、openssl、libcurl、autoconf/automake/libtool 等
-- 编译 `unimrcpserver`
-- systemd 守护：开机自启、崩溃重启、日志落盘
+### 4.1 编译安装 mod_audio_fork
+- 从 FreeSWITCH 源码编译 mod_audio_fork 模块
+- 在 modules.conf 中添加 `mod_audio_fork`
 
-### 4.2 MRCPv2 配置要点
-- MRCPv2 监听端口（信令）+ RTP 端口范围（媒体）
-- ASR Resource：
-  - 后端地址：VibeVoice ASR
-  - 超时、并发上限、失败重试
-- TTS Resource：
-  - 后端地址：VibeVoice TTS
-  - 超时、并发上限、失败重试
+### 4.2 WebSocket 连接配置
+- vars.xml 中设置 `agent_flow_ws_url=ws://10.0.0.20:8000/ws/call`
+- dialplan 中使用 `audio_fork ${agent_flow_ws_url}?call_id=${uuid}&biz_type=${biz_type}&user_key=${caller_id_number} rw`
 
 监控要求：
-- MRCP 端口存活探测
-- 资源调用延迟 P95、失败率
+- WebSocket 连接状态探测
+- 音频流延迟 P95、断连率
 
 ---
 
-## 5. FreeSWITCH全部配置文件(拨号计划、MRCP配置、模块加载) [1]
+## 5. FreeSWITCH全部配置文件(拨号计划、模块加载) [1]
 
-> 给出“必须实现的配置要点 + 变量约定 + detect_speech 事件链路”。具体 XML 模板可由 Codex 按此清单生成并落盘。
+> 给出”必须实现的配置要点 + 变量约定 + mod_audio_fork WebSocket 链路”。具体 XML 模板可由 Codex 按此清单生成并落盘。
 
 ### 5.1 modules（必须加载）
 - `mod_sofia`（SIP）
-- `mod_unimrcp`（MRCP 客户端）
-- `mod_event_socket`（ESL）
-- `mod_dptools`（playback/record/detect_speech 等）
+- `mod_audio_fork`（WebSocket 双向音频流）
+- `mod_dptools`（playback/record 等）
+- `mod_sndfile`、`mod_native_file`（音频文件读写）
 
-### 5.2 event_socket
-- 仅内网监听
-- ACL 白名单（Orchestrator）
-- 强密码
-
-### 5.3 unimrcp.conf
-- 指向 UniMRCP server
-- 定义 ASR/TTS profile 名称（建议带版本与业务前缀）：
-  - `asr_default_v1`
-  - `tts_customer_service_v1`
-  - `tts_collection_v1`
-  - `tts_marketing_v1`
-
-### 5.4 dialplan（关键）
+### 5.2 dialplan（关键）
 接通后必须具备：
 1) **固定录音告知**：播放法务固定音频文件（WAV/PCM）
 2) 开启录音（分轨/混音），路径按 biz_type 强隔离
 3) 设置 channel variables（贯穿 Orchestrator / 录音 / 审计）：
    - `biz_type, task_id, call_id, core_user_id, phone_hash_salted, user_key`
-4) Orchestrator 通过 ESL 控制：
-   - 启动 `detect_speech`（绑定 unimrcp ASR profile）
-   - 监听 `DETECTED_SPEECH` 事件
-   - 触发 TTS 播报（MRCP）
+4) `audio_fork` 连接 agent-flow WebSocket：
+   - `audio_fork ${agent_flow_ws_url}?call_id=${uuid}&biz_type=${biz_type}&user_key=${caller_id_number} rw`
 
 ---
 
@@ -318,17 +295,17 @@ aiphone/
 - `db/models.py`：PG17 DDL对应的 ORM 模型
 - `storage/repository.py`：异步仓储层
 
-### 7.3 每轮对话处理流程（UniMRCP 串联，对客户无感）
-- UniMRCP 收到 ASR 识别结果后，HTTP POST /call/speech → agent-flow：
-  1) 落库 user turn（含置信度）
-  2) MCP 查询用户身份（手机号 → 用户ID + 身份证后四位）
-  3) 如 marketing 类型，MCP 查询征信（用户ID → 征信资质）
-  4) 召回记忆块（Redis 热记忆 + PG 长期事实）
-  5) Agentic RAG 检索话术知识库
-  6) Qwen3.5-9B 决策输出结构化动作
-  7) 调用 agent-tts 合成语音，返回音频给 UniMRCP
-- orchestrator 返回 JSON {action, text, tts_audio, tts_minio_key}
-- UniMRCP 将音频回传 FreeSWITCH 播放，完成一轮交互
+### 7.3 每轮对话处理流程（agent-flow 统一调度，对客户无感）
+- FreeSWITCH 通过 mod_audio_fork WebSocket 将用户音频流传至 agent-flow：
+  1) agent-flow VAD 检测到用户说完 → 调用 agent-asr 识别
+  2) 落库 user turn（含置信度）
+  3) MCP 查询用户身份（手机号 → 用户ID + 身份证后四位）
+  4) 如 marketing 类型，MCP 查询征信（用户ID → 征信资质）
+  5) 召回记忆块（Redis 热记忆 + PG 长期事实）
+  6) Agentic RAG 检索话术知识库
+  7) Qwen3.5-9B 决策输出结构化动作
+  8) 调用 agent-tts 合成语音，音频通过 WebSocket 回传 FreeSWITCH
+- FreeSWITCH 播放 TTS 音频，完成一轮交互
 
 ### 7.4 三业务隔离“强制编码规则”
 - 所有函数签名必须包含 `biz_type`
@@ -342,13 +319,10 @@ aiphone/
 
 必须服务化拆分：
 - `freeswitch.service`
-- `unimrcp.service`
-- `asr-engine.service`（GPU0, SenseVoice/FunASR Server）
-- `asr-adapter.service`（agent-asr FastAPI adapter）
-- `tts-engine.service`（GPU1, CosyVoice Server）
-- `tts-adapter.service`（agent-tts FastAPI adapter）
+- `agent-asr.service`（GPU0, agent-asr 含内置推理引擎）
+- `agent-tts.service`（GPU1, agent-tts 含内置推理引擎）
 - `llm-engine.service`（GPU2, Qwen3.5-9B）
-- `orchestrator.service`（agent-flow FastAPI）
+- `orchestrator.service`（agent-flow FastAPI + WebSocket）
 - `mcp-server.service`（java-mcp-server Spring Boot, :9090）
 - `postgresql.service` `redis.service` `minio.service`（如自建）
 
@@ -727,9 +701,10 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 - 向量分区表索引必须在分区上建（HNSW）
 - 检索必须加条件：`biz_type, user_key, ts >= now()-interval '180 days'`，并限制 topK
 
-### 12.3 UniMRCP 串联链路
-- ASR 识别文本为空：检查 VAD 参数、音频路径、ASR 引擎健康状态
+### 12.3 WebSocket 双向音频链路
+- ASR 识别文本为空：检查 VAD 参数、音频格式、agent-asr 健康状态
 - orchestrator 超时：检查 LLM 响应时间、MCP Server 连通性、TTS 合成延迟
+- WebSocket 断连：检查 agent-flow 进程状态、FreeSWITCH mod_audio_fork 日志
 
 ### 12.4 高并发 TTS
 - 营销 200 路时 TTS 队列最容易爆：必须启用常用话术缓存，并对营销并发做动态降级
@@ -756,15 +731,13 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 
 应用服务组件/
 ├── agent-asr/
-│   ├── asradapter/    # ASR 适配器 (FastAPI, port 8080)
-│   ├── asrengine/     # ASR 推理引擎 (SenseVoice)
-│   └── Dockerfile
+│   ├── asradapter/    # ASR 服务 (FastAPI, 内置 GPU 推理, port 8080)
+│   └── Dockerfile     # PyTorch GPU 镜像
 ├── agent-tts/
-│   ├── ttsadapter/    # TTS 适配器 (FastAPI, port 8081)
-│   ├── ttsengine/     # TTS 推理引擎 (CosyVoice)
-│   └── Dockerfile
+│   ├── ttsadapter/    # TTS 服务 (FastAPI, 内置 GPU 推理, port 8081)
+│   └── Dockerfile     # PyTorch GPU 镜像
 ├── agent-flow/
-│   ├── src/           # 核心源码 (LangGraph 7 节点, port 8000)
+│   ├── src/           # 核心源码 (LangGraph 7 节点 + WebSocket, port 8000)
 │   ├── llm/           # LLM 推理引擎 (Qwen3.5-9B)
 │   ├── alembic/       # 数据库迁移
 │   └── Dockerfile
@@ -778,44 +751,37 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 
 1. **vars.xml** - 设置全局变量
    - SIP 端口、RTP 范围、编码
+   - agent-flow WebSocket URL
    - 业务变量默认值
    - 转接目标分机号
 
 2. **modules.conf** - 加载必要模块
-   - 核心模块：mod_sofia, mod_unimrcp, mod_event_socket, mod_dptools
-   - 可选模块按需加载
+   - 核心模块：mod_sofia, mod_audio_fork, mod_dptools, mod_sndfile
+   - 编码模块按需加载
 
-3. **event_socket.conf.xml** - ESL 配置
-   - 监听地址：127.0.0.1:8021
-   - 密码认证
-   - 内网 ACL 白名单
+### 阶段 2: 拨号计划
 
-### 阶段 2: UniMRCP 配置
-
-4. **unimrcpserver.xml** - UniMRCP 服务端
-   - ASR/TTS Resource 后端地址
-   - VibeVoice 服务地址
-   - 并发与超时配置
-
-5. **unimrcp.conf.xml** - FreeSWITCH MRCP 客户端
-   - ASR profile: asr_default_v1
-   - TTS profiles: tts_customer_service_v1, tts_collection_v1, tts_marketing_v1
-
-### 阶段 3: 拨号计划
-
-6. **dialplan/public.xml** - 业务路由
+3. **dialplan/public.xml** - 业务路由
    - 业务变量设置
    - 录音告知播放（固定）
-   - detect_speech 触发示例
+   - audio_fork 连接 agent-flow WebSocket
    - 转人工：loopback/1001
 
-### 阶段 4: Orchestrator
+### 阶段 3: 应用服务
 
-7. **event_handling_spec.md** - 事件处理规范
-   - CHANNEL_ANSWER 流程
-   - DETECTED_SPEECH 处理
-   - 静默检测
-   - 转人工逻辑
+4. **agent-asr** - ASR 服务（GPU0）
+   - 内置 SenseVoice GPU 推理
+   - PyTorch 基础镜像
+   - 构建时下载模型
+
+5. **agent-tts** - TTS 服务（GPU1）
+   - 内置 CosyVoice2 GPU 推理
+   - PyTorch 基础镜像
+   - 构建时下载模型
+
+6. **agent-flow** - 编排服务
+   - WebSocket 双向音频 + HTTP API
+   - 连接 agent-asr, agent-tts, MCP, LLM
 
 ## 依赖关系
 
@@ -824,40 +790,35 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
     │
     └─→ FreeSWITCH (mod_sofia)
             │
-            └─→ mod_unimrcp ──→ UniMRCP Server (:8060)
+            └─→ mod_audio_fork ──→ agent-flow (:8000) WebSocket
                     │
-                    ├─→ ASR Resource ──→ agent-asr adapter (:8080) ──→ SenseVoice/VibeVoice ASR (GPU0)
-                    │                                                    └─→ 返回识别文本
+                    ├─→ agent-asr (:8080) ──→ SenseVoice GPU0 (内置推理)
+                    │                       └─→ 返回识别文本
                     │
-                    ├─→ 决策 ──→ agent-flow (:8000)
+                    ├─→ 决策 ──→ agent-flow LangGraph 7 节点
                     │              │
                     │              ├─→ java-mcp-server (:9090) 用户中心（身份/征信查询）
                     │              ├─→ Qwen3.5-9B (GPU2)
                     │              ├─→ Redis（热记忆/对话历史）
                     │              ├─→ PG17 pgvector（长期记忆/RAG话术库）
-                    │              └─→ agent-tts adapter (:8081) ──→ CosyVoice/VibeVoice TTS (GPU1)
+                    │              └─→ agent-tts (:8081) ──→ CosyVoice GPU1 (内置推理)
                     │
-                    └─→ TTS Resource ──→ 音频回传 FreeSWITCH ──→ 播放给用户
+                    └─→ TTS 音频 ──→ WebSocket 回传 FreeSWITCH ──→ 播放给用户
 ```
 
-整个 ASR → 编排决策 → TTS 合成链路由 UniMRCP 串联，对客户完全无感。
+FreeSWITCH 通过 mod_audio_fork WebSocket 直连 agent-flow，双向音频流。agent-flow 统一调度 ASR → 决策 → TTS 全链路。
 
 ## 验收要点
 
 ### FreeSWITCH
 - [ ] `fs_cli` 能正常连接
-- [ ] `show modules` 显示已加载必要模块
+- [ ] `show modules` 显示已加载 mod_audio_fork
 - [ ] SIP 通话能正常建立
-
-### UniMRCP
-- [ ] UniMRCP 服务启动（端口 8060）
-- [ ] ASR 识别能返回文本（UniMRCP → agent-asr → ASR引擎）
-- [ ] TTS 播报正常（不同 profile 音色不同）
-- [ ] MRCPv2 链路通
-- [ ] UniMRCP 能串联 ASR → orchestrator → TTS 完整链路
+- [ ] mod_audio_fork WebSocket 连接 agent-flow 正常
 
 ### Orchestrator
-- [ ] POST /call/speech 接收 ASR 文本正常
+- [ ] WebSocket /ws/call 双向音频流通
+- [ ] POST /call/speech 接收文本正常
 - [ ] MCP Client 连接 java-mcp-server 成功
 - [ ] MCP Client 连接 java-mcp-server 成功
 - [ ] 身份查询工具 (`user_identity_query`) 正常返回
@@ -879,13 +840,11 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 |------|--------|--------|
 | FS | SIP 端口 | 5060 |
 | FS | RTP 范围 | 16384-32768 |
-| FS | ESL 端口 | 8021 |
-| FS | ESL 密码 | ClueCon |
-| UniMRCP | MRCP 端口 | 8060 |
-| ASR adapter | 服务地址 | :8080 |
-| ASR engine | 推理地址 | SENSEVOICE_API_URL |
-| TTS adapter | 服务地址 | :8081 |
-| TTS engine | 推理地址 | COSYVOICE_API_URL |
+| FS | WebSocket URL | ws://10.0.0.20:8000/ws/call |
+| ASR | 服务地址 | :8080 |
+| ASR | 模型路径 | MODEL_DIR=/opt/sensevoice/models/SenseVoiceSmall |
+| TTS | 服务地址 | :8081 |
+| TTS | 模型路径 | MODEL_DIR=/opt/cosyvoice/pretrained_models/CosyVoice2-0.5B |
 | LLM | 推理地址 | :8083 (GPU2) |
 | Orchestrator | 服务地址 | :8000 |
 | MCP Server | 用户中心 | :9090 |
@@ -896,21 +855,22 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 
 ## 常见问题
 
-### 1. ESL 连接失败
-- 检查 event_socket.conf.xml 监听地址
-- 检查密码是否匹配
-- 检查 ACL 白名单
+### 1. WebSocket 连接失败
+- 检查 agent-flow 是否启动（:8000）
+- 检查 vars.xml 中 agent_flow_ws_url 配置
+- 检查 mod_audio_fork 是否加载
 
-### 2. DETECTED_SPEECH 不回传
-- 检查 mod_unimrcp 是否加载
-- 检查 unimrcp profile 配置
-- 检查 UniMRCP 服务状态
-- 检查 VibeVoice ASR 健康状态
+### 2. ASR 识别为空
+- 检查 agent-asr 服务状态（:8080）
+- 检查 GPU 可用性
+- 检查模型是否加载（MODEL_DIR 路径）
+- 检查 VAD 参数配置
 
 ### 3. TTS 播放无声
-- 检查 TTS profile 配置
-- 检查 VibeVoice TTS 服务
-- 检查 RTP 端口是否正常
+- 检查 agent-tts 服务状态（:8081）
+- 检查 GPU 可用性
+- 检查 CosyVoice 运行时环境（COSYVOICE_RUNTIME）
+- 检查 biz_type 对应的音色配置
 
 ### 4. 录音文件不存在
 - 检查 NAS 挂载
@@ -921,13 +881,11 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 
 | 文件 | 版本 | 更新日期 |
 |------|------|----------|
-| modules.conf | 1.0 | 2025-05-08 |
-| vars.xml | 1.0 | 2025-05-08 |
-| event_socket.conf.xml | 1.0 | 2025-05-08 |
-| unimrcp.conf.xml | 1.0 | 2025-05-08 |
-| unimrcpserver.xml | 1.0 | 2025-05-08 |
-| dialplan/public.xml | 1.0 | 2025-05-08 |
-| event_handling_spec.md | 1.0 | 2025-05-08 |
+| modules.conf | 2.0 | 2026-05-16 |
+| vars.xml | 2.0 | 2026-05-16 |
+| dialplan/public.xml | 2.0 | 2026-05-16 |
+| agent-asr Dockerfile | 2.0 | 2026-05-16 |
+| agent-tts Dockerfile | 2.0 | 2026-05-16 |
 | java-mcp-server | 0.0.1-SNAPSHOT | 2026-05-16 |
 
 ## 联系方式

@@ -4,86 +4,22 @@
     <context name="public">
 
       <!-- ============ 智能外呼入口 ============ -->
-      <!-- 匹配所有外呼来电，设置业务变量并转接 -->
+      <!-- mod_audio_fork 双向音频流直连 agent-flow WebSocket -->
 
-      <!-- 入口：设置业务变量和转接目标 -->
       <extension name="callbot-entry">
         <condition field="destination_number" expression="^(.*)$">
-          <!-- 设置全局变量（后续 Orchestrator 读取） -->
           <action application="set" data="call_start_time=${strftime(%Y-%m-%d %H:%M:%S)}"/>
           <action application="set" data="original_destination=$1"/>
-
-          <!-- 业务类型路由（默认营销，可通过外部任务系统传入） -->
           <action application="set" data="biz_type=marketing"/>
-
-          <!-- 任务 ID（从 SIP Header 或变量获取） -->
           <action application="set" data="task_id=${task_id}"/>
+          <action application="answer"/>
 
-          <!-- 转接至 Orchestrator 控制流程 -->
-          <!-- 注意：实际落地时可能通过 FIFO 或 Lua 脚本调用 -->
-          <action application="transfer" data="1001"/>
-        </condition>
-      </extension>
-
-      <!-- ============ 录音告知播放（固定） ============ -->
-      <extension name="legal-notice">
-        <condition field="destination_number" data="legal_notice">
-          <!-- 法务固定录音告知 -->
-          <action application="playback" data="/usr/local/freeswitch/sounds/legal_notice.wav"/>
-          <!-- 挂断 -->
-          <action application="hangup" data="NORMAL_CLEARING"/>
+          <!-- mod_audio_fork: 双向流音频到 agent-flow WebSocket -->
+          <!-- rw=读写双向, ws-url 带业务参数 -->
+          <action application="audio_fork" data="${agent_flow_ws_url}?call_id=${uuid}&amp;biz_type=${biz_type}&amp;user_key=${caller_id_number} rw"/>
         </condition>
       </extension>
 
     </context>
   </section>
 </document>
-
-
-<!--
-============================================================
-完整拨号计划（需配合 fs_cli 测试或通过 API 下发）
-============================================================
-
-以下为 Orchestrator 通过 ESL 控制的标准流程：
-
-1. 来电应答 (CHANNEL_ANSWER)
-   - 设置业务变量
-   - 播放固定录音告知
-   - 启动录音
-   - 启动 detect_speech
-
-2. detect_speech 使用示例（ESL 命令）：
-
-   启动语音识别：
-   uuid_detect_speech <uuid> unimrcp://asr_default_v1 grammar:builtin:grammar:digits
-
-   停止语音识别：
-   uuid_detect_speech <uuid> stop
-
-3. 录音示例（分轨录制）：
-
-   启动录音（双声道）：
-   uuid_record <uuid> start /nas/rec/${biz_type}/${strftime(%Y)}/${strftime(%m)}/${strftime(%d)}/${uuid}/caller.wav 48000 16
-   uuid_record <uuid> start /nas/rec/${biz_type}/${strftime(%Y)}/${strftime(%m)}/${strftime(%d)}/${uuid}/bot.wav 48000 16
-
-   停止录音：
-   uuid_record <uuid> stop
-
-4. TTS 播放示例：
-
-   客服音色：
-   uuid_send_tts <uuid> unimrcp://tts_customer_service_v1 "您好，请问有什么可以帮助您？"
-
-   催收音色：
-   uuid_send_tts <uuid> unimrcp://tts_collection_v1 "您好，我是XX公司客服，请问您方便接听吗？"
-
-   营销音色：
-   uuid_send_tts <uuid> unimrcp://tts_marketing_v1 "您好，我公司现推出XX活动，请问您感兴趣吗？"
-
-5. 转接人工示例：
-
-   uuid_transfer <uuid> loopback/1001
-
-============================================================
--->

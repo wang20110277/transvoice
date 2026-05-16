@@ -15,6 +15,7 @@ from memory.assembler import MemoryAssembler
 from memory.chat_history import get_chat_history, save_turn
 from clients.mcp import MCPClient
 from clients.tts import TTSClient
+from clients.asr import ASRClient
 
 logger = logging.getLogger(__name__)
 
@@ -22,13 +23,20 @@ logger = logging.getLogger(__name__)
 _assembler: MemoryAssembler | None = None
 _mcp_client: MCPClient | None = None
 _tts_client: TTSClient | None = None
+_asr_client: ASRClient | None = None
 
 
-def set_services(assembler: MemoryAssembler, mcp: MCPClient, tts: TTSClient) -> None:
-    global _assembler, _mcp_client, _tts_client
+def set_services(
+    assembler: MemoryAssembler,
+    mcp: MCPClient,
+    tts: TTSClient,
+    asr: ASRClient | None = None,
+) -> None:
+    global _assembler, _mcp_client, _tts_client, _asr_client
     _assembler = assembler
     _mcp_client = mcp
     _tts_client = tts
+    _asr_client = asr
 
 
 class CallGraphState(TypedDict, total=False):
@@ -36,6 +44,7 @@ class CallGraphState(TypedDict, total=False):
     biz_type: str
     user_key: str
     user_input: str
+    audio_bytes: bytes | None
     asr_minio_key: str | None
     identity: dict | None
     credit_result: dict | None
@@ -52,15 +61,38 @@ class CallGraphState(TypedDict, total=False):
 # ── Node ①: receive_asr ──
 
 async def receive_asr_node(state: CallGraphState) -> dict:
+    call_id = state.get("call_id", "?")
+
+    # If audio_bytes provided, call agent-asr for recognition
+    audio_bytes = state.get("audio_bytes")
+    if audio_bytes and _asr_client is not None:
+        try:
+            asr_result = await _asr_client.recognize(audio_bytes, call_id)
+            if asr_result:
+                user_input = asr_result.get("text", "")
+                asr_minio_key = asr_result.get("minio_key")
+            else:
+                user_input = ""
+                asr_minio_key = None
+        except Exception as e:
+            logger.error("[%s] ASR 调用失败: %s", call_id, e)
+            user_input = ""
+            asr_minio_key = None
+    else:
+        # Text already provided (e.g. from /call/speech endpoint)
+        user_input = state.get("user_input", "")
+        asr_minio_key = state.get("asr_minio_key")
+
     try:
         history = get_chat_history(state["call_id"], state["biz_type"])
         chat_history = list(await history.aget_messages())
     except Exception as e:
-        logger.warning(f"[{state.get('call_id', '?')}] 对话历史加载失败: {e}")
+        logger.warning("[%s] 对话历史加载失败: %s", call_id, e)
         chat_history = []
+
     return {
-        "user_input": state["user_input"],
-        "asr_minio_key": state.get("asr_minio_key"),
+        "user_input": user_input,
+        "asr_minio_key": asr_minio_key,
         "chat_history": chat_history,
     }
 

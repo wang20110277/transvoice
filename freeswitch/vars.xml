@@ -25,8 +25,9 @@
         <variable name="record_path" value="/nas/rec"/>
         <variable name="record_format" value="wav"/>
 
-        <!-- MRCP 配置 -->
-        <variable name="unimrcp_profiles" value="asr_default_v1,tts_customer_service_v1,tts_collection_v1,tts_marketing_v1"/>
+        <!-- agent-flow WebSocket 音频流 -->
+        <variable name="agent_flow_ws_url" value="ws://10.0.0.20:8000/ws/call"/>
+        <variable name="agent_flow_temp_dir" value="/tmp/aiphone_tts"/>
 
         <!-- 业务变量默认值 -->
         <variable name="biz_type" value=""/>

@@ -1,5 +1,0 @@
-- pip install modelscope
-- ASR（GPU0）：GPU×1、CPU 16C、内存 64GB
-- modelscope download --model microsoft/VibeVoice-ASR --local_dir .checkpoints/VibeVoice-ASR
-
-- modelscope download --model iic/SenseVoiceSmall --local_dir .checkpoints/SenseVoiceSmall
