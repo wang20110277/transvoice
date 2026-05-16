@@ -45,7 +45,7 @@ cd agent-orchestrator && PYTHONPATH=$(pwd)/src alembic upgrade head
 # Build
 cd mcp-server/java-mcp-server && JAVA_HOME=/opt/homebrew/opt/openjdk ./mvnw clean compile
 
-# Run (port 8082)
+# Run (port 9090)
 cd mcp-server/java-mcp-server && JAVA_HOME=/opt/homebrew/opt/openjdk ./mvnw spring-boot:run
 ```
 
@@ -58,7 +58,7 @@ SIP Caller → FreeSWITCH (mod_sofia, SIP/RTP)
     │    └─ TTS resource → HTTP POST → agent-tts adapter (:8081)
     └─ 外部调度系统 → HTTP POST /call/speech → agent-orchestrator (:8000)
          ├─ 7-node LangGraph pipeline → LLM decision → TTS via HTTP
-         ├─ Node ②/③: MCP client → java-mcp-server (:8082) 用户中心
+         ├─ Node ②/③: MCP client → java-mcp-server (:9090) 用户中心
          └─ Returns: {action, text, tts_audio, tts_minio_key}
 ```
 
@@ -76,13 +76,13 @@ Data flow per turn:
 
 **agent-orchestrator** — FastAPI HTTP service. Receives ASR text via `POST /call/speech`, runs 7-node LangGraph pipeline, returns TTS audio. LLM via LangChain ChatOpenAI with structured output (`LLMAction`). Conversation history via langchain-redis `RedisChatMessageHistory`. Agentic RAG with adaptive retrieval + document grading + query rewriting.
 
-**java-mcp-server** — Spring Boot 3.5 + Spring AI 1.1.6 stateless MCP server (WebMVC transport). Serves as the user center backend for orchestrator nodes ② and ③. Exposes two MCP tools: `user_identity_query` (phone_hash + biz_type → identity info) and `user_credit_query` (user_id + phone_hash → credit info). Endpoint: `POST /mcp` on port 8082.
+**java-mcp-server** — Spring Boot 3.5 + Spring AI 1.1.6 stateless MCP server (WebMVC transport). Serves as the user center backend for orchestrator nodes ② and ③. Exposes two MCP tools: `user_identity_query` (phone + biz_type → user_id, phone_masked, id_card_last_four) and `user_credit_query` (user_id → credit_qualified, risk_level). Endpoint: `POST /mcp` on port 9090.
 
 ### LangGraph 7-Node Pipeline
 
 ```
 ① receive_asr    — 接收 ASR 文本，加载 Redis 对话历史
-② mcp_identity   — 查询用户中心（身份/姓名/性别）
+② mcp_identity   — 手机号查用户中心（用户ID/脱敏手机号/身份证后四位）
 ③ [条件] credit_query — 仅 marketing 查询征信
 ④ recall_memory  — Redis 热记忆 + PG 长期记忆
 ⑤ rag_retrieve   — Agentic RAG (自适应检索 → 文档评分 → 查询改写)
@@ -125,7 +125,7 @@ Full adaptive + corrective RAG inside `rag_retrieve_node`:
 - **MinIO**: `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, `MINIO_BUCKET` (optional, disabled when empty)
 - **Engine URLs**: `SENSEVOICE_API_URL`, `COSYVOICE_API_URL`, `VIBEVOICE_ASR_API_URL`, `VIBEVOICE_TTS_API_URL`
 - **RAG**: `CALLBOT_RAG_TOP_K` (default 3), `CALLBOT_RAG_SIMILARITY_THRESHOLD` (default 0.7), `CALLBOT_RAG_MAX_RETRIES` (default 2)
-- **MCP Server**: `application.yaml` with `spring.ai.mcp.server.*` properties, STATELESS protocol, WebMVC transport, port 8082
+- **MCP Server**: `application.yaml` with `spring.ai.mcp.server.*` properties, STATELESS protocol, WebMVC transport, port 9090
 
 ### Key Orchestrator Modules
 

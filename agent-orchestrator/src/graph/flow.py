@@ -74,9 +74,8 @@ async def mcp_identity_node(state: CallGraphState) -> dict:
         result = await _mcp_client.query_user_identity(state["user_key"], state["biz_type"])
         return {"identity": {
             "user_id": result.user_id,
-            "name_masked": result.name_masked,
-            "gender": result.gender,
-            "verified": result.verified,
+            "phone_masked": result.phone_masked,
+            "id_card_last_four": result.id_card_last_four,
         }}
     except Exception as e:
         logger.error(f"[{state.get('call_id', '?')}] MCP 身份查询失败: {e}")
@@ -90,7 +89,7 @@ async def credit_query_node(state: CallGraphState) -> dict:
         return {"credit_result": None}
     try:
         user_id = state.get("identity", {}).get("user_id", "") if state.get("identity") else ""
-        result = await _mcp_client.query_credit_profile(user_id, state["user_key"])
+        result = await _mcp_client.query_credit_profile(user_id)
         return {"credit_result": {
             "user_id": result.user_id,
             "credit_qualified": result.credit_qualified,

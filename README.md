@@ -5,10 +5,10 @@
 2. **语音交换层**：通话接入FreeSWITCH软交换，负责媒体流转发、通话事件调度、上下行语音流中转，全程携带CallID+手机号
 3. **语音识别层**：FreeSWITCH基于UniMRCP协议对接MRCP ASR语音识别引擎，通过事件通知机制传输实时用户语音流，ASR引擎完成语音转文字，生成**同时携带CallID与用户手机号**的ASR识别文本
 4. **编排接入层**：**ASR识别文本携带CallID+用户手机号，以HTTP JSON接口推送至LangGraph流程编排调度器**，文本、CallID、手机号统一存入LangGraph全局状态State中持久留存，不丢失原始用户对话与身份标识数据
-5. **LangGraph第一业务节点（用户身份&声纹核验）**
-编排引擎内置MCP Client，调用远端MCP Server，通过ESB企业服务总线或RPC远程调用模式，**优先传入用户手机号**调用用户中心User Service；查询获取用户ID与完整用户信息，同步调取用户预留声纹数据，实时比对实时通话人声纹，声纹比对不一致自动触发业务风险预警，流程全程保留State内ASR文本、CallID、手机号
-6. **LangGraph第二业务节点（贷款意向&征信合规核验）**
-复用MCP Client+MCP Server+ESB/RPC统一调用链路，**依托手机号+用户ID双维度**查询金融核心业务系统，获取用户征信档案数据，校验征信资质与贷款意向，征信不合规直接触发风控预警，以上两个业务节点执行全程保留LangGraph状态内的ASR原始文本、CallID、手机号
+5. **LangGraph第一业务节点（用户身份核验）**
+编排引擎内置MCP Client，通过HTTP Streamable传输协议调用java-mcp-server用户中心MCP服务，**传入用户手机号**调用`user_identity_query`工具；查询获取用户ID、脱敏手机号、身份证后四位，流程全程保留State内ASR文本、CallID、手机号
+6. **LangGraph第二业务节点（征信合规核验）**
+复用MCP Client调用java-mcp-server，**使用用户ID**调用`user_credit_query`工具，获取用户征信档案数据，校验征信资质与风险等级（仅marketing业务类型触发），征信不合规直接触发风控预警，以上两个业务节点执行全程保留LangGraph状态内的ASR原始文本、CallID、手机号
 7. **LangGraph第三业务节点（ASR文本送入LLM智能应答生成）**
 **从LangGraph全局State中提取完整ASR用户识别文本、CallID、用户手机号、用户ID**，统一送入LLM大模型；LLM解析用户语音文本语义，结合用户手机号绑定的历史用户数据，自主判定是否调取RAG知识库匹配业务标准话术，最终生成标准化外呼应答话术文本；依托LangChain Memory记忆体系做分层数据存储：Redis存储短期会话记忆、PostgreSQL(PG)存储长期业务会话数据、Mem0存储永久全域对话记忆，同步记录实时对话内容、语音文件存储路径、绑定手机号与CallID关联关系，支持客户二次呼入时通过**用户ID/手机号/CallID**双维度调取全量历史会话数据，结合历史对话信息生成连贯应答话术
 8. **语音合成下发层**：LangGraph将LLM生成的应答话术文本，附带CallID与手机号标识，通过HTTP JSON请求推送至TTS语音合成服务，完成文字转语音音频生成，将用户原始识别语音、合成应答语音统一归档存储至NAS私有存储或OSS对象存储，音频文件关联绑定CallID+手机号
@@ -17,13 +17,13 @@
 
 ## 统一绘图强制规范
 1. 整体布局：数据流从左至右分层排布，层级从上至下划分清晰
-2. 明确标注所有协议：SIP、UniMRCP、HTTP JSON、MCP、ESB、RPC
+2. 明确标注所有协议：SIP、UniMRCP、HTTP JSON、MCP
 3. 重点高亮：**ASR文本+CallID+手机号联合HTTP JSON入LangGraph→存入State→节点三取出直传LLM**完整数据流向
 4. 区分交互模式：事件通知回调、HTTP接口推送、远程服务调用、状态内存取
 5. 清晰标注三大风控预警点、三层记忆存储介质、音文件存储介质NAS/OSS
 6. **强制标注：CallID、用户手机号双标识全链路全局透传**，业务查询优先依托手机号作为核心查询维度
-7. 拆分独立模块：通信接入模块、MRCP语音识别模块、LangGraph编排模块、业务微服务核验模块、LLM+RAG智能话术模块、多级记忆存储模块、MRCP语音合成播放模块
-8. 标注身份查询逻辑：业务服务查询优先使用手机号，再关联用户ID完成全维度信息匹配
+7. 拆分独立模块：通信接入模块、MRCP语音识别模块、LangGraph编排模块、MCP用户中心模块、LLM+RAG智能话术模块、多级记忆存储模块、MRCP语音合成播放模块
+8. 标注身份查询逻辑：业务服务查询优先使用手机号哈希，再关联用户ID完成全维度信息匹配
 
 ---
 
@@ -67,6 +67,14 @@ aiphone/
 │   ├── alembic/            # 数据库迁移
 │   ├── Dockerfile          # 应用镜像 (含 alembic 自动迁移)
 │   └── tests/              # test suite
+├── mcp-server/             # MCP 服务器 (用户中心后端)
+│   └── java-mcp-server/    # Spring Boot + Spring AI stateless MCP server
+│       ├── src/main/java/com/trans/mcp/
+│       │   ├── McpApplication.java     # 入口 + 工具注册
+│       │   ├── model/                  # IdentityResult, CreditResult
+│       │   └── service/                # UserService, CreditService (@Tool)
+│       └── src/main/resources/
+│           └── application.yaml        # MCP 配置 (STATELESS, /mcp, :9090)
 ├── deploy/                 # systemd 服务, 安装脚本, Prometheus 监控
 ├── freeswitch/             # FreeSWITCH + UniMRCP 配置文件
 ├── docs/                   # 设计规范, 实现方案
@@ -86,7 +94,7 @@ aiphone/
 
 ```
 ① receive_asr    — 接收 ASR 文本，加载 Redis 对话历史
-② mcp_identity   — 查询用户中心（身份/姓名/性别）
+② mcp_identity   — 手机号查用户中心（用户ID/脱敏手机号/身份证后四位）
 ③ [条件] credit_query — 仅 marketing 查询征信
 ④ recall_memory  — Redis 热记忆 + PG 长期记忆
 ⑤ rag_retrieve   — Agentic RAG (自适应检索 → 文档评分 → 查询改写)
@@ -114,9 +122,9 @@ aiphone/
   - 输入：业务域 Prompt + 会话状态 + 记忆召回块 + 用户最新文本  
   - 输出：结构化动作（say/ask/handoff/end）+ 文本 + 标签  
 
-**核心数据流（RocketMQ）**  
-- Orchestrator → RocketMQ：identity_req（request_id=fs_uuid）  
-- RocketMQ → Orchestrator：identity_resp（用于核验姓名+身份证后四位、性别、催收敏感字段门禁）  
+**核心数据流（MCP 协议）**
+- Orchestrator → java-mcp-server(:9090)：`user_identity_query`（phone + biz_type → user_id, phone_masked, id_card_last_four）
+- Orchestrator → java-mcp-server(:9090)：`user_credit_query`（user_id → credit_qualified, risk_level，仅 marketing）
 
 **数据/记忆/审计**  
 - Redis：会话态、短期记忆、TTS缓存索引  
@@ -295,7 +303,7 @@ aiphone/
 ### 7.1 工程约束
 - Python 3.12
 - `python-ESL` 连接 FS
-- `rocketmq-client-python` 做核心身份 req/resp
+- `langchain-mcp-adapters` MCP Client 对接 java-mcp-server 用户中心
 - LangChain + LangGraph：图编排
 - Redis + PG17(pgvector) + mem0：记忆
 
@@ -310,7 +318,7 @@ aiphone/
   - `transfer(uuid, dest)`
 - `graph_flow.py`：LangGraph StateGraph（强流程）
 - `llm_qwen.py`：Qwen3.5-9B调用 + JSON schema 校验 + 超时重试 + 降级
-- `mq_identity.py`：RocketMQ req/resp（request_id=fs_uuid）
+- `mq_identity.py`：MCP Client 调用 java-mcp-server（身份查询 + 征信查询）
 - `storage_artifacts.py`：NAS落盘、MinIO归档、artifact元数据
 - `db_pg.py`：PG17 DDL对应的插入/查询
 - `memory/`：mem0 抽取与召回，Redis热数据，PG向量召回
@@ -320,7 +328,7 @@ aiphone/
   1) 记录 `call_session`（含 biz_type/user_key）
   2) 播放固定录音告知（必须成功，否则告警并标红）
   3) 启动录音（分轨/混音）
-  4) RocketMQ 拉身份包
+  4) MCP Client 调用 java-mcp-server 拉身份包
   5) 进入核验（姓名+身份证后四位）
   6) 启动 detect_speech 进入 listen 状态
 - `DETECTED_SPEECH`：
@@ -355,6 +363,7 @@ aiphone/
 - `tts-adapter.service`（agent-tts FastAPI adapter）
 - `llm-engine.service`（GPU2, Qwen3.5-9B）
 - `orchestrator.service`（agent-orchestrator FastAPI）
+- `mcp-server.service`（java-mcp-server Spring Boot, :9090）
 - `postgresql.service` `redis.service` `minio.service`（如自建）
 
 关键要求：
@@ -657,10 +666,10 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
   - key 必须包含 biz_type + profile_version，确保严格隔离
   - 禁止缓存含敏感个资的动态句子（或必须加密+短TTL）
 
-#### 11.1.6 MQ 身份请求缓存（TTL=10–30min）
+#### 11.1.6 MCP 身份查询缓存（TTL=10–30min）
 - Key：`cb:core:id:{biz_type}:{user_key}`
 - Type：String(JSON)
-- 用途：降低 RocketMQ 请求频次（注意与合规一致：仅缓存必要字段，脱敏/最小化）
+- 用途：降低 java-mcp-server 请求频次（注意与合规一致：仅缓存必要字段，脱敏/最小化）
 
 ---
 
@@ -773,6 +782,8 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 │   ├── llm/           # LLM 推理引擎 (Qwen3.5-9B)
 │   ├── alembic/       # 数据库迁移
 │   └── Dockerfile
+├── mcp-server/
+│   └── java-mcp-server/  # 用户中心 MCP Server (Spring Boot, port 9090)
 ```
 
 ## 部署顺序
@@ -833,9 +844,9 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
     │       ├─→ mod_event_socket ──→ ESL ──→ Orchestrator (Python)
     │       │                                        │
     │       │                                        ├─→ Qwen3.5-9B (GPU2)
+    │       │                                        ├─→ java-mcp-server (:9090) 用户中心
     │       │                                        ├─→ Redis
     │       │                                        ├─→ PG17 (pgvector)
-    │       │                                        ├─→ RocketMQ
     │       │                                        └─→ MinIO
     │       │
     │       └─→ 录音文件 ──→ NAS ──→ MinIO 归档
@@ -861,6 +872,9 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 - [ ] ESL 连接并接收事件
 - [ ] detect_speech 启动成功
 - [ ] DETECTED_SPEECH 事件正常回调
+- [ ] MCP Client 连接 java-mcp-server 成功
+- [ ] 身份查询工具 (`user_identity_query`) 正常返回
+- [ ] 征信查询工具 (`user_credit_query`) 正常返回 (仅 marketing)
 - [ ] LLM 决策正常返回
 - [ ] TTS 播报正常
 - [ ] 录音文件生成
@@ -887,6 +901,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 | TTS engine | 推理地址 | COSYVOICE_API_URL |
 | LLM | 推理地址 | Qwen3.5-9B (GPU2) |
 | Orchestrator | 服务地址 | :8000 |
+| MCP Server | 用户中心 | :9090 |
 | Redis | 地址 | 10.0.0.30:6379 |
 | PG | 地址 | 10.0.0.31:5432 |
 | MinIO | 地址 | 10.0.0.32:9000 |
@@ -926,6 +941,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 | unimrcpserver.xml | 1.0 | 2025-05-08 |
 | dialplan/public.xml | 1.0 | 2025-05-08 |
 | event_handling_spec.md | 1.0 | 2025-05-08 |
+| java-mcp-server | 0.0.1-SNAPSHOT | 2026-05-16 |
 
 ## 联系方式
 

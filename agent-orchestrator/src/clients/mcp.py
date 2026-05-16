@@ -11,11 +11,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class IdentityResult:
     user_id: str
-    name_masked: str
-    id_last_four: str
-    gender: str
-    verified: bool = True
-    voiceprint_match: bool | None = None
+    phone_masked: str
+    id_card_last_four: str
 
 
 @dataclass
@@ -51,23 +48,20 @@ class MCPClient:
             return json.loads(result)
         return result
 
-    async def query_user_identity(self, phone_hash: str, biz_type: str) -> IdentityResult:
+    async def query_user_identity(self, phone: str, biz_type: str) -> IdentityResult:
         data = await self._call_tool("user_identity_query", {
-            "phone_hash": phone_hash,
+            "phone": phone,
             "biz_type": biz_type,
         })
         return IdentityResult(
             user_id=data.get("user_id", ""),
-            name_masked=data.get("name_masked", ""),
-            id_last_four=data.get("id_last_four", ""),
-            gender=data.get("gender", ""),
-            verified=True,
+            phone_masked=data.get("phone_masked", ""),
+            id_card_last_four=data.get("id_card_last_four", ""),
         )
 
-    async def query_credit_profile(self, user_id: str, phone_hash: str) -> CreditResult:
+    async def query_credit_profile(self, user_id: str) -> CreditResult:
         data = await self._call_tool("user_credit_query", {
             "user_id": user_id,
-            "phone_hash": phone_hash,
         })
         return CreditResult(
             user_id=user_id,
