@@ -175,7 +175,7 @@ services:
       CALLBOT_ASR_ADAPTER_URL: http://agent-asr:8080
       CALLBOT_TTS_ADAPTER_URL: http://agent-tts:8081
       CALLBOT_LLM_BASE_URL: ${CALLBOT_LLM_BASE_URL:-http://host.docker.internal:8083/v1}
-      CALLBOT_LLM_MODEL: ${CALLBOT_LLM_MODEL:-qwen3:8b}
+      CALLBOT_LLM_MODEL: ${CALLBOT_LLM_MODEL:-qwen3.5:9b}
       CALLBOT_LLM_DEVICE: ${CALLBOT_LLM_DEVICE:-cpu}
       CALLBOT_MCP_SERVER_URL: ${CALLBOT_MCP_SERVER_URL:-http://host.docker.internal:9090/mcp/}
     ports:

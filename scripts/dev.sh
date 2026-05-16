@@ -27,7 +27,7 @@ cd "$(dirname "$0")/.."
 COMPOSE="docker compose"
 BUILD_FLAG=""
 SKIP_SERVICES=()
-OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3:8b}"
+OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3.5:9b}"
 OLLAMA_PORT="${OLLAMA_PORT:-8083}"
 MCP_DIR="./mcp-server/java-mcp-server"
 MCP_PORT="${MCP_PORT:-9090}"
@@ -142,6 +142,7 @@ deploy() {
   [[ -f .env ]] && source .env 2>/dev/null || true
   export CALLBOT_LLM_BASE_URL="${CALLBOT_LLM_BASE_URL:-http://host.docker.internal:${OLLAMA_PORT}/v1}"
   export CALLBOT_LLM_MODEL="${CALLBOT_LLM_MODEL:-${OLLAMA_MODEL}}"
+  export CALLBOT_LLM_DEVICE="${CALLBOT_LLM_DEVICE:-cpu}"
 
   # ① 基础设施
   info "━━━ ① 基础设施 ━━━"

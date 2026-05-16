@@ -29,6 +29,6 @@ services:
   agent-flow:
     environment:
       CALLBOT_LLM_BASE_URL: ${CALLBOT_LLM_BASE_URL:-http://vllm:8083/v1}
-      CALLBOT_LLM_MODEL: ${VLLM_SERVED_NAME:-qwen3.5-9b}
+      CALLBOT_LLM_MODEL: ${VLLM_SERVED_NAME:-qwen3.5:9b}
       CALLBOT_LLM_DEVICE: gpu
       CALLBOT_MCP_SERVER_URL: ${CALLBOT_MCP_SERVER_URL:-http://mcp-server:9090/mcp/}

@@ -23,7 +23,7 @@ ENV GPU_MEMORY_UTILIZATION=0.9
 EXPOSE ${PORT}
 
 CMD ["--model", "Qwen/Qwen3.5-9B", \
-     "--served-model-name", "qwen3.5-9b", \
+     "--served-model-name", "qwen3.5:9b", \
      "--host", "0.0.0.0", \
      "--port", "8083", \
      "--max-model-len", "4096", \
