@@ -1,10 +1,8 @@
-version: "3.8"
-
-x-common-env: &common-env
-  MINIO_ENDPOINT: minio:9000
-  MINIO_ACCESS_KEY: admin
-  MINIO_SECRET_KEY: changeme123
-  MINIO_BUCKET: callbot
+# ══════════════════════════════════════════════════
+# 本地开发 — Docker 服务 (基础设施 + MCP)
+# ASR/TTS/agent-flow/Ollama 均本地 conda 运行
+# 启动: ./scripts/dev.sh
+# ══════════════════════════════════════════════════
 
 services:
   # ──────────────────────────────────────────────
@@ -68,135 +66,20 @@ services:
       retries: 5
 
   # ──────────────────────────────────────────────
-  # ASR 服务 (SenseVoice, CPU)
+  # MCP Server (Spring Boot, 用户中心)
+  # jar 由 dev.sh 构建后挂载进容器
   # ──────────────────────────────────────────────
-  agent-asr:
-    build:
-      context: ./agent-asr
-      dockerfile: Dockerfile.cpu
-    container_name: callbot-asr
+  mcp:
+    image: eclipse-temurin:25-jre
+    container_name: callbot-mcp
     restart: unless-stopped
-    environment:
-      <<: *common-env
-      MODEL_DIR: /opt/sensevoice/models/SenseVoiceSmall
     ports:
-      - "8080:8080"
+      - "${MCP_PORT:-9090}:9090"
     volumes:
-      - asr_models:/opt/sensevoice/models
-    depends_on:
-      minio:
-        condition: service_healthy
-
-  # ──────────────────────────────────────────────
-  # TTS 服务 (CosyVoice2, CPU)
-  # ──────────────────────────────────────────────
-  agent-tts:
-    build:
-      context: ./agent-tts
-      dockerfile: Dockerfile.cpu
-    container_name: callbot-tts
-    restart: unless-stopped
-    environment:
-      <<: *common-env
-      MODEL_DIR: /opt/cosyvoice/pretrained_models/CosyVoice2-0.5B
-      COSYVOICE_RUNTIME: /opt/cosyvoice/runtime
-      TTS_CACHE_DIR: /data/tts_cache
-    ports:
-      - "8081:8081"
-    volumes:
-      - tts_models:/opt/cosyvoice/pretrained_models
-      - tts_cache:/data/tts_cache
-    depends_on:
-      minio:
-        condition: service_healthy
-
-  # ──────────────────────────────────────────────
-  # LLM — Ollama (本地开发, CPU)
-  # 启动: docker compose --profile ollama up
-  # ──────────────────────────────────────────────
-  ollama:
-    image: ollama/ollama:latest
-    container_name: callbot-ollama
-    profiles: ["ollama"]
-    restart: unless-stopped
-    ports:
-      - "${OLLAMA_PORT:-8083}:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    # CPU 模式 — 如需 GPU 加速，取消注释 deploy 段并改 device_ids
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           device_ids: ["0"]
-    #           capabilities: [gpu]
-
-  # ──────────────────────────────────────────────
-  # LLM — vLLM (生产环境, GPU)
-  # 启动: docker compose --profile vllm up
-  # ──────────────────────────────────────────────
-  vllm:
-    build:
-      context: ./agent-flow/llm
-      dockerfile: Dockerfile
-    container_name: callbot-vllm
-    profiles: ["vllm"]
-    restart: unless-stopped
-    environment:
-      MODEL_NAME: ${VLLM_MODEL:-Qwen/Qwen3.5-9B}
-    ports:
-      - "${VLLM_PORT:-8083}:8083"
-    volumes:
-      - ${HF_CACHE:-~/.cache/huggingface}:/root/.cache/huggingface
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["${VLLM_GPU_IDS:-2}"]
-              capabilities: [gpu]
-
-  # ──────────────────────────────────────────────
-  # Orchestrator (LangGraph 7-node pipeline)
-  # ──────────────────────────────────────────────
-  agent-flow:
-    build:
-      context: ./agent-flow
-      dockerfile: Dockerfile
-    container_name: callbot-flow
-    restart: unless-stopped
-    environment:
-      CALLBOT_PG_DSN: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/callbot
-      CALLBOT_REDIS_URL: redis://redis:6379/0
-      CALLBOT_MINIO_ENDPOINT: minio:9000
-      CALLBOT_MINIO_ACCESS_KEY: admin
-      CALLBOT_MINIO_SECRET_KEY: changeme123
-      CALLBOT_ASR_ADAPTER_URL: http://agent-asr:8080
-      CALLBOT_TTS_ADAPTER_URL: http://agent-tts:8081
-      CALLBOT_LLM_BASE_URL: ${CALLBOT_LLM_BASE_URL:-http://host.docker.internal:8083/v1}
-      CALLBOT_LLM_MODEL: ${CALLBOT_LLM_MODEL:-qwen3.5:9b}
-      CALLBOT_LLM_DEVICE: ${CALLBOT_LLM_DEVICE:-cpu}
-      CALLBOT_MCP_SERVER_URL: ${CALLBOT_MCP_SERVER_URL:-http://host.docker.internal:9090/mcp/}
-    ports:
-      - "8000:8000"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-      agent-asr:
-        condition: service_started
-      agent-tts:
-        condition: service_started
+      - ./mcp-server/java-mcp-server/target/app.jar:/app/app.jar:ro
+    command: ["java", "-jar", "/app/app.jar"]
 
 volumes:
   pgdata:
   redisdata:
   miniodata:
-  asr_models:
-  tts_models:
-  tts_cache:
-  ollama_data:
