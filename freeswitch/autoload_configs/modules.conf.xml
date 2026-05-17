@@ -1,0 +1,19 @@
+<configuration name="modules.conf" description="Modules">
+  <modules>
+    <!-- SIP -->
+    <load module="mod_sofia"/>
+
+    <!-- Audio fork (agent-flow WebSocket) -->
+    <load module="mod_audio_fork"/>
+
+    <!-- Core -->
+    <load module="mod_dptools"/>
+    <load module="mod_rtp"/>
+    <load module="mod_sndfile"/>
+    <load module="mod_native_file"/>
+    <load module="mod_timer"/>
+
+    <!-- Codecs -->
+    <load module="mod_opus"/>
+  </modules>
+</configuration>

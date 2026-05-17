@@ -26,7 +26,7 @@ class CreditResult:
 class MCPClient:
     """Wraps langchain-mcp-adapters MultiServerMCPClient for the user center MCP server."""
 
-    def __init__(self, server_url: str, transport: str = "http"):
+    def __init__(self, server_url: str, transport: str = "streamable_http"):
         self._client = MultiServerMCPClient(
             {"user_center": {"transport": transport, "url": server_url}},
         )
@@ -44,6 +44,14 @@ class MCPClient:
         if tool is None:
             raise RuntimeError(f"MCP tool not found: {name}")
         result = await tool.ainvoke(arguments)
+        # MCP tool returns list of content blocks: [{"type": "text", "text": "..."}]
+        if isinstance(result, list):
+            for block in result:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    return json.loads(block["text"])
+            # Fallback: join all text blocks
+            text = "".join(b.get("text", str(b)) for b in result if isinstance(b, dict))
+            return json.loads(text)
         if isinstance(result, str):
             return json.loads(result)
         return result

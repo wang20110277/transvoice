@@ -33,7 +33,10 @@ async def lifespan(app: FastAPI):
 
     assembler = MemoryAssembler()
     mcp = MCPClient(settings.mcp_server_url, settings.mcp_transport)
-    await mcp.initialize()
+    try:
+        await mcp.initialize()
+    except Exception as e:
+        logger.warning("MCP 初始化失败，将跳过身份/征信查询: %s", e)
     tts = TTSClient(settings.tts_adapter_url)
     asr = ASRClient(settings.asr_adapter_url)
     set_services(assembler, mcp, tts, asr)
@@ -48,7 +51,10 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    await mcp.close()
+    try:
+        await mcp.close()
+    except Exception:
+        pass
     _initialized = False
     logger.info("=== Agent Orchestrator 关闭 ===")
 

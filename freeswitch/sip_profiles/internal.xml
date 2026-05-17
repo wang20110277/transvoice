@@ -1,0 +1,31 @@
+<profile name="internal">
+  <settings>
+    <param name="debug" value="0"/>
+    <param name="sip-trace" value="no"/>
+    <param name="sip-capture" value="no"/>
+
+    <param name="rtp-ip" value="$${local_ip_v4}"/>
+    <param name="sip-ip" value="$${local_ip_v4}"/>
+    <param name="ext-rtp-ip" value="host.docker.internal"/>
+    <param name="ext-sip-ip" value="host.docker.internal"/>
+
+    <param name="sip-port" value="5060"/>
+    <param name="rtp-timer-name" value="soft"/>
+
+    <!-- Codec -->
+    <param name="global_codec_prefs" value="PCMU,PCMA,OPUS"/>
+    <param name="outbound_codec_prefs" value="PCMU,PCMA,OPUS"/>
+
+    <!-- RTP -->
+    <param name="rtp-start-port" value="16384"/>
+    <param name="rtp-end-port" value="32768"/>
+
+    <!-- Auth: accept all for local dev -->
+    <param name="auth-calls" value="false"/>
+    <param name="accept-blind-reg" value="true"/>
+
+    <!-- Dialplan -->
+    <param name="context" value="public"/>
+    <param name="dialplan" value="XML"/>
+  </settings>
+</profile>

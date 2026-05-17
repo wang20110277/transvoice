@@ -5,9 +5,9 @@
       <!-- 全局变量 -->
       <variables>
         <!-- SIP 配置 -->
-        <variable name="local_ip" value="10.0.0.10"/>
-        <variable name="external_rtp_ip" value="10.0.0.10"/>
-        <variable name="external_sip_ip" value="10.0.0.10"/>
+        <variable name="local_ip" value="$${local_ip_v4}"/>
+        <variable name="external_rtp_ip" value="host.docker.internal"/>
+        <variable name="external_sip_ip" value="host.docker.internal"/>
 
         <!-- 端口配置 -->
         <variable name="sip_port" value="5060"/>
@@ -26,7 +26,7 @@
         <variable name="record_format" value="wav"/>
 
         <!-- agent-flow WebSocket 音频流 -->
-        <variable name="agent_flow_ws_url" value="ws://10.0.0.20:8000/ws/call"/>
+        <variable name="agent_flow_ws_url" value="ws://host.docker.internal:8000/ws/call"/>
         <variable name="agent_flow_temp_dir" value="/tmp/aiphone_tts"/>
 
         <!-- 业务变量默认值 -->

@@ -1,25 +1,18 @@
-<?xml version="1.0" encoding="UTF-8"?>
 <document type="freeswitch/xml">
   <section name="dialplan">
     <context name="public">
-
-      <!-- ============ 智能外呼入口 ============ -->
-      <!-- mod_audio_fork 双向音频流直连 agent-flow WebSocket -->
-
       <extension name="callbot-entry">
         <condition field="destination_number" expression="^(.*)$">
           <action application="set" data="call_start_time=${strftime(%Y-%m-%d %H:%M:%S)}"/>
-          <action application="set" data="original_destination=$1"/>
           <action application="set" data="biz_type=marketing"/>
-          <action application="set" data="task_id=${task_id}"/>
           <action application="answer"/>
 
-          <!-- mod_audio_fork: 双向流音频到 agent-flow WebSocket -->
-          <!-- rw=读写双向, ws-url 带业务参数 -->
-          <action application="audio_fork" data="${agent_flow_ws_url}?call_id=${uuid}&amp;biz_type=${biz_type}&amp;user_key=${caller_id_number} rw"/>
+          <!-- mod_audio_fork: bidirectional audio to agent-flow WebSocket -->
+          <!-- rw=read+write (bidirectional), L16/8000 = 16-bit PCM 8kHz -->
+          <action application="start_dialplan"/>
+          <action application="audio_fork" data="ws://host.docker.internal:8000/ws/call?call_id=${uuid}&amp;biz_type=${biz_type}&amp;user_key=${caller_id_number} rw L16/8000/20"/>
         </condition>
       </extension>
-
     </context>
   </section>
 </document>

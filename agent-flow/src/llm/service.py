@@ -1,6 +1,7 @@
 """LLM 服务层 - 根据 llm_device 自动适配 Ollama(CPU) / vLLM(GPU)"""
 import json
 import logging
+import httpx
 from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
@@ -11,12 +12,60 @@ logger = logging.getLogger(__name__)
 FALLBACK_ACTION_TEXT = "抱歉，请再说一遍。"
 
 
+def _make_http_clients(base_url: str) -> dict:
+    """Create httpx clients with trust_env=False to bypass system proxy."""
+    timeout = httpx.Timeout(timeout=None, connect=30.0)
+    return {
+        "http_client": httpx.Client(timeout=timeout, trust_env=False),
+        "http_async_client": httpx.AsyncClient(timeout=timeout, trust_env=False),
+    }
+
+
 class LLMAction(BaseModel):
     """LLM 返回的结构化动作"""
     action: str = Field(description="动作类型: say | ask | handoff | end")
     text: str = Field(description="回复用户的文本")
     intent: str = Field(default="", description="识别到的意图")
     labels: dict = Field(default_factory=dict, description="附加标签")
+
+
+class _OllamaChat:
+    """Lightweight Ollama native /api/chat client — bypasses OpenAI compat layer to support think:false."""
+
+    def __init__(self, base_url: str, model: str, timeout: float, max_tokens: int, temperature: float):
+        self._base_url = base_url.rstrip("/")
+        # Convert /v1 base to root for native API
+        if self._base_url.endswith("/v1"):
+            self._base_url = self._base_url[:-3]
+        self._model = model
+        self._timeout = timeout
+        self._max_tokens = max_tokens
+        self._temperature = temperature
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(timeout=None, connect=30.0), trust_env=False)
+
+    async def ainvoke(self, messages: list) -> str:
+        ollama_msgs = []
+        for msg in messages:
+            role = msg.role if hasattr(msg, "role") else "user"
+            content = msg.content if hasattr(msg, "content") else str(msg)
+            ollama_msgs.append({"role": role, "content": content})
+
+        resp = await self._client.post(
+            f"{self._base_url}/api/chat",
+            json={
+                "model": self._model,
+                "messages": ollama_msgs,
+                "stream": False,
+                "think": False,
+                "options": {
+                    "num_predict": self._max_tokens,
+                    "temperature": self._temperature,
+                },
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("message", {}).get("content", "")
 
 
 class LLMService:
@@ -27,54 +76,68 @@ class LLMService:
         backend = "vLLM(GPU)" if is_gpu else "Ollama(CPU)"
         logger.info("LLM 后端: %s, model=%s, base_url=%s", backend, settings.llm_model, settings.llm_base_url)
 
-        # GPU 超时短、token 多；CPU 超时长、token 少
         timeout = settings.llm_timeout_sec
         max_tokens = 512 if is_gpu else 256
 
-        self._chat = ChatOpenAI(
-            base_url=settings.llm_base_url,
-            model=settings.llm_model,
-            timeout=timeout,
-            max_tokens=max_tokens,
-            temperature=0.7,
-        )
-
-        # vLLM 支持 json_schema 精确约束；Ollama 用 json_mode 兜底
-        method = "json_schema" if is_gpu else "json_mode"
-        self._structured_chat = self._chat.with_structured_output(
-            LLMAction,
-            method=method,
-        )
+        if is_gpu:
+            self._chat = ChatOpenAI(
+                base_url=settings.llm_base_url,
+                model=settings.llm_model,
+                api_key=settings.llm_api_key,
+                timeout=timeout,
+                max_tokens=max_tokens,
+                temperature=0.7,
+                **_make_http_clients(settings.llm_base_url),
+            )
+            method = "json_schema"
+            self._structured_chat = self._chat.with_structured_output(LLMAction, method=method)
+        else:
+            self._ollama = _OllamaChat(
+                base_url=settings.llm_base_url,
+                model=settings.llm_model,
+                timeout=timeout,
+                max_tokens=max_tokens,
+                temperature=0.7,
+            )
+            self._chat = self._ollama
+            self._structured_chat = None
 
         self._embeddings = OpenAIEmbeddings(
             base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key,
             model=settings.llm_embedding_model,
+            **_make_http_clients(settings.llm_base_url),
         )
         self._is_gpu = is_gpu
 
     async def chat(self, messages: list) -> str:
         """发送对话消息，返回文本响应"""
         lc_messages = self._to_lc_messages(messages)
-        response = await self._chat.ainvoke(lc_messages)
-        return response.content
+        if self._is_gpu:
+            response = await self._chat.ainvoke(lc_messages)
+            return response.content
+        else:
+            return await self._ollama.ainvoke(lc_messages)
 
     async def chat_for_action(self, messages: list) -> LLMAction:
         """发送对话并解析为结构化动作"""
         lc_messages = self._to_lc_messages(messages)
-        try:
-            result = await self._structured_chat.ainvoke(lc_messages)
-            if isinstance(result, LLMAction):
-                return result
-            return self._parse_fallback(str(result))
-        except Exception as e:
-            logger.error("结构化输出失败: %s", e)
-            # GPU 失败不重试直接降级；CPU 尝试纯文本再解析
-            if self._is_gpu:
-                return LLMAction(action="say", text=FALLBACK_ACTION_TEXT)
+        if self._is_gpu:
             try:
-                raw = await self.chat(messages)
+                result = await self._structured_chat.ainvoke(lc_messages)
+                if isinstance(result, LLMAction):
+                    return result
+                return self._parse_fallback(str(result))
+            except Exception as e:
+                logger.error("结构化输出失败: %s", e)
+                return LLMAction(action="say", text=FALLBACK_ACTION_TEXT)
+        else:
+            # Ollama: native API + manual JSON parse
+            try:
+                raw = await self._ollama.ainvoke(lc_messages)
                 return self._parse_fallback(raw)
-            except Exception:
+            except Exception as e:
+                logger.error("Ollama 调用失败: %s", e)
                 return LLMAction(action="say", text=FALLBACK_ACTION_TEXT)
 
     async def get_embeddings(self, text: str) -> list[float]:
@@ -88,8 +151,12 @@ class LLMService:
     async def health_check(self) -> bool:
         """检查 LLM 服务可用性"""
         try:
-            response = await self._chat.ainvoke([HumanMessage(content="ping")])
-            return bool(response.content)
+            if self._is_gpu:
+                response = await self._chat.ainvoke([HumanMessage(content="ping")])
+                return bool(response.content)
+            else:
+                content = await self._ollama.ainvoke([HumanMessage(content="ping")])
+                return bool(content)
         except Exception as e:
             logger.error("LLM 健康检查失败: %s", e)
             return False

@@ -1,6 +1,12 @@
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
+
 from clients.mcp import MCPClient, IdentityResult, CreditResult
+
+
+def _make_mcp_text_response(data: dict) -> list:
+    import json
+    return [{"type": "text", "text": json.dumps(data)}]
 
 
 @pytest.mark.asyncio
@@ -8,20 +14,20 @@ async def test_query_user_identity_success():
     client = MCPClient("http://localhost:9090/mcp/")
     mock_tool = AsyncMock()
     mock_tool.name = "user_identity_query"
-    mock_tool.ainvoke.return_value = {
+    mock_tool.ainvoke.return_value = _make_mcp_text_response({
         "user_id": "u123",
-        "name_masked": "张*",
-        "id_last_four": "1234",
-        "gender": "male",
-    }
+        "phone_masked": "138****5678",
+        "id_card_last_four": "1234",
+    })
     client._tools = {"user_identity_query": mock_tool}
 
-    result = await client.query_user_identity("phone_hash_123", "collection")
+    result = await client.query_user_identity("13800005678", "collection")
     assert isinstance(result, IdentityResult)
     assert result.user_id == "u123"
-    assert result.verified is True
+    assert result.phone_masked == "138****5678"
+    assert result.id_card_last_four == "1234"
     mock_tool.ainvoke.assert_awaited_once_with({
-        "phone_hash": "phone_hash_123",
+        "phone": "13800005678",
         "biz_type": "collection",
     })
 
@@ -31,20 +37,19 @@ async def test_query_credit_profile_success():
     client = MCPClient("http://localhost:9090/mcp/")
     mock_tool = AsyncMock()
     mock_tool.name = "user_credit_query"
-    mock_tool.ainvoke.return_value = {
+    mock_tool.ainvoke.return_value = _make_mcp_text_response({
+        "user_id": "u123",
         "credit_qualified": True,
         "risk_level": "low",
-        "details": {"score": 750},
-    }
+    })
     client._tools = {"user_credit_query": mock_tool}
 
-    result = await client.query_credit_profile("u123", "phone_hash_123")
+    result = await client.query_credit_profile("u123")
     assert isinstance(result, CreditResult)
     assert result.credit_qualified is True
     assert result.risk_level == "low"
     mock_tool.ainvoke.assert_awaited_once_with({
         "user_id": "u123",
-        "phone_hash": "phone_hash_123",
     })
 
 
