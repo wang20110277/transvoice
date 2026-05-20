@@ -36,3 +36,5 @@ htmlcov/
 *.pyc
 
 models
+openspec/
+.openflow
