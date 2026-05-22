@@ -1,0 +1,74 @@
+"""gRPC ASR service — streaming audio recognition alongside FastAPI HTTP."""
+import asyncio
+import logging
+import os
+from concurrent import futures
+
+import grpc
+
+from asradapter.proto import asr_pb2, asr_pb2_grpc
+from asradapter.base import ASREngine
+
+logger = logging.getLogger(__name__)
+
+GRPC_PORT = int(os.environ.get("ASR_GRPC_PORT", "50051"))
+
+
+class ASRGrpcServicer(asr_pb2_grpc.ASRServiceServicer):
+    def __init__(self, engine: ASREngine):
+        self._engine = engine
+
+    async def StreamingRecognize(self, request_iterator, context):
+        """Receive streaming audio chunks, accumulate, run batch ASR on stream close."""
+        call_id = ""
+        language = "zh"
+        audio_chunks: list[bytes] = []
+
+        async for request in request_iterator:
+            if request.HasField("config"):
+                call_id = request.config.call_id
+                language = request.config.language or "zh"
+            elif request.audio_chunk:
+                audio_chunks.append(request.audio_chunk)
+
+        audio_bytes = b"".join(audio_chunks)
+        if not audio_bytes:
+            return asr_pb2.StreamingRecognizeResponse(
+                text="", confidence=0.0, is_final=True,
+            )
+
+        params = {"call_id": call_id, "language": language}
+        try:
+            result = await self._engine.recognize(audio_bytes, params)
+        except Exception as e:
+            logger.error("gRPC ASR recognize error call_id=%s: %s", call_id, e)
+            return asr_pb2.StreamingRecognizeResponse(
+                text="", confidence=0.0, is_final=True,
+            )
+
+        # Upload to MinIO in background (fire-and-forget)
+        minio_key = ""
+        try:
+            from asradapter.store.storage import upload_audio
+            key = upload_audio(audio_bytes, call_id)
+            if key:
+                minio_key = key
+        except Exception:
+            pass
+
+        return asr_pb2.StreamingRecognizeResponse(
+            text=result.text,
+            confidence=result.confidence,
+            is_final=True,
+            minio_key=minio_key,
+        )
+
+
+async def serve_grpc(engine: ASREngine, port: int = GRPC_PORT):
+    """Start gRPC server (run alongside FastAPI)."""
+    server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=10))
+    asr_pb2_grpc.add_ASRServiceServicer_to_server(ASRGrpcServicer(engine), server)
+    server.add_insecure_port(f"[::]:{port}")
+    await server.start()
+    logger.info("gRPC ASR server started on port %d", port)
+    return server

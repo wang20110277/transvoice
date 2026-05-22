@@ -70,6 +70,18 @@ class Settings(BaseSettings):
     jitter_target_depth: int = 3
     jitter_max_depth: int = 10
 
+    # Denoising (pre-VAD): "", "highpass", "noisereduce", "rnnoise"
+    denoise_enabled: str = ""
+    denoise_highpass_cutoff: float = 200.0
+
+    # ASR gRPC streaming
+    asr_grpc_target: str = "127.0.0.1:50051"
+    asr_use_grpc: bool = False
+
+    # TTS gRPC streaming
+    tts_grpc_target: str = "127.0.0.1:50052"
+    tts_use_grpc: bool = False
+
     model_config = {"env_prefix": "CALLBOT_", "env_file": ".env", "extra": "ignore"}
 
 

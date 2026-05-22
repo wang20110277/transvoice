@@ -10,9 +10,11 @@ from fastapi import WebSocket, WebSocketDisconnect
 from ws.vad import SimpleVAD
 from ws.jitter_buffer import JitterBuffer, TTSOutputBuffer
 from ws.registry import ActiveCallRegistry
+from ws.denoise import BaseDenoiser, PassThroughDenoiser
 
 if TYPE_CHECKING:
     from clients.esl import ESLClient
+    from clients.asr_grpc_client import ASRGrpcClient, ASRStream
     from ws.registry import ActiveCall
 
 logger = logging.getLogger(__name__)
@@ -167,6 +169,9 @@ class StreamingCallHandler:
         barge_in_min_audio_bytes: int = 1600,
         jitter_target_depth: int = 3,
         jitter_max_depth: int = 10,
+        denoiser: BaseDenoiser | None = None,
+        asr_grpc_client: "ASRGrpcClient | None" = None,
+        use_grpc_streaming: bool = False,
     ) -> None:
         self._pre_llm_fn = pre_llm_fn
         self._streaming_fn = streaming_fn
@@ -179,6 +184,9 @@ class StreamingCallHandler:
         self._barge_in_min_audio_bytes = barge_in_min_audio_bytes
         self._jitter_target_depth = jitter_target_depth
         self._jitter_max_depth = jitter_max_depth
+        self._denoiser = denoiser or PassThroughDenoiser()
+        self._asr_grpc_client = asr_grpc_client
+        self._use_grpc_streaming = use_grpc_streaming
 
     async def handle(self, websocket: WebSocket, call_id: str, biz_type: str, user_key: str) -> None:
         await websocket.accept()
@@ -202,6 +210,10 @@ class StreamingCallHandler:
         # Barge-in state
         streaming_task: asyncio.Task | None = None
         barge_in_event = asyncio.Event()
+        # gRPC ASR streaming state
+        asr_stream: ASRStream | None = None
+        speech_started = False
+        precomputed_asr_result: dict | None = None
 
         try:
             while True:
@@ -230,6 +242,7 @@ class StreamingCallHandler:
                         audio_buffer.clear()
                         vad.reset()
                         jitter.reset()
+                        self._denoiser.reset()
                         barge_in_event.clear()
                         streaming_task = None
                         continue
@@ -243,6 +256,7 @@ class StreamingCallHandler:
                             audio_buffer.clear()
                             vad.reset()
                             jitter.reset()
+                            self._denoiser.reset()
                             barge_in_event.clear()
                         continue
 
@@ -258,9 +272,20 @@ class StreamingCallHandler:
                         smooth_frame = jitter.drain()
                         if not smooth_frame:
                             break
-                        audio_buffer.extend(smooth_frame)
+                        denoised_frame = self._denoiser.process(smooth_frame)
+                        audio_buffer.extend(denoised_frame)
 
-                        if vad.is_end_of_speech(smooth_frame, len(audio_buffer)):
+                        # gRPC streaming: start stream on first speech, feed frames
+                        if self._use_grpc_streaming and self._asr_grpc_client:
+                            if not speech_started and vad.is_speech(denoised_frame):
+                                speech_started = True
+                                asr_stream = self._asr_grpc_client.create_stream(call_id)
+                                if asr_stream:
+                                    await asr_stream.start()
+                            if asr_stream:
+                                asr_stream.send_audio(denoised_frame)
+
+                        if vad.is_end_of_speech(denoised_frame, len(audio_buffer)):
                             if active_call and active_call.cancel.is_set():
                                 break
 
@@ -268,6 +293,13 @@ class StreamingCallHandler:
                             t0 = time.monotonic()
                             logger.info("[%s] end-of-speech, streaming turn %d (%d bytes)",
                                         call_id, turn_count, len(audio_buffer))
+
+                            # gRPC: finish stream and get ASR result
+                            precomputed_asr_result = None
+                            if asr_stream:
+                                precomputed_asr_result = await asr_stream.finish()
+                                asr_stream = None
+                                speech_started = False
 
                             # Launch streaming as a concurrent task so we can
                             # receive audio for barge-in while it runs
@@ -277,6 +309,7 @@ class StreamingCallHandler:
                                     websocket, call_id, biz_type, user_key,
                                     bytes(audio_buffer), turn_count, active_call,
                                     barge_in_event=barge_in_event,
+                                    precomputed_asr_result=precomputed_asr_result,
                                 ),
                                 name=f"stream-{call_id}-{turn_count}",
                             )
@@ -284,6 +317,7 @@ class StreamingCallHandler:
                             audio_buffer.clear()
                             vad.reset()
                             jitter.reset()
+                            self._denoiser.reset()
                             break  # Exit to outer loop to enter barge-in mode
 
                 elif "text" in data and data["text"]:
@@ -346,11 +380,12 @@ class StreamingCallHandler:
                 smooth_frame = jitter.drain()
                 if not smooth_frame:
                     break
-                audio_buffer.extend(smooth_frame)
+                denoised_frame = self._denoiser.process(smooth_frame)
+                audio_buffer.extend(denoised_frame)
 
                 # Barge-in VAD: use shorter thresholds for faster detection
                 # during AI speech — just need to detect that user started talking
-                if len(audio_buffer) >= self._barge_in_min_audio_bytes and self._is_speech_frame(smooth_frame, vad):
+                if len(audio_buffer) >= self._barge_in_min_audio_bytes and self._is_speech_frame(denoised_frame, vad):
                     logger.info("[%s] barge-in: user speech detected (%d bytes buffered)",
                                 call_id, len(audio_buffer))
 
@@ -400,6 +435,7 @@ class StreamingCallHandler:
         turn: int,
         active_call: "ActiveCall | None" = None,
         barge_in_event: asyncio.Event | None = None,
+        precomputed_asr_result: dict | None = None,
     ) -> None:
         """运行流式管线：Pre-LLM 阶段 → 流式 LLM+TTS → TTS Jitter Buffer 匀速回传。
 
@@ -411,7 +447,10 @@ class StreamingCallHandler:
                 return
 
             # Phase 1: Pre-LLM (ASR + parallel MCP/Memory/RAG)
-            state = await self._pre_llm_fn(call_id, biz_type, user_key, audio)
+            state = await self._pre_llm_fn(
+                call_id, biz_type, user_key, audio,
+                precomputed_asr_result=precomputed_asr_result,
+            )
 
             # Check barge-in after pre-LLM phase
             if barge_in_event and barge_in_event.is_set():

@@ -7,3 +7,5 @@ modelscope==1.22.0
 soundfile
 pydub
 python-multipart
+grpcio>=1.60.0
+grpcio-tools>=1.60.0

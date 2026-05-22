@@ -30,6 +30,6 @@ ENV PYTHONPATH=/app
 RUN mkdir -p ${TTS_CACHE_DIR}
 VOLUME ${TTS_CACHE_DIR}
 
-EXPOSE 8081
+EXPOSE 8081 50052
 
 CMD ["uvicorn", "ttsadapter.main:app", "--host", "0.0.0.0", "--port", "8081"]

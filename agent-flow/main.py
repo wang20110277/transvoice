@@ -20,6 +20,9 @@ from src.clients.tts import TTSClient
 from src.clients.asr import ASRClient
 from src.clients.esl import ESLClient
 from src.ws.registry import ActiveCallRegistry
+from src.ws.denoise import create_denoiser
+from src.clients.asr_grpc_client import ASRGrpcClient
+from src.clients.tts_grpc_client import TTSGrpcClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,7 +51,22 @@ async def lifespan(app: FastAPI):
     asr = ASRClient(settings.asr_adapter_url)
     await asr.start()
     await tts.start()
-    set_services(assembler, mcp, tts, asr)
+
+    # gRPC ASR client (optional — for streaming audio transfer)
+    asr_grpc = None
+    if settings.asr_use_grpc:
+        asr_grpc = ASRGrpcClient(settings.asr_grpc_target)
+        await asr_grpc.start()
+        logger.info("ASR gRPC client connected to %s", settings.asr_grpc_target)
+
+    # gRPC TTS client (optional — for streaming text-to-speech)
+    tts_grpc = None
+    if settings.tts_use_grpc:
+        tts_grpc = TTSGrpcClient(settings.tts_grpc_target)
+        await tts_grpc.start()
+        logger.info("TTS gRPC client connected to %s", settings.tts_grpc_target)
+
+    set_services(assembler, mcp, tts, asr, tts_grpc=tts_grpc)
 
     # ESL client (optional — graceful degradation if FreeSWITCH not reachable)
     esl = ESLClient(host=settings.esl_host, port=settings.esl_port, password=settings.esl_password)
@@ -70,6 +88,7 @@ async def lifespan(app: FastAPI):
     _initialized = True
 
     from src.ws.handler import CallWebSocketHandler, StreamingCallHandler
+    denoiser = create_denoiser()
     _ws_handler = CallWebSocketHandler(
         turn_fn=invoke_turn, esl=esl, handoff_extension=settings.handoff_extension,
         vad_aggressiveness=settings.vad_aggressiveness,
@@ -88,6 +107,9 @@ async def lifespan(app: FastAPI):
         barge_in_min_audio_bytes=settings.barge_in_min_audio_bytes,
         jitter_target_depth=settings.jitter_target_depth,
         jitter_max_depth=settings.jitter_max_depth,
+        denoiser=denoiser,
+        asr_grpc_client=asr_grpc,
+        use_grpc_streaming=settings.asr_use_grpc,
     )
 
     logger.info("=== Agent Orchestrator 启动 ===")
@@ -100,6 +122,10 @@ async def lifespan(app: FastAPI):
         pass
     if _streaming_handler and _streaming_handler._esl:
         await _streaming_handler._esl.close()
+    if asr_grpc:
+        await asr_grpc.close()
+    if tts_grpc:
+        await tts_grpc.close()
     await asr.close()
     await tts.close()
     _initialized = False

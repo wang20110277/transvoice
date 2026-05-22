@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package asr;
+
+// ASR streaming service — client sends audio chunks, server returns final result
+service ASRService {
+  rpc StreamingRecognize (stream StreamingRecognizeRequest) returns (StreamingRecognizeResponse);
+}
+
+message StreamingRecognizeRequest {
+  oneof request {
+    // Audio data chunk (raw PCM 8kHz 16-bit mono)
+    bytes audio_chunk = 1;
+
+    // Configuration (sent as first message)
+    RecognitionConfig config = 2;
+  }
+}
+
+message RecognitionConfig {
+  string call_id = 1;
+  string language = 2;
+}
+
+message StreamingRecognizeResponse {
+  string text = 1;
+  double confidence = 2;
+  bool is_final = 3;
+  string minio_key = 4;
+}

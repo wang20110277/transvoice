@@ -9,10 +9,12 @@ from fastapi import FastAPI, Form
 from fastapi.responses import Response, JSONResponse
 from ttsadapter.config import load_tts_engine
 from ttsadapter.store import storage
+from ttsadapter.grpc_server import serve_grpc
 
 logger = logging.getLogger(__name__)
 
 engine = None
+_grpc_server = None
 
 
 def _load_config():
@@ -23,13 +25,21 @@ def _load_config():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global engine
+    global engine, _grpc_server
     config = _load_config()
     engine = load_tts_engine(config["engine"]["tts"])
     if hasattr(engine, "load_model"):
         await engine.load_model()
     logger.info(f"TTS engine loaded: {config['engine']['tts']}")
+
+    # Start gRPC server alongside FastAPI
+    _grpc_server = await serve_grpc(engine)
+
     yield
+
+    if _grpc_server:
+        await _grpc_server.stop(grace=2)
+        logger.info("gRPC TTS server stopped")
 
 
 app = FastAPI(title="TTS Adapter Service", lifespan=lifespan)

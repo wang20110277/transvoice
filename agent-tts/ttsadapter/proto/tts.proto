@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package tts;
+
+// TTS synthesis service — unary RPC: send text, receive audio
+service TTSService {
+  rpc Synthesize (SynthesizeRequest) returns (SynthesizeResponse);
+}
+
+message SynthesizeRequest {
+  string text = 1;
+  string call_id = 2;
+  string biz_type = 3;
+}
+
+message SynthesizeResponse {
+  bytes audio = 1;
+  string content_type = 2;
+  int32 duration_ms = 3;
+  string minio_key = 4;
+}

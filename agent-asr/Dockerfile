@@ -20,6 +20,6 @@ RUN python -c "from modelscope import snapshot_download; snapshot_download('iic/
 
 ENV MODEL_DIR=/opt/sensevoice/models/SenseVoiceSmall
 ENV PYTHONPATH=/app
-EXPOSE 8080
+EXPOSE 8080 50051
 
 CMD ["uvicorn", "asradapter.main:app", "--host", "0.0.0.0", "--port", "8080"]

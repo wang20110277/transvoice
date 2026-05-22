@@ -7,3 +7,5 @@ funasr==1.2.3
 modelscope==1.22.0
 torch-complex
 python-multipart
+grpcio>=1.60.0
+grpcio-tools>=1.60.0

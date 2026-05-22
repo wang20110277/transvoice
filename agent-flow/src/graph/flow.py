@@ -29,6 +29,7 @@ _assembler: MemoryAssembler | None = None
 _mcp_client: MCPClient | None = None
 _tts_client: TTSClient | None = None
 _asr_client: ASRClient | None = None
+_tts_grpc_client: "TTSGrpcClient | None" = None
 
 
 def set_services(
@@ -36,12 +37,14 @@ def set_services(
     mcp: MCPClient,
     tts: TTSClient,
     asr: ASRClient | None = None,
+    tts_grpc: "TTSGrpcClient | None" = None,
 ) -> None:
-    global _assembler, _mcp_client, _tts_client, _asr_client
+    global _assembler, _mcp_client, _tts_client, _asr_client, _tts_grpc_client
     _assembler = assembler
     _mcp_client = mcp
     _tts_client = tts
     _asr_client = asr
+    _tts_grpc_client = tts_grpc
 
 
 class CallGraphState(TypedDict, total=False):
@@ -286,9 +289,13 @@ def create_call_graph():
 # ── Pre-LLM phase (for streaming path) ──
 
 async def run_pre_llm_phase(
-    call_id: str, biz_type: str, user_key: str, audio_bytes: bytes
+    call_id: str, biz_type: str, user_key: str, audio_bytes: bytes,
+    precomputed_asr_result: dict | None = None,
 ) -> CallGraphState:
-    """运行 ASR + 并行 fan-out（MCP + Memory + RAG），返回组装好的 state。"""
+    """运行 ASR + 并行 fan-out（MCP + Memory + RAG），返回组装好的 state。
+
+    precomputed_asr_result: 如果已通过 gRPC 流式获取了 ASR 结果，直接使用，跳过 HTTP ASR 调用。
+    """
     t0 = time.monotonic()
 
     # Node 1: ASR
@@ -308,8 +315,18 @@ async def run_pre_llm_phase(
         "tts_audio": None,
         "chat_history": [],
     }
-    asr_result = await receive_asr_node(state)
-    state.update(asr_result)
+
+    if precomputed_asr_result:
+        # Use gRPC-streamed ASR result directly
+        state["user_input"] = precomputed_asr_result.get("text", "")
+        state["asr_minio_key"] = precomputed_asr_result.get("minio_key")
+        # Load chat history
+        asr_result = await receive_asr_node(state)
+        state.update(asr_result)
+        state["user_input"] = precomputed_asr_result.get("text", "") or state.get("user_input", "")
+    else:
+        asr_result = await receive_asr_node(state)
+        state.update(asr_result)
 
     # Parallel fan-out: mcp_identity + recall_memory + rag_retrieve
     identity_coro = mcp_identity_node(state)
@@ -388,10 +405,13 @@ async def run_streaming_pipeline(
 
     async def _tts_sentence(sentence: Sentence) -> None:
         """TTS 合成单句并通过回调发送。"""
-        if _tts_client is None or not sentence.text:
+        if not sentence.text:
+            return
+        client = _tts_grpc_client if _tts_grpc_client else _tts_client
+        if client is None:
             return
         try:
-            wav = await _tts_client.synthesize_raw(sentence.text, call_id, biz_type)
+            wav = await client.synthesize_raw(sentence.text, call_id, biz_type)
             if wav:
                 pcm = _strip_wav_header(wav)
                 await audio_callback(pcm, sentence.index)
