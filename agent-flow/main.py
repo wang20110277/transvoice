@@ -19,6 +19,7 @@ from src.clients.mcp import MCPClient
 from src.clients.tts import TTSClient
 from src.clients.asr import ASRClient
 from src.clients.esl import ESLClient
+from src.ws.registry import ActiveCallRegistry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,6 +31,7 @@ _graph = None
 _initialized = False
 _ws_handler = None
 _streaming_handler = None
+_call_registry = ActiveCallRegistry()
 
 
 @asynccontextmanager
@@ -52,6 +54,14 @@ async def lifespan(app: FastAPI):
     esl = ESLClient(host=settings.esl_host, port=settings.esl_port, password=settings.esl_password)
     try:
         await esl.start()
+        # Subscribe to CHANNEL_HANGUP to detect caller hangup
+        async def _on_channel_hangup(event):
+            hangup_uuid = event.headers.get("Unique-ID", "")
+            if hangup_uuid:
+                _call_registry.cancel_call(hangup_uuid)
+        esl.on_event("CHANNEL_HANGUP", _on_channel_hangup)
+        await esl.subscribe(["CHANNEL_HANGUP"])
+        logger.info("ESL subscribed to CHANNEL_HANGUP")
     except Exception as e:
         logger.warning("ESL connection failed (call control disabled): %s", e)
         esl = None
@@ -66,6 +76,7 @@ async def lifespan(app: FastAPI):
         streaming_fn=run_streaming_pipeline,
         esl=esl,
         handoff_extension=settings.handoff_extension,
+        registry=_call_registry,
     )
 
     logger.info("=== Agent Orchestrator 启动 ===")

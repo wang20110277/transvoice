@@ -8,9 +8,11 @@ from typing import TYPE_CHECKING
 from fastapi import WebSocket, WebSocketDisconnect
 
 from ws.vad import SimpleVAD
+from ws.registry import ActiveCallRegistry
 
 if TYPE_CHECKING:
     from clients.esl import ESLClient
+    from ws.registry import ActiveCall
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +155,7 @@ class StreamingCallHandler:
         streaming_fn,
         esl: "ESLClient | None" = None,
         handoff_extension: str = "1001",
+        registry: ActiveCallRegistry | None = None,
         vad_silence_threshold: float = 500.0,
         vad_silence_frames: int = 15,
         vad_min_audio_bytes: int = 3200,
@@ -161,6 +164,7 @@ class StreamingCallHandler:
         self._streaming_fn = streaming_fn
         self._esl = esl
         self._handoff_extension = handoff_extension
+        self._registry = registry
         self._vad_silence_threshold = vad_silence_threshold
         self._vad_silence_frames = vad_silence_frames
         self._vad_min_audio_bytes = vad_min_audio_bytes
@@ -168,6 +172,11 @@ class StreamingCallHandler:
     async def handle(self, websocket: WebSocket, call_id: str, biz_type: str, user_key: str) -> None:
         await websocket.accept()
         logger.info("[%s] streaming WS connected biz_type=%s", call_id, biz_type)
+
+        # Register active call for CHANNEL_HANGUP cancellation
+        active_call = None
+        if self._registry:
+            active_call = self._registry.register(call_id, biz_type)
 
         vad = SimpleVAD(
             silence_threshold=self._vad_silence_threshold,
@@ -179,6 +188,11 @@ class StreamingCallHandler:
 
         try:
             while True:
+                # Check if caller hung up (signaled by CHANNEL_HANGUP event)
+                if active_call and active_call.cancel.is_set():
+                    logger.info("[%s] call cancelled (CHANNEL_HANGUP), stopping", call_id)
+                    break
+
                 data = await websocket.receive()
 
                 if "bytes" in data and data["bytes"]:
@@ -186,6 +200,11 @@ class StreamingCallHandler:
                     audio_buffer.extend(frame)
 
                     if vad.is_end_of_speech(frame, len(audio_buffer)):
+                        # Check cancellation before processing
+                        if active_call and active_call.cancel.is_set():
+                            logger.info("[%s] call cancelled during turn processing", call_id)
+                            break
+
                         turn_count += 1
                         t0 = time.monotonic()
                         logger.info("[%s] end-of-speech, streaming turn %d (%d bytes)",
@@ -193,7 +212,7 @@ class StreamingCallHandler:
 
                         await self._process_streaming_turn(
                             websocket, call_id, biz_type, user_key,
-                            bytes(audio_buffer), turn_count,
+                            bytes(audio_buffer), turn_count, active_call,
                         )
 
                         elapsed = (time.monotony() - t0) * 1000
@@ -213,6 +232,8 @@ class StreamingCallHandler:
         except Exception as e:
             logger.error("[%s] streaming WS error: %s", call_id, e, exc_info=True)
         finally:
+            if self._registry:
+                self._registry.unregister(call_id)
             logger.info("[%s] streaming WS ended, total turns=%d", call_id, turn_count)
 
     async def _process_streaming_turn(
@@ -223,9 +244,13 @@ class StreamingCallHandler:
         user_key: str,
         audio: bytes,
         turn: int,
+        active_call: "ActiveCall | None" = None,
     ) -> None:
         """运行流式管线：Pre-LLM 阶段 → 流式 LLM+TTS → 音频按序回传。"""
         try:
+            # Check cancellation before starting pipeline
+            if active_call and active_call.cancel.is_set():
+                return
             # Phase 1: Pre-LLM (ASR + parallel MCP/Memory/RAG)
             state = await self._pre_llm_fn(call_id, biz_type, user_key, audio)
 
