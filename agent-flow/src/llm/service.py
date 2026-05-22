@@ -1,11 +1,13 @@
 """LLM 服务层 - 根据 llm_device 自动适配 Ollama(CPU) / vLLM(GPU)"""
 import json
 import logging
+from collections.abc import AsyncIterator
 import httpx
 from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from config import settings
+from llm.json_stream import IncrementalJSONParser, StreamEvent
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +120,26 @@ class LLMService:
             return response.content
         else:
             return await self._ollama.ainvoke(lc_messages)
+
+    async def astream_text(self, messages: list) -> AsyncIterator[str]:
+        """流式输出原始 token。"""
+        lc_messages = self._to_lc_messages(messages)
+        async for chunk in self._chat.astream(lc_messages):
+            if chunk.content:
+                yield chunk.content
+
+    async def astream_action(self, messages: list) -> AsyncIterator[StreamEvent]:
+        """流式输出 + 增量 JSON 解析，逐步提取 action/text 字段。"""
+        lc_messages = self._to_lc_messages(messages)
+        parser = IncrementalJSONParser()
+
+        async for chunk in self._chat.astream(lc_messages):
+            if chunk.content:
+                for event in parser.feed(chunk.content):
+                    yield event
+
+        final = parser.finalize()
+        yield final
 
     async def chat_for_action(self, messages: list) -> LLMAction:
         """发送对话并解析为结构化动作"""

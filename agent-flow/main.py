@@ -10,7 +10,10 @@ from pydantic import BaseModel
 from fastapi import HTTPException
 
 from src.config import settings
-from src.graph.flow import create_call_graph, set_services, CallGraphState
+from src.graph.flow import (
+    create_call_graph, set_services, CallGraphState,
+    run_pre_llm_phase, run_streaming_pipeline,
+)
 from src.memory.assembler import MemoryAssembler
 from src.clients.mcp import MCPClient
 from src.clients.tts import TTSClient
@@ -25,11 +28,12 @@ logger = logging.getLogger(__name__)
 _graph = None
 _initialized = False
 _ws_handler = None
+_streaming_handler = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _graph, _initialized, _ws_handler
+    global _graph, _initialized, _ws_handler, _streaming_handler
 
     assembler = MemoryAssembler()
     mcp = MCPClient(settings.mcp_server_url, settings.mcp_transport)
@@ -39,13 +43,19 @@ async def lifespan(app: FastAPI):
         logger.warning("MCP 初始化失败，将跳过身份/征信查询: %s", e)
     tts = TTSClient(settings.tts_adapter_url)
     asr = ASRClient(settings.asr_adapter_url)
+    await asr.start()
+    await tts.start()
     set_services(assembler, mcp, tts, asr)
 
     _graph = create_call_graph()
     _initialized = True
 
-    from src.ws.handler import CallWebSocketHandler
+    from src.ws.handler import CallWebSocketHandler, StreamingCallHandler
     _ws_handler = CallWebSocketHandler(turn_fn=invoke_turn)
+    _streaming_handler = StreamingCallHandler(
+        pre_llm_fn=run_pre_llm_phase,
+        streaming_fn=run_streaming_pipeline,
+    )
 
     logger.info("=== Agent Orchestrator 启动 ===")
 
@@ -55,6 +65,8 @@ async def lifespan(app: FastAPI):
         await mcp.close()
     except Exception:
         pass
+    await asr.close()
+    await tts.close()
     _initialized = False
     logger.info("=== Agent Orchestrator 关闭 ===")
 
@@ -198,5 +210,9 @@ async def ws_call(
     biz_type: str = Query(default="marketing"),
     user_key: str = Query(default=""),
 ):
-    """WebSocket 双向音频流端点 — FreeSWITCH mod_audio_fork 直连。"""
-    await _ws_handler.handle(websocket, call_id, biz_type, user_key)
+    """WebSocket 双向音频流端点 — 流式 LLM+TTS 音频回传。"""
+    handler = _streaming_handler or _ws_handler
+    if handler is None:
+        await websocket.close(code=503, reason="Service not initialized")
+        return
+    await handler.handle(websocket, call_id, biz_type, user_key)

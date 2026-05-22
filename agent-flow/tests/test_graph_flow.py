@@ -30,8 +30,8 @@ def _make_state(**overrides) -> dict:
 async def test_route_credit_query_only_marketing():
     from graph.flow import should_query_credit
     assert should_query_credit(_make_state(biz_type="marketing")) == "credit_query"
-    assert should_query_credit(_make_state(biz_type="customer_service")) == "recall_memory"
-    assert should_query_credit(_make_state(biz_type="collection")) == "recall_memory"
+    assert should_query_credit(_make_state(biz_type="customer_service")) == "llm_decide"
+    assert should_query_credit(_make_state(biz_type="collection")) == "llm_decide"
 
 
 @pytest.mark.asyncio
