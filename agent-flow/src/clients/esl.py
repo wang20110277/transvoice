@@ -2,6 +2,7 @@
 import asyncio
 import logging
 from dataclasses import dataclass
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -9,7 +10,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ESLEvent:
     """ESL 事件/响应"""
-    headers: dict[str, str]
+    headers: Dict[str, str]
     body: str = ""
 
 
@@ -19,31 +20,44 @@ class ESLClient:
     支持:
     - api/bgapi 命令 (uuid_kill, uuid_transfer, uuid_break 等)
     - 事件订阅 (CHANNEL_HANGUP, CHANNEL_ANSWER 等)
-    - 自动重连
+    - 自动重连 (断线后指数退避重连, 重订阅事件)
+    - 心跳检测 (定期 api status, 发现僵死连接主动断开重连)
     """
+
+    RECONNECT_BASE_DELAY = 1.0
+    RECONNECT_MAX_DELAY = 30.0
+    HEARTBEAT_INTERVAL = 30.0
 
     def __init__(self, host: str = "127.0.0.1", port: int = 8021, password: str = "ClueCon"):
         self._host = host
         self._port = port
         self._password = password
-        self._reader: asyncio.StreamReader | None = None
-        self._writer: asyncio.StreamWriter | None = None
+        self._reader: Optional[asyncio.StreamReader] = None
+        self._writer: Optional[asyncio.StreamWriter] = None
         self._connected = False
-        self._event_handlers: dict[str, list] = {}
-        self._event_task: asyncio.Task | None = None
+        self._closing = False
+        self._event_handlers: Dict[str, list] = {}
+        self._subscribed_events: List[str] = []
+        self._event_task: Optional[asyncio.Task] = None
+        self._reconnect_task: Optional[asyncio.Task] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._reconnect_delay = self.RECONNECT_BASE_DELAY
 
     async def start(self) -> None:
         """连接并认证, 启动事件监听。"""
         await self._connect()
         self._event_task = asyncio.create_task(self._event_loop())
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         logger.info("ESL connected to %s:%d", self._host, self._port)
 
     async def close(self) -> None:
-        """关闭连接。"""
+        """关闭连接, 停止重连。"""
+        self._closing = True
         self._connected = False
-        if self._event_task:
-            self._event_task.cancel()
-            self._event_task = None
+        for task in (self._event_task, self._reconnect_task, self._heartbeat_task):
+            if task:
+                task.cancel()
+        self._event_task = self._reconnect_task = self._heartbeat_task = None
         if self._writer:
             try:
                 self._writer.close()
@@ -84,8 +98,15 @@ class ESLClient:
         self._event_handlers.setdefault(event_name, []).append(handler)
 
     async def subscribe(self, events: list[str]) -> None:
-        """订阅 FreeSWITCH 事件。"""
-        events_str = " ".join(events)
+        """订阅 FreeSWITCH 事件 (记录到列表, 重连后自动重订阅)。"""
+        self._subscribed_events = list(set(self._subscribed_events + events))
+        await self._subscribe_on_wire()
+
+    async def _subscribe_on_wire(self) -> None:
+        """向 FreeSWITCH 发送事件订阅命令。"""
+        if not self._subscribed_events or not self._connected:
+            return
+        events_str = " ".join(self._subscribed_events)
         await self._send_command(f"event plain {events_str}\n\n")
 
     # ── Low-level protocol ──
@@ -104,23 +125,80 @@ class ESLClient:
         resp = await self._send_command(f"bgapi {command}\n\n")
         return resp.body.strip() if resp else "-ERR no response"
 
+    # ── Connection management ──
+
     async def _connect(self) -> None:
         """建立 TCP 连接并认证。"""
         self._reader, self._writer = await asyncio.open_connection(self._host, self._port)
 
-        # 读取认证挑战
         greeting = await self._read_response()
         if not greeting or "auth" not in greeting.headers.get("Content-Type", "").lower():
             raise ConnectionError("ESL: 未收到认证挑战")
 
-        # 认证
         resp = await self._send_command(f"auth {self._password}\n\n")
         if not resp or "+OK" not in resp.headers.get("Reply-Text", ""):
             raise ConnectionError("ESL: 认证失败")
 
         self._connected = True
+        self._reconnect_delay = self.RECONNECT_BASE_DELAY
 
-    async def _send_command(self, command: str) -> ESLEvent | None:
+    async def _reconnect(self) -> None:
+        """断线后自动重连 (指数退避)。"""
+        if self._closing:
+            return
+        if self._reconnect_task and not self._reconnect_task.done():
+            return
+        self._connected = False
+        self._cleanup_connection()
+        logger.warning("ESL connection lost, reconnecting to %s:%d ...", self._host, self._port)
+        self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+
+    async def _reconnect_loop(self) -> None:
+        while not self._closing:
+            try:
+                await asyncio.sleep(self._reconnect_delay)
+                await self._connect()
+                await self._subscribe_on_wire()
+                self._event_task = asyncio.create_task(self._event_loop())
+                self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+                logger.info("ESL reconnected to %s:%d", self._host, self._port)
+                return
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.error("ESL reconnect failed: %s, retry in %.1fs", e, self._reconnect_delay)
+                self._reconnect_delay = min(self._reconnect_delay * 2, self.RECONNECT_MAX_DELAY)
+
+    def _cleanup_connection(self) -> None:
+        if self._event_task:
+            self._event_task.cancel()
+            self._event_task = None
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
+        if self._writer:
+            try:
+                self._writer.close()
+            except Exception:
+                pass
+            self._writer = None
+            self._reader = None
+
+    async def _heartbeat_loop(self) -> None:
+        """定期发送 api status 检测连接存活性。"""
+        while self._connected and not self._closing:
+            await asyncio.sleep(self.HEARTBEAT_INTERVAL)
+            if not self._connected:
+                return
+            resp = await self._send_command("api status\n\n")
+            if resp is None:
+                logger.warning("ESL heartbeat failed, triggering reconnect")
+                await self._reconnect()
+                return
+
+    # ── Low-level IO ──
+
+    async def _send_command(self, command: str) -> Optional[ESLEvent]:
         """发送命令并读取响应。"""
         if self._writer is None:
             return None
@@ -130,16 +208,15 @@ class ESLClient:
             return await self._read_response()
         except Exception as e:
             logger.error("ESL send error: %s", e)
-            self._connected = False
+            await self._reconnect()
             return None
 
-    async def _read_response(self) -> ESLEvent | None:
+    async def _read_response(self) -> Optional[ESLEvent]:
         """读取一个 ESL 响应/事件。"""
         if self._reader is None:
             return None
         try:
-            headers: dict[str, str] = {}
-            # 读取 headers (空行结束)
+            headers: Dict[str, str] = {}
             while True:
                 line = await asyncio.wait_for(self._reader.readline(), timeout=10.0)
                 line = line.decode().strip()
@@ -149,7 +226,6 @@ class ESLClient:
                     key, _, val = line.partition(": ")
                     headers[key] = val
 
-            # 读取 body (根据 Content-Length)
             content_length = int(headers.get("Content-Length", "0"))
             body = ""
             if content_length > 0:
