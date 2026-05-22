@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     mcp_server_url: str = "http://127.0.0.1:9090/mcp"
     mcp_transport: str = "http"
 
+    # ESL (FreeSWITCH Event Socket)
+    esl_host: str = "127.0.0.1"
+    esl_port: int = 8021
+    esl_password: str = "ClueCon"
+    handoff_extension: str = "1001"
+
     # RAG
     rag_top_k: int = 3
     rag_similarity_threshold: float = 0.7

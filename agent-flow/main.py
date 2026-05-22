@@ -18,6 +18,7 @@ from src.memory.assembler import MemoryAssembler
 from src.clients.mcp import MCPClient
 from src.clients.tts import TTSClient
 from src.clients.asr import ASRClient
+from src.clients.esl import ESLClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,14 +48,24 @@ async def lifespan(app: FastAPI):
     await tts.start()
     set_services(assembler, mcp, tts, asr)
 
+    # ESL client (optional — graceful degradation if FreeSWITCH not reachable)
+    esl = ESLClient(host=settings.esl_host, port=settings.esl_port, password=settings.esl_password)
+    try:
+        await esl.start()
+    except Exception as e:
+        logger.warning("ESL connection failed (call control disabled): %s", e)
+        esl = None
+
     _graph = create_call_graph()
     _initialized = True
 
     from src.ws.handler import CallWebSocketHandler, StreamingCallHandler
-    _ws_handler = CallWebSocketHandler(turn_fn=invoke_turn)
+    _ws_handler = CallWebSocketHandler(turn_fn=invoke_turn, esl=esl, handoff_extension=settings.handoff_extension)
     _streaming_handler = StreamingCallHandler(
         pre_llm_fn=run_pre_llm_phase,
         streaming_fn=run_streaming_pipeline,
+        esl=esl,
+        handoff_extension=settings.handoff_extension,
     )
 
     logger.info("=== Agent Orchestrator 启动 ===")
@@ -65,6 +76,8 @@ async def lifespan(app: FastAPI):
         await mcp.close()
     except Exception:
         pass
+    if _streaming_handler and _streaming_handler._esl:
+        await _streaming_handler._esl.close()
     await asr.close()
     await tts.close()
     _initialized = False

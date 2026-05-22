@@ -1,12 +1,16 @@
-"""WebSocket 通话处理 — 流式音频回传 FreeSWITCH"""
+"""WebSocket 通话处理 — 流式音频回传 + ESL 通话控制"""
 import asyncio
 import json
 import logging
 import time
+from typing import TYPE_CHECKING
 
 from fastapi import WebSocket, WebSocketDisconnect
 
 from ws.vad import SimpleVAD
+
+if TYPE_CHECKING:
+    from clients.esl import ESLClient
 
 logger = logging.getLogger(__name__)
 
@@ -17,11 +21,15 @@ class CallWebSocketHandler:
     def __init__(
         self,
         turn_fn,
+        esl: "ESLClient | None" = None,
+        handoff_extension: str = "1001",
         vad_silence_threshold: float = 500.0,
         vad_silence_frames: int = 15,
         vad_min_audio_bytes: int = 3200,
     ) -> None:
         self._turn_fn = turn_fn
+        self._esl = esl
+        self._handoff_extension = handoff_extension
         self._vad_silence_threshold = vad_silence_threshold
         self._vad_silence_frames = vad_silence_frames
         self._vad_min_audio_bytes = vad_min_audio_bytes
@@ -103,7 +111,7 @@ class CallWebSocketHandler:
                 logger.error("[%s] send audio failed: %s", call_id, e)
 
         if action in ("end", "handoff"):
-            logger.info("[%s] terminal action: %s", call_id, action)
+            await self._execute_terminal_action(action, call_id)
 
     @staticmethod
     def _read_file(path: str) -> bytes | None:
@@ -112,6 +120,21 @@ class CallWebSocketHandler:
                 return f.read()
         except OSError:
             return None
+
+    async def _execute_terminal_action(self, action: str, call_id: str) -> None:
+        """通过 ESL 执行终态动作（挂断/转接）。"""
+        if self._esl is None:
+            logger.warning("[%s] ESL not available, cannot execute action: %s", call_id, action)
+            return
+        try:
+            if action == "end":
+                result = await self._esl.hangup(call_id)
+                logger.info("[%s] ESL hangup: %s", call_id, result)
+            elif action == "handoff":
+                result = await self._esl.transfer(call_id, self._handoff_extension)
+                logger.info("[%s] ESL transfer to %s: %s", call_id, self._handoff_extension, result)
+        except Exception as e:
+            logger.error("[%s] ESL action %s failed: %s", call_id, action, e)
 
 
 class StreamingCallHandler:
@@ -128,12 +151,16 @@ class StreamingCallHandler:
         self,
         pre_llm_fn,
         streaming_fn,
+        esl: "ESLClient | None" = None,
+        handoff_extension: str = "1001",
         vad_silence_threshold: float = 500.0,
         vad_silence_frames: int = 15,
         vad_min_audio_bytes: int = 3200,
     ) -> None:
         self._pre_llm_fn = pre_llm_fn
         self._streaming_fn = streaming_fn
+        self._esl = esl
+        self._handoff_extension = handoff_extension
         self._vad_silence_threshold = vad_silence_threshold
         self._vad_silence_frames = vad_silence_frames
         self._vad_min_audio_bytes = vad_min_audio_bytes
@@ -232,6 +259,8 @@ class StreamingCallHandler:
                     })
                 except Exception as e:
                     logger.error("[%s] send action failed: %s", call_id, e)
+                if action in ("end", "handoff") and self._esl:
+                    await self._execute_terminal_action(action, call_id)
 
             await self._streaming_fn(state, audio_callback, action_callback)
 
@@ -246,3 +275,18 @@ class StreamingCallHandler:
                 })
             except Exception:
                 pass
+
+    async def _execute_terminal_action(self, action: str, call_id: str) -> None:
+        """通过 ESL 执行终态动作（挂断/转接）。"""
+        if self._esl is None:
+            logger.warning("[%s] ESL not available, cannot execute action: %s", call_id, action)
+            return
+        try:
+            if action == "end":
+                result = await self._esl.hangup(call_id)
+                logger.info("[%s] ESL hangup: %s", call_id, result)
+            elif action == "handoff":
+                result = await self._esl.transfer(call_id, self._handoff_extension)
+                logger.info("[%s] ESL transfer to %s: %s", call_id, self._handoff_extension, result)
+        except Exception as e:
+            logger.error("[%s] ESL action %s failed: %s", call_id, action, e)
