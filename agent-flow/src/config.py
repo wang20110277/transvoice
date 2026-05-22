@@ -63,6 +63,13 @@ class Settings(BaseSettings):
     vad_silence_frames: int = 15
     vad_min_audio_bytes: int = 3200
 
+    # Barge-in
+    barge_in_min_audio_bytes: int = 1600
+
+    # Jitter Buffer
+    jitter_target_depth: int = 3
+    jitter_max_depth: int = 10
+
     model_config = {"env_prefix": "CALLBOT_", "env_file": ".env", "extra": "ignore"}
 
 

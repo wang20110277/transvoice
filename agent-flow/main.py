@@ -85,6 +85,9 @@ async def lifespan(app: FastAPI):
         vad_aggressiveness=settings.vad_aggressiveness,
         vad_silence_frames=settings.vad_silence_frames,
         vad_min_audio_bytes=settings.vad_min_audio_bytes,
+        barge_in_min_audio_bytes=settings.barge_in_min_audio_bytes,
+        jitter_target_depth=settings.jitter_target_depth,
+        jitter_max_depth=settings.jitter_max_depth,
     )
 
     logger.info("=== Agent Orchestrator 启动 ===")

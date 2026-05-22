@@ -1,4 +1,4 @@
-"""WebSocket 通话处理 — 流式音频回传 + ESL 通话控制"""
+"""WebSocket 通话处理 — 流式音频回传 + ESL 通话控制 + Barge-in 打断"""
 import asyncio
 import json
 import logging
@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from fastapi import WebSocket, WebSocketDisconnect
 
 from ws.vad import SimpleVAD
+from ws.jitter_buffer import JitterBuffer, TTSOutputBuffer
 from ws.registry import ActiveCallRegistry
 
 if TYPE_CHECKING:
@@ -124,7 +125,6 @@ class CallWebSocketHandler:
             return None
 
     async def _execute_terminal_action(self, action: str, call_id: str) -> None:
-        """通过 ESL 执行终态动作（挂断/转接）。"""
         if self._esl is None:
             logger.warning("[%s] ESL not available, cannot execute action: %s", call_id, action)
             return
@@ -140,13 +140,18 @@ class CallWebSocketHandler:
 
 
 class StreamingCallHandler:
-    """流式 WebSocket handler — LLM 流式输出 → 句级 TTS → 音频按序回传 FreeSWITCH。
+    """流式 WebSocket handler — LLM 流式输出 → 句级 TTS → 音频按序回传 + Barge-in 打断。
 
     协议：
     - 连接: ws://host:port/ws/call?call_id=x&biz_type=marketing&user_key=138xxx
     - 接收: binary frames (PCM 16-bit raw bytes)
     - 发送: binary frames (PCM 16-bit TTS 音频，按句拆分流式发送)
     - 控制: JSON text frames {"type": "action", "action": "say|ask|handoff|end"}
+
+    Barge-in 机制：
+    - 流式 TTS 回传期间，并发接收用户音频并运行 VAD
+    - VAD 检测到用户说话 → 取消当前 LLM/TTS 流 → ESL uuid_break 停止 FreeSWITCH 播放
+    - 清空缓冲区，开始处理新的用户输入
     """
 
     def __init__(
@@ -159,6 +164,9 @@ class StreamingCallHandler:
         vad_aggressiveness: int = 3,
         vad_silence_frames: int = 15,
         vad_min_audio_bytes: int = 3200,
+        barge_in_min_audio_bytes: int = 1600,
+        jitter_target_depth: int = 3,
+        jitter_max_depth: int = 10,
     ) -> None:
         self._pre_llm_fn = pre_llm_fn
         self._streaming_fn = streaming_fn
@@ -168,12 +176,14 @@ class StreamingCallHandler:
         self._vad_aggressiveness = vad_aggressiveness
         self._vad_silence_frames = vad_silence_frames
         self._vad_min_audio_bytes = vad_min_audio_bytes
+        self._barge_in_min_audio_bytes = barge_in_min_audio_bytes
+        self._jitter_target_depth = jitter_target_depth
+        self._jitter_max_depth = jitter_max_depth
 
     async def handle(self, websocket: WebSocket, call_id: str, biz_type: str, user_key: str) -> None:
         await websocket.accept()
         logger.info("[%s] streaming WS connected biz_type=%s", call_id, biz_type)
 
-        # Register active call for CHANNEL_HANGUP cancellation
         active_call = None
         if self._registry:
             active_call = self._registry.register(call_id, biz_type)
@@ -183,43 +193,98 @@ class StreamingCallHandler:
             silence_frames=self._vad_silence_frames,
             min_audio_bytes=self._vad_min_audio_bytes,
         )
+        jitter = JitterBuffer(
+            target_depth=self._jitter_target_depth,
+            max_depth=self._jitter_max_depth,
+        )
         audio_buffer = bytearray()
         turn_count = 0
+        # Barge-in state
+        streaming_task: asyncio.Task | None = None
+        barge_in_event = asyncio.Event()
 
         try:
             while True:
-                # Check if caller hung up (signaled by CHANNEL_HANGUP event)
                 if active_call and active_call.cancel.is_set():
                     logger.info("[%s] call cancelled (CHANNEL_HANGUP), stopping", call_id)
                     break
 
-                data = await websocket.receive()
-
-                if "bytes" in data and data["bytes"]:
-                    frame = data["bytes"]
-                    audio_buffer.extend(frame)
-
-                    if vad.is_end_of_speech(frame, len(audio_buffer)):
-                        # Check cancellation before processing
-                        if active_call and active_call.cancel.is_set():
-                            logger.info("[%s] call cancelled during turn processing", call_id)
-                            break
-
+                # If a streaming task is running, concurrently receive audio
+                # to detect barge-in while AI is speaking
+                if streaming_task and not streaming_task.done():
+                    barge_detected = await self._receive_during_streaming(
+                        websocket, call_id, vad, jitter, audio_buffer,
+                        streaming_task, barge_in_event, active_call,
+                    )
+                    if barge_detected:
+                        # Cancel streaming and start processing the interruption
                         turn_count += 1
-                        t0 = time.monotonic()
-                        logger.info("[%s] end-of-speech, streaming turn %d (%d bytes)",
-                                    call_id, turn_count, len(audio_buffer))
+                        logger.info("[%s] barge-in detected, processing turn %d", call_id, turn_count)
 
+                        # Use buffered audio (user was speaking during AI playback)
                         await self._process_streaming_turn(
                             websocket, call_id, biz_type, user_key,
                             bytes(audio_buffer), turn_count, active_call,
                         )
 
-                        elapsed = (time.monotony() - t0) * 1000
-                        logger.info("[%s] turn %d done in %.0fms", call_id, turn_count, elapsed)
-
                         audio_buffer.clear()
                         vad.reset()
+                        jitter.reset()
+                        barge_in_event.clear()
+                        streaming_task = None
+                        continue
+                    else:
+                        # Streaming task finished normally or WebSocket closed
+                        if streaming_task.done():
+                            exc = streaming_task.exception()
+                            if exc:
+                                logger.error("[%s] streaming task error: %s", call_id, exc)
+                            streaming_task = None
+                            audio_buffer.clear()
+                            vad.reset()
+                            jitter.reset()
+                            barge_in_event.clear()
+                        continue
+
+                # Normal receive mode (AI not speaking)
+                data = await websocket.receive()
+
+                if "bytes" in data and data["bytes"]:
+                    frame = data["bytes"]
+                    jitter.insert(frame)
+
+                    # Drain jitter buffer into VAD
+                    while True:
+                        smooth_frame = jitter.drain()
+                        if not smooth_frame:
+                            break
+                        audio_buffer.extend(smooth_frame)
+
+                        if vad.is_end_of_speech(smooth_frame, len(audio_buffer)):
+                            if active_call and active_call.cancel.is_set():
+                                break
+
+                            turn_count += 1
+                            t0 = time.monotonic()
+                            logger.info("[%s] end-of-speech, streaming turn %d (%d bytes)",
+                                        call_id, turn_count, len(audio_buffer))
+
+                            # Launch streaming as a concurrent task so we can
+                            # receive audio for barge-in while it runs
+                            barge_in_event.clear()
+                            streaming_task = asyncio.create_task(
+                                self._process_streaming_turn(
+                                    websocket, call_id, biz_type, user_key,
+                                    bytes(audio_buffer), turn_count, active_call,
+                                    barge_in_event=barge_in_event,
+                                ),
+                                name=f"stream-{call_id}-{turn_count}",
+                            )
+
+                            audio_buffer.clear()
+                            vad.reset()
+                            jitter.reset()
+                            break  # Exit to outer loop to enter barge-in mode
 
                 elif "text" in data and data["text"]:
                     msg = json.loads(data["text"])
@@ -232,9 +297,98 @@ class StreamingCallHandler:
         except Exception as e:
             logger.error("[%s] streaming WS error: %s", call_id, e, exc_info=True)
         finally:
+            # Cancel any running streaming task
+            if streaming_task and not streaming_task.done():
+                streaming_task.cancel()
+                try:
+                    await streaming_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             if self._registry:
                 self._registry.unregister(call_id)
             logger.info("[%s] streaming WS ended, total turns=%d", call_id, turn_count)
+
+    async def _receive_during_streaming(
+        self,
+        websocket: WebSocket,
+        call_id: str,
+        vad: SimpleVAD,
+        jitter: JitterBuffer,
+        audio_buffer: bytearray,
+        streaming_task: asyncio.Task,
+        barge_in_event: asyncio.Event,
+        active_call: "ActiveCall | None",
+    ) -> bool:
+        """Receive audio while streaming TTS is in progress. Returns True if barge-in detected.
+
+        This method polls the WebSocket for new audio frames, feeds them through the
+        jitter buffer and VAD. If user speech is detected, it cancels the streaming
+        task and signals barge-in.
+        """
+        try:
+            # Use a short timeout so we can check streaming_task completion
+            data = await asyncio.wait_for(websocket.receive(), timeout=0.1)
+        except asyncio.TimeoutError:
+            # No data received within timeout — check if streaming finished
+            return False
+        except WebSocketDisconnect:
+            streaming_task.cancel()
+            return False
+        except Exception as e:
+            logger.error("[%s] receive during streaming error: %s", call_id, e)
+            return False
+
+        if "bytes" in data and data["bytes"]:
+            frame = data["bytes"]
+            jitter.insert(frame)
+
+            while True:
+                smooth_frame = jitter.drain()
+                if not smooth_frame:
+                    break
+                audio_buffer.extend(smooth_frame)
+
+                # Barge-in VAD: use shorter thresholds for faster detection
+                # during AI speech — just need to detect that user started talking
+                if len(audio_buffer) >= self._barge_in_min_audio_bytes and self._is_speech_frame(smooth_frame, vad):
+                    logger.info("[%s] barge-in: user speech detected (%d bytes buffered)",
+                                call_id, len(audio_buffer))
+
+                    # 1. Cancel streaming task (which stops TTSOutputBuffer in its finally)
+                    streaming_task.cancel()
+                    barge_in_event.set()
+
+                    # 2. Stop FreeSWITCH media playback via ESL
+                    await self._break_media(call_id)
+
+                    # 3. Drain remaining jitter buffer into audio_buffer
+                    remaining = jitter.drain_all()
+                    if remaining:
+                        audio_buffer.extend(remaining)
+
+                    return True
+
+        elif "text" in data and data["text"]:
+            msg = json.loads(data["text"])
+            if msg.get("type") == "stop":
+                streaming_task.cancel()
+                return False
+
+        return False
+
+    def _is_speech_frame(self, frame: bytes, vad: SimpleVAD) -> bool:
+        """Quick check if a frame contains speech. Used for barge-in detection."""
+        return vad.is_speech(frame) if len(frame) >= 320 else False
+
+    async def _break_media(self, call_id: str) -> None:
+        """Stop FreeSWITCH media playback via ESL uuid_break."""
+        if self._esl is None:
+            return
+        try:
+            result = await self._esl.break_media(call_id)
+            logger.info("[%s] ESL break_media (barge-in): %s", call_id, result)
+        except Exception as e:
+            logger.error("[%s] ESL break_media failed: %s", call_id, e)
 
     async def _process_streaming_turn(
         self,
@@ -245,34 +399,53 @@ class StreamingCallHandler:
         audio: bytes,
         turn: int,
         active_call: "ActiveCall | None" = None,
+        barge_in_event: asyncio.Event | None = None,
     ) -> None:
-        """运行流式管线：Pre-LLM 阶段 → 流式 LLM+TTS → 音频按序回传。"""
+        """运行流式管线：Pre-LLM 阶段 → 流式 LLM+TTS → TTS Jitter Buffer 匀速回传。
+
+        barge_in_event: 如果设置，检测到打断时提前终止管线。
+        """
+        tts_buffer: TTSOutputBuffer | None = None
         try:
-            # Check cancellation before starting pipeline
             if active_call and active_call.cancel.is_set():
                 return
+
             # Phase 1: Pre-LLM (ASR + parallel MCP/Memory/RAG)
             state = await self._pre_llm_fn(call_id, biz_type, user_key, audio)
 
-            # Phase 2: Streaming LLM+TTS with ordered audio delivery
+            # Check barge-in after pre-LLM phase
+            if barge_in_event and barge_in_event.is_set():
+                logger.info("[%s] barge-in during pre-llm, aborting stream", call_id)
+                return
+
+            # Phase 2: Streaming LLM+TTS with TTSOutputBuffer for steady frame delivery
             next_to_send = 0
             pending: dict[int, bytes] = {}
-            stream_done = asyncio.Event()
+
+            # TTS Jitter Buffer: 接收 TTS PCM，以 30ms 间隔匀速发送给 FreeSWITCH
+            async def _send_frame(frame: bytes) -> None:
+                try:
+                    await websocket.send_bytes(frame)
+                except Exception as e:
+                    logger.error("[%s] TTS buffer send error: %s", call_id, e)
+
+            tts_buffer = TTSOutputBuffer(send_fn=_send_frame)
+            await tts_buffer.start()
 
             async def audio_callback(pcm: bytes, index: int) -> None:
                 nonlocal next_to_send
+
+                if barge_in_event and barge_in_event.is_set():
+                    return
+
                 pending[index] = pcm
 
-                # Send all consecutive chunks starting from next_to_send
+                # Write consecutive chunks to TTS buffer in order
                 while next_to_send in pending:
                     chunk = pending.pop(next_to_send)
-                    try:
-                        await websocket.send_bytes(chunk)
-                        logger.debug("[%s] sent audio chunk %d (%d bytes)",
-                                     call_id, next_to_send, len(chunk))
-                    except Exception as e:
-                        logger.error("[%s] send audio chunk %d failed: %s", call_id, next_to_send, e)
-                        break
+                    tts_buffer.write(chunk)
+                    logger.debug("[%s] queued TTS chunk %d (%d bytes)",
+                                 call_id, next_to_send, len(chunk))
                     next_to_send += 1
 
             async def action_callback(action: str) -> None:
@@ -289,6 +462,13 @@ class StreamingCallHandler:
 
             await self._streaming_fn(state, audio_callback, action_callback)
 
+            # Signal TTS buffer that all data has been written
+            if tts_buffer and tts_buffer.is_running:
+                tts_buffer.finish()
+                await tts_buffer.wait_drained(timeout=5.0)
+
+        except asyncio.CancelledError:
+            logger.info("[%s] streaming turn %d cancelled (barge-in)", call_id, turn)
         except Exception as e:
             logger.error("[%s] streaming turn %d error: %s", call_id, turn, e, exc_info=True)
             try:
@@ -300,6 +480,9 @@ class StreamingCallHandler:
                 })
             except Exception:
                 pass
+        finally:
+            if tts_buffer and tts_buffer.is_running:
+                await tts_buffer.stop()
 
     async def _execute_terminal_action(self, action: str, call_id: str) -> None:
         """通过 ESL 执行终态动作（挂断/转接）。"""
