@@ -70,13 +70,21 @@ async def lifespan(app: FastAPI):
     _initialized = True
 
     from src.ws.handler import CallWebSocketHandler, StreamingCallHandler
-    _ws_handler = CallWebSocketHandler(turn_fn=invoke_turn, esl=esl, handoff_extension=settings.handoff_extension)
+    _ws_handler = CallWebSocketHandler(
+        turn_fn=invoke_turn, esl=esl, handoff_extension=settings.handoff_extension,
+        vad_aggressiveness=settings.vad_aggressiveness,
+        vad_silence_frames=settings.vad_silence_frames,
+        vad_min_audio_bytes=settings.vad_min_audio_bytes,
+    )
     _streaming_handler = StreamingCallHandler(
         pre_llm_fn=run_pre_llm_phase,
         streaming_fn=run_streaming_pipeline,
         esl=esl,
         handoff_extension=settings.handoff_extension,
         registry=_call_registry,
+        vad_aggressiveness=settings.vad_aggressiveness,
+        vad_silence_frames=settings.vad_silence_frames,
+        vad_min_audio_bytes=settings.vad_min_audio_bytes,
     )
 
     logger.info("=== Agent Orchestrator 启动 ===")

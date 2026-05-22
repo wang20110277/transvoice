@@ -58,6 +58,11 @@ class Settings(BaseSettings):
     # Audio temp
     temp_dir: str = "/tmp/aiphone_tts"
 
+    # VAD (WebRTC)
+    vad_aggressiveness: int = 3
+    vad_silence_frames: int = 15
+    vad_min_audio_bytes: int = 3200
+
     model_config = {"env_prefix": "CALLBOT_", "env_file": ".env", "extra": "ignore"}
 
 

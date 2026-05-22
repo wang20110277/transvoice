@@ -25,14 +25,14 @@ class CallWebSocketHandler:
         turn_fn,
         esl: "ESLClient | None" = None,
         handoff_extension: str = "1001",
-        vad_silence_threshold: float = 500.0,
+        vad_aggressiveness: int = 3,
         vad_silence_frames: int = 15,
         vad_min_audio_bytes: int = 3200,
     ) -> None:
         self._turn_fn = turn_fn
         self._esl = esl
         self._handoff_extension = handoff_extension
-        self._vad_silence_threshold = vad_silence_threshold
+        self._vad_aggressiveness = vad_aggressiveness
         self._vad_silence_frames = vad_silence_frames
         self._vad_min_audio_bytes = vad_min_audio_bytes
 
@@ -41,7 +41,7 @@ class CallWebSocketHandler:
         logger.info("[%s] WS call connected biz_type=%s user_key=%s", call_id, biz_type, user_key)
 
         vad = SimpleVAD(
-            silence_threshold=self._vad_silence_threshold,
+            aggressiveness=self._vad_aggressiveness,
             silence_frames=self._vad_silence_frames,
             min_audio_bytes=self._vad_min_audio_bytes,
         )
@@ -156,7 +156,7 @@ class StreamingCallHandler:
         esl: "ESLClient | None" = None,
         handoff_extension: str = "1001",
         registry: ActiveCallRegistry | None = None,
-        vad_silence_threshold: float = 500.0,
+        vad_aggressiveness: int = 3,
         vad_silence_frames: int = 15,
         vad_min_audio_bytes: int = 3200,
     ) -> None:
@@ -165,7 +165,7 @@ class StreamingCallHandler:
         self._esl = esl
         self._handoff_extension = handoff_extension
         self._registry = registry
-        self._vad_silence_threshold = vad_silence_threshold
+        self._vad_aggressiveness = vad_aggressiveness
         self._vad_silence_frames = vad_silence_frames
         self._vad_min_audio_bytes = vad_min_audio_bytes
 
@@ -179,7 +179,7 @@ class StreamingCallHandler:
             active_call = self._registry.register(call_id, biz_type)
 
         vad = SimpleVAD(
-            silence_threshold=self._vad_silence_threshold,
+            aggressiveness=self._vad_aggressiveness,
             silence_frames=self._vad_silence_frames,
             min_audio_bytes=self._vad_min_audio_bytes,
         )
