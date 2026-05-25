@@ -19,10 +19,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY ttsadapter/ ttsadapter/
 
-# 下载 CosyVoice2-0.5B 模型
-RUN python -c "from modelscope import snapshot_download; snapshot_download('iic/CosyVoice2-0.5B', local_dir='/opt/cosyvoice/pretrained_models/CosyVoice2-0.5B')"
+# 下载 CosyVoice3-0.5B 模型
+RUN python -c "from modelscope import snapshot_download; snapshot_download('FunAudioLLM/Fun-CosyVoice3-0.5B-2512', local_dir='/opt/cosyvoice/models/CosyVoice3-0.5B')"
 
-ENV MODEL_DIR=/opt/cosyvoice/pretrained_models/CosyVoice2-0.5B
+ENV MODEL_DIR=/opt/cosyvoice/models/CosyVoice3-0.5B
 ENV COSYVOICE_RUNTIME=/opt/cosyvoice/runtime
 ENV TTS_CACHE_DIR=/data/tts_cache
 ENV PYTHONPATH=/app

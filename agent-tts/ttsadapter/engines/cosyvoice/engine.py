@@ -8,15 +8,15 @@ from ttsadapter.base import TTSEngine, TTSResult
 
 logger = logging.getLogger(__name__)
 
-MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/cosyvoice/pretrained_models/CosyVoice3-0.5B")
+MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/cosyvoice/models/CosyVoice3-0.5B")
 COSYVOICE_MAX_CONCURRENT = int(os.environ.get("COSYVOICE_MAX_CONCURRENT", "5"))
 
 VOICES_DIR = os.environ.get("VOICES_DIR", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "voices"))
 
-BIZ_TYPE_PROFILES = {
-    "customer_service": {"voice": "default_female.wav", "speed": 1.0},
-    "collection": {"voice": "default_female.wav", "speed": 0.9},
-    "marketing": {"voice": "default_female.wav", "speed": 1.1},
+BIZ_TYPE_PROFILES = {                                                                                                                                        
+      "customer_service": {"voice": "default_female.wav", "instruct": "You are a helpful assistant. 请用温柔的客服语气说话。<|endofprompt|>", "speed": 1.0},   
+      "collection": {"voice": "default_female.wav", "instruct": "You are a helpful assistant. 请用严肃的催收语气说话。<|endofprompt|>", "speed": 0.9},         
+      "marketing": {"voice": "default_female.wav", "instruct": "You are a helpful assistant. 请用活泼的营销语气说话。<|endofprompt|>", "speed": 1.1},          
 }
 
 DEFAULT_PROFILE = BIZ_TYPE_PROFILES["customer_service"]
@@ -70,8 +70,9 @@ class CosyVoiceTTSEngine(TTSEngine):
                 import soundfile as sf
 
                 prompt_wav = self._voice_path(profile)
-                chunks = list(self._model.inference_cross_lingual(
-                    text, prompt_wav, stream=False, speed=profile["speed"],
+                instruct_text = profile.get("instruct", "")
+                chunks = list(self._model.inference_instruct2(
+                    text, instruct_text, prompt_wav, stream=False, speed=profile["speed"],
                 ))
 
                 buffer = io.BytesIO()

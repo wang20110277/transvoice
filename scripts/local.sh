@@ -30,9 +30,9 @@ ASR_PORT=8080
 TTS_PORT=8081
 FLOW_PORT=8000
 
-ASR_MODEL_DIR="$PROJECT_DIR/models/SenseVoiceSmall"
-TTS_MODEL_DIR="$PROJECT_DIR/models/CosyVoice3-0.5B"
-TTS_VOICES_DIR="$PROJECT_DIR/voices"
+ASR_MODEL_DIR="$PROJECT_DIR/agent-asr/models/SenseVoiceSmall"
+TTS_MODEL_DIR="$PROJECT_DIR/agent-tts/models/CosyVoice3-0.5B"
+VOICES_DIR="$PROJECT_DIR/voices"
 TTS_CACHE_DIR="/tmp/tts_cache"
 COSYVOICE_RUNTIME="$HOME/Documents/project/CosyVoice"
 
@@ -101,7 +101,7 @@ start_tts() {
     "cd '$PROJECT_DIR/agent-tts/ttsadapter' \
      && PYTHONPATH='$PROJECT_DIR/agent-tts' \
         MODEL_DIR='$TTS_MODEL_DIR' \
-        VOICES_DIR='$TTS_VOICES_DIR' \
+        VOICES_DIR='$VOICES_DIR' \
         TTS_CACHE_DIR='$TTS_CACHE_DIR' \
         COSYVOICE_RUNTIME='$COSYVOICE_RUNTIME' \
         uvicorn main:app --host 0.0.0.0 --port $TTS_PORT \
