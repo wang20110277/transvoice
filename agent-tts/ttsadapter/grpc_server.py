@@ -16,11 +16,17 @@ GRPC_PORT = int(os.environ.get("TTS_GRPC_PORT", "50052"))
 
 
 class TTSGrpcServicer(tts_pb2_grpc.TTSServiceServicer):
+    """gRPC TTS 服务实现 — 一元调用语音合成。
+
+    协议: 发送文本 + 业务类型，返回合成音频（WAV）。
+    端口: 50052（可通过 TTS_GRPC_PORT 环境变量覆盖）
+    """
+
     def __init__(self, engine: TTSEngine):
         self._engine = engine
 
     async def Synthesize(self, request, context):
-        """Synthesize text to audio."""
+        """文本转语音 — 接收文本，调用引擎合成音频，异步上传 MinIO。"""
         text = request.text
         call_id = request.call_id
         biz_type = request.biz_type or "marketing"
@@ -52,7 +58,7 @@ class TTSGrpcServicer(tts_pb2_grpc.TTSServiceServicer):
 
 
 async def serve_grpc(engine: TTSEngine, port: int = GRPC_PORT):
-    """Start gRPC server (run alongside FastAPI)."""
+    """启动 gRPC 服务（与 FastAPI HTTP 共存）。"""
     server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=10))
     tts_pb2_grpc.add_TTSServiceServicer_to_server(TTSGrpcServicer(engine), server)
     server.add_insecure_port(f"[::]:{port}")

@@ -26,7 +26,7 @@ async def test_get_audio_meta_found():
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get("/asr/audio/test-call-123")
+        resp = await client.get("/asr/audio-meta/test-call-123")
         assert resp.status_code == 200
         data = resp.json()
         assert data["call_id"] == "test-call-123"
@@ -40,6 +40,6 @@ async def test_get_audio_meta_found():
 async def test_get_audio_meta_not_found():
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get("/asr/audio/nonexistent")
+        resp = await client.get("/asr/audio-meta/nonexistent")
         assert resp.status_code == 200
         assert "error" in resp.json()

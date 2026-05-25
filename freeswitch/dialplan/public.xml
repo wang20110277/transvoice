@@ -10,7 +10,7 @@
           <!-- mod_audio_fork: bidirectional audio to agent-flow WebSocket -->
           <!-- rw=read+write (bidirectional), L16/8000 = 16-bit PCM 8kHz -->
           <action application="start_dialplan"/>
-          <action application="audio_fork" data="ws://host.docker.internal:8000/ws/call?call_id=${uuid}&amp;biz_type=${biz_type}&amp;user_key=${caller_id_number} rw L16/8000/20"/>
+          <action application="audio_fork" data="ws://host.docker.internal:8000/ws/streaming-call?call_id=${uuid}&amp;biz_type=${biz_type}&amp;user_key=${caller_id_number} rw L16/8000/20"/>
         </condition>
       </extension>
     </context>

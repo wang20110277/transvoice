@@ -28,7 +28,7 @@ class TTSClient:
             return None
         try:
             resp = await self._client.post(
-                f"{self._base_url}/tts/synthesize_json",
+                f"{self._base_url}/tts/synthesize-json",
                 data={"text": text, "params": json.dumps({"call_id": call_id, "biz_type": biz_type})},
             )
             resp.raise_for_status()
@@ -43,7 +43,7 @@ class TTSClient:
             return None
         try:
             resp = await self._client.post(
-                f"{self._base_url}/tts/synthesize",
+                f"{self._base_url}/tts/synthesize-binary",
                 data={"text": text, "params": json.dumps({"call_id": call_id, "biz_type": biz_type})},
             )
             resp.raise_for_status()

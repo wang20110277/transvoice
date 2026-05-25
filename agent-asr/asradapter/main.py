@@ -54,14 +54,32 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="ASR Adapter Service", lifespan=lifespan)
 
 
+# ── HTTP 接口 ────────────────────────────────────────────────
+
 @app.get("/healthz")
 async def healthz():
+    """健康检查 — 判断 ASR 引擎是否可用。
+
+    Returns:
+        {"status": "ok" | "degraded"}
+    """
     healthy = await engine.health_check() if engine else False
     return {"status": "ok" if healthy else "degraded"}
 
 
-@app.post("/asr/recognize")
-async def recognize(audio: UploadFile, params: str = Form("{}")):
+@app.post("/asr/recognize-speech")
+async def recognize_speech(audio: UploadFile, params: str = Form("{}")):
+    """语音识别 — 上传音频文件，返回识别文本。
+
+    Args (multipart/form-data):
+        audio: 音频文件（PCM / WAV，8kHz/16kHz 16-bit mono）
+        params: JSON 字符串，可选字段：
+            - call_id (str): 通话ID，用于 MinIO 音频归档
+            - language (str): 语言代码，默认 "zh"
+
+    Returns:
+        {"text": str, "confidence": float, "is_final": bool, "minio_key": str|None}
+    """
     audio_bytes = await audio.read()
     params_dict = json.loads(params)
     call_id = params_dict.get("call_id", "")
@@ -76,8 +94,17 @@ async def recognize(audio: UploadFile, params: str = Form("{}")):
     return resp
 
 
-@app.get("/asr/audio/{call_id}")
+@app.get("/asr/audio-meta/{call_id}")
 async def get_audio_meta(call_id: str):
+    """音频元数据查询 — 按通话ID查询音频存储信息（非音频本身，为 MinIO key + 识别文本）。
+
+    Args:
+        call_id: 通话唯一标识
+
+    Returns:
+        {"call_id": str, "minio_key": str|None, "text": str}
+        或 {"error": "not found", "call_id": str}
+    """
     meta = _audio_cache.get(call_id)
     if not meta:
         return {"error": "not found", "call_id": call_id}

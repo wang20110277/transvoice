@@ -2,20 +2,25 @@ syntax = "proto3";
 
 package tts;
 
-// TTS synthesis service — unary RPC: send text, receive audio
+// ── TTS 语音合成服务（一元调用）──────────────────────────────
+// 发送文本，返回合成的音频数据。
+// 默认端口: 50052
 service TTSService {
+  // 文本转语音 — 一元 RPC，发送待合成文本，返回音频数据
   rpc Synthesize (SynthesizeRequest) returns (SynthesizeResponse);
 }
 
+// 合成请求
 message SynthesizeRequest {
-  string text = 1;
-  string call_id = 2;
-  string biz_type = 3;
+  string text = 1;      // 待合成文本
+  string call_id = 2;   // 通话唯一标识，用于 MinIO 音频归档
+  string biz_type = 3;  // 业务类型，决定音色/语速: customer_service / collection / marketing
 }
 
+// 合成响应
 message SynthesizeResponse {
-  bytes audio = 1;
-  string content_type = 2;
-  int32 duration_ms = 3;
-  string minio_key = 4;
+  bytes audio = 1;          // 合成音频数据（WAV 格式）
+  string content_type = 2;  // 音频 MIME 类型，默认 "audio/wav"
+  int32 duration_ms = 3;    // 音频时长（毫秒）
+  string minio_key = 4;     // MinIO 音频存储 key，未启用时为空
 }

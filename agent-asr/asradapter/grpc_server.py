@@ -15,11 +15,17 @@ GRPC_PORT = int(os.environ.get("ASR_GRPC_PORT", "50051"))
 
 
 class ASRGrpcServicer(asr_pb2_grpc.ASRServiceServicer):
+    """gRPC ASR 服务实现 — 客户端流式语音识别。
+
+    协议: 客户端逐帧发送音频（首帧为 RecognitionConfig），流关闭后返回识别结果。
+    端口: 50051（可通过 ASR_GRPC_PORT 环境变量覆盖）
+    """
+
     def __init__(self, engine: ASREngine):
         self._engine = engine
 
     async def StreamingRecognize(self, request_iterator, context):
-        """Receive streaming audio chunks, accumulate, run batch ASR on stream close."""
+        """接收流式音频帧，累积后批量识别。流关闭时返回最终结果，并异步上传 MinIO。"""
         call_id = ""
         language = "zh"
         audio_chunks: list[bytes] = []
@@ -65,7 +71,7 @@ class ASRGrpcServicer(asr_pb2_grpc.ASRServiceServicer):
 
 
 async def serve_grpc(engine: ASREngine, port: int = GRPC_PORT):
-    """Start gRPC server (run alongside FastAPI)."""
+    """启动 gRPC 服务（与 FastAPI HTTP 共存）。"""
     server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=10))
     asr_pb2_grpc.add_ASRServiceServicer_to_server(ASRGrpcServicer(engine), server)
     server.add_insecure_port(f"[::]:{port}")

@@ -90,7 +90,7 @@ async def lifespan(app: FastAPI):
     from src.ws.handler import CallWebSocketHandler, StreamingCallHandler
     denoiser = create_denoiser()
     _ws_handler = CallWebSocketHandler(
-        turn_fn=invoke_turn, esl=esl, handoff_extension=settings.handoff_extension,
+        turn_fn=run_audio_pipeline, esl=esl, handoff_extension=settings.handoff_extension,
         vad_aggressiveness=settings.vad_aggressiveness,
         vad_silence_frames=settings.vad_silence_frames,
         vad_min_audio_bytes=settings.vad_min_audio_bytes,
@@ -135,12 +135,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Agent Orchestrator", lifespan=lifespan)
 
 
-class SpeechRequest(BaseModel):
-    call_id: str
-    biz_type: str
-    user_key: str
-    text: str
-    minio_key: str | None = None
+class TextTurnRequest(BaseModel):
+    """文本对话请求体 — POST /call/text-turn 使用。"""
+    call_id: str          # 通话唯一标识
+    biz_type: str         # 业务类型: customer_service / collection / marketing
+    user_key: str         # 用户标识（手机号等）
+    text: str             # 用户输入文本
+    minio_key: str | None = None  # 可选，已上传音频的 MinIO key
 
 
 def _build_initial_state(
@@ -169,10 +170,10 @@ def _build_initial_state(
     }
 
 
-async def invoke_pipeline(
+async def run_text_pipeline(
     call_id: str, biz_type: str, user_key: str, text: str, minio_key: str | None = None
 ) -> dict:
-    """调用 LangGraph pipeline（文本输入），供 HTTP /call/speech 使用。"""
+    """调用 LangGraph 全流程（文本输入）：MCP查询 ‖ 记忆召回 ‖ RAG检索 → LLM → TTS。"""
     if _graph is None:
         return {"action": "say", "text": "", "tts_audio": None, "tts_minio_key": None}
 
@@ -190,10 +191,10 @@ async def invoke_pipeline(
     }
 
 
-async def invoke_turn(
+async def run_audio_pipeline(
     call_id: str, biz_type: str, user_key: str, audio_bytes: bytes
 ) -> dict:
-    """调用 LangGraph pipeline（音频输入），供 WebSocket 和 /call/turn 使用。"""
+    """调用 LangGraph 全流程（音频输入）：ASR → MCP查询 ‖ 记忆召回 ‖ RAG检索 → LLM → TTS。"""
     if _graph is None:
         return {"text": "", "action": "say", "tts_audio_path": None, "tts_minio_key": None}
 
@@ -228,25 +229,59 @@ async def invoke_turn(
     }
 
 
+# ── HTTP 接口 ────────────────────────────────────────────────
+
 @app.get("/healthz")
 async def healthz():
+    """健康检查 — 判断编排服务是否初始化完成。
+
+    Returns:
+        {"status": "ok" | "initializing"}
+    """
     return {"status": "ok" if _initialized else "initializing"}
 
 
-@app.post("/call/speech")
-async def handle_speech(request: SpeechRequest):
-    """文本输入端点。"""
+@app.post("/call/text-turn")
+async def handle_text_turn(request: TextTurnRequest):
+    """文本对话（同步模式）— 接收文本，执行 LangGraph 7节点全流程，返回 AI 回复。
+
+    流程: 接收文本 → MCP身份查询 ‖ 记忆召回 ‖ RAG检索 → LLM决策 → TTS合成
+
+    Args (JSON body):
+        call_id: 通话唯一标识
+        biz_type: 业务类型 (customer_service / collection / marketing)
+        user_key: 用户标识（手机号等）
+        text: 用户输入文本
+        minio_key: 可选，已上传音频的 MinIO key
+
+    Returns:
+        {"action": str, "text": str, "tts_minio_key": str|None, "tts_audio": str|None}
+        action 值: "say"(继续对话) / "ask"(追问) / "handoff"(转人工) / "end"(挂断)
+    """
     if _graph is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
-    return await invoke_pipeline(
+    return await run_text_pipeline(
         call_id=request.call_id, biz_type=request.biz_type,
         user_key=request.user_key, text=request.text, minio_key=request.minio_key,
     )
 
 
-@app.post("/call/turn")
-async def handle_turn(audio: UploadFile, params: str = Form("{}")):
-    """音频输入端点 — 全流程 (ASR → pipeline → TTS)。"""
+@app.post("/call/audio-turn")
+async def handle_audio_turn(audio: UploadFile, params: str = Form("{}")):
+    """音频对话（同步模式）— 上传音频，全链路 ASR → LangGraph → TTS。
+
+    流程: 接收音频 → ASR识别 → MCP身份查询 ‖ 记忆召回 ‖ RAG检索 → LLM决策 → TTS合成
+
+    Args (multipart/form-data):
+        audio: 音频文件（PCM/WAV）
+        params: JSON 字符串:
+            - call_id (str): 通话唯一标识
+            - biz_type (str): 业务类型，默认 "marketing"
+            - user_key (str): 用户标识
+
+    Returns:
+        {"text": str, "confidence": float, "is_final": bool}
+    """
     if _graph is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
@@ -256,7 +291,7 @@ async def handle_turn(audio: UploadFile, params: str = Form("{}")):
     biz_type = params_dict.get("biz_type", "marketing")
     user_key = params_dict.get("user_key", "")
 
-    turn_result = await invoke_turn(call_id, biz_type, user_key, audio_bytes)
+    turn_result = await run_audio_pipeline(call_id, biz_type, user_key, audio_bytes)
     return {
         "text": turn_result.get("text", ""),
         "confidence": 0.95,
@@ -264,14 +299,36 @@ async def handle_turn(audio: UploadFile, params: str = Form("{}")):
     }
 
 
-@app.websocket("/ws/call")
-async def ws_call(
+# ── WebSocket 接口 ────────────────────────────────────────────
+
+@app.websocket("/ws/streaming-call")
+async def ws_streaming_call(
     websocket: WebSocket,
     call_id: str = Query(...),
     biz_type: str = Query(default="marketing"),
     user_key: str = Query(default=""),
 ):
-    """WebSocket 双向音频流端点 — 流式 LLM+TTS 音频回传。"""
+    """双向音频流（流式模式，生产路径）— FreeSWITCH mod_audio_fork 连接。
+
+    连接地址: ws://host:8000/ws/streaming-call?call_id=xxx&biz_type=marketing&user_key=138xxx
+
+    协议:
+        接收 (FreeSWITCH → agent-flow): 二进制 PCM 16-bit 音频帧
+        发送 (agent-flow → FreeSWITCH): 二进制 PCM 16-bit TTS 音频帧（句级流式）
+        控制: 文本 JSON 帧 {"type": "action", "action": "say|ask|handoff|end", "turn": int}
+
+    流程:
+        1. JitterBuffer 抖动平滑 → 降噪 → WebRTC VAD 端点检测
+        2. ASR 识别 → MCP/记忆/RAG 并发查询（fan-out）
+        3. LLM 流式输出 → SentenceSplitter 分句 → 每句并行 TTS
+        4. TTSOutputBuffer 稳态 30ms 帧回传 FreeSWITCH
+        5. 支持 barge-in（打断）：VAD 检测到用户说话 → ESL uuid_break → 取消当前流
+
+    Args (query params):
+        call_id: 通话唯一标识（必填）
+        biz_type: 业务类型，默认 "marketing"
+        user_key: 用户标识（手机号等），默认 ""
+    """
     handler = _streaming_handler or _ws_handler
     if handler is None:
         await websocket.close(code=503, reason="Service not initialized")

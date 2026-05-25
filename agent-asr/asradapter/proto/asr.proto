@@ -2,29 +2,35 @@ syntax = "proto3";
 
 package asr;
 
-// ASR streaming service — client sends audio chunks, server returns final result
+// ── ASR 语音识别服务（客户端流式）────────────────────────────
+// 客户端逐帧发送音频，流结束后服务端返回识别结果。
+// 默认端口: 50051
 service ASRService {
+  // 流式语音识别 — 客户端流式发送音频帧，服务端在流结束时返回最终识别结果
   rpc StreamingRecognize (stream StreamingRecognizeRequest) returns (StreamingRecognizeResponse);
 }
 
+// 请求消息 — 首条消息发送 config，后续逐帧发送 audio_chunk
 message StreamingRecognizeRequest {
   oneof request {
-    // Audio data chunk (raw PCM 8kHz 16-bit mono)
+    // 音频数据帧（raw PCM 8kHz 16-bit mono）
     bytes audio_chunk = 1;
 
-    // Configuration (sent as first message)
+    // 识别配置（必须作为首条消息发送）
     RecognitionConfig config = 2;
   }
 }
 
+// 识别配置
 message RecognitionConfig {
-  string call_id = 1;
-  string language = 2;
+  string call_id = 1;    // 通话唯一标识，用于 MinIO 音频归档
+  string language = 2;   // 语言代码，默认 "zh"
 }
 
+// 识别响应
 message StreamingRecognizeResponse {
-  string text = 1;
-  double confidence = 2;
-  bool is_final = 3;
-  string minio_key = 4;
+  string text = 1;        // 识别文本
+  double confidence = 2;  // 置信度 [0, 1]
+  bool is_final = 3;      // 是否为最终结果（当前实现始终为 true）
+  string minio_key = 4;   // MinIO 音频存储 key，未启用时为空
 }

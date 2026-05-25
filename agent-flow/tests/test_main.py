@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 from httpx import AsyncClient, ASGITransport
-from main import app, SpeechRequest
+from main import app, TextTurnRequest
 
 
 def _mock_graph_result():
@@ -34,7 +34,7 @@ async def test_call_speech():
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
-            resp = await client.post("/call/speech", json={
+            resp = await client.post("/call/text-turn", json={
                 "call_id": "test-call-123",
                 "biz_type": "customer_service",
                 "user_key": "user_abc",

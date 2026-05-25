@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 智能外呼系统 (Smart Outbound Call System) — a telephony AI platform using FreeSWITCH for SIP/RTP with mod_audio_fork WebSocket audio streaming, built-in GPU ASR/TTS inference, and a LangGraph-orchestrated Python agent driving LLM-powered conversations with full streaming pipeline, barge-in support, gRPC streaming (ASR/TTS), uvloop event loop, and pre-VAD audio denoising.
 
+## Coding Conventions
+
+- **接口命名见名知意**：HTTP/gRPC/WebSocket 接口路径和函数名必须从名字就能看出用途，不使用模糊缩写。例如 `/call/text-turn`（文本输入轮次）、`/call/audio-turn`（音频输入轮次）、`/ws/streaming-call`（流式双向通话）、`/tts/synthesize-binary`（返回二进制音频）、`/asr/audio-meta/{id}`（音频元数据查询）。
+
 ## Commands
 
 ### Test
@@ -63,10 +67,10 @@ SIP Caller → FreeSWITCH (mod_sofia, SIP/RTP)
 
 Data flow per turn (two modes):
 ```
-[同步模式] POST /call/speech 或 /call/turn
+[同步模式] POST /call/text-turn 或 /call/audio-turn
 呼入: HTTP 文本/音频 → agent-flow → ASR → LangGraph 7节点全量执行 → TTS → 返回
 
-[流式模式] WebSocket /ws/call (生产路径, uvloop 事件循环)
+[流式模式] WebSocket /ws/streaming-call (生产路径, uvloop 事件循环)
 呼入: FreeSWITCH → mod_audio_fork → agent-flow WebSocket → JitterBuffer → Denoiser降噪 → WebRTC VAD → ASR → 识别文本
 并行: MCP身份查询 ‖ 记忆召回 ‖ RAG检索 (fan-out 并发)
 决策: LLM 流式输出 → IncrementalJSONParser → SentenceSplitter → 句级文本
@@ -77,11 +81,11 @@ Data flow per turn (two modes):
 
 ### Three Components
 
-**agent-asr** — FastAPI + gRPC service with pluggable ASR engines and built-in GPU inference. Loads SenseVoice (FunASR) model directly in-process, no separate inference server needed. Receives audio from agent-flow, runs recognition, uploads to MinIO. HTTP endpoints: `POST /asr/recognize`, `GET /asr/audio/{call_id}`, `GET /healthz`. gRPC endpoint: `ASRService.StreamingRecognize` (client-streaming, port 50051).
+**agent-asr** — FastAPI + gRPC service with pluggable ASR engines and built-in GPU inference. Loads SenseVoice (FunASR) model directly in-process, no separate inference server needed. Receives audio from agent-flow, runs recognition, uploads to MinIO. HTTP endpoints: `POST /asr/recognize-speech`, `GET /asr/audio-meta/{call_id}`, `GET /healthz`. gRPC endpoint: `ASRService.StreamingRecognize` (client-streaming, port 50051).
 
-**agent-tts** — FastAPI + gRPC service with pluggable TTS engines and built-in GPU inference. Loads CosyVoice2 model directly in-process, no separate inference server needed. Receives text from orchestrator, synthesizes audio, uploads to MinIO. Disk cache keyed by voice+text hash, biz_type voice profiles. HTTP endpoints: `POST /tts/synthesize` (binary), `POST /tts/synthesize_json` (JSON with base64 audio + minio_key), `GET /healthz`. gRPC endpoint: `TTSService.Synthesize` (unary, port 50052).
+**agent-tts** — FastAPI + gRPC service with pluggable TTS engines and built-in GPU inference. Loads CosyVoice2 model directly in-process, no separate inference server needed. Receives text from orchestrator, synthesizes audio, uploads to MinIO. Disk cache keyed by voice+text hash, biz_type voice profiles. HTTP endpoints: `POST /tts/synthesize-binary` (binary audio response), `POST /tts/synthesize-json` (JSON with base64 audio + minio_key), `GET /healthz`. gRPC endpoint: `TTSService.Synthesize` (unary, port 50052).
 
-**agent-flow** — FastAPI HTTP + WebSocket service (uvloop event loop). FreeSWITCH connects via mod_audio_fork WebSocket (`/ws/call`) for bidirectional audio streaming. Also exposes HTTP endpoints: `POST /call/speech` (text input), `POST /call/turn` (audio input). Two execution modes: **sync mode** (HTTP path, full LangGraph pipeline) and **streaming mode** (WebSocket path, production). Streaming mode: LLM tokens streamed via `IncrementalJSONParser`, split into sentences by `SentenceSplitter`, each sentence synthesized by TTS in parallel (gRPC or HTTP), PCM audio paced through `TTSOutputBuffer` at steady 30ms frames. Barge-in: concurrent audio receive during AI speech with WebRTC VAD detection, ESL `uuid_break` to stop FreeSWITCH playback. Input audio smoothed through `JitterBuffer`, pre-VAD denoising via configurable denoiser (highpass/noisereduce/rnnoise). ESL (Event Socket Library) client subscribes to CHANNEL_HANGUP for call cancellation via `ActiveCallRegistry`. Conversation history via langchain-redis. Agentic RAG with adaptive retrieval + document grading + query rewriting. VAD using WebRTC VAD for endpointing. ASR/TTS gRPC streaming optional via feature flags (`CALLBOT_ASR_USE_GRPC`, `CALLBOT_TTS_USE_GRPC`).
+**agent-flow** — FastAPI HTTP + WebSocket service (uvloop event loop). FreeSWITCH connects via mod_audio_fork WebSocket (`/ws/streaming-call`) for bidirectional audio streaming. Also exposes HTTP endpoints: `POST /call/text-turn` (text input), `POST /call/audio-turn` (audio input). Two execution modes: **sync mode** (HTTP path, full LangGraph pipeline) and **streaming mode** (WebSocket path, production). Streaming mode: LLM tokens streamed via `IncrementalJSONParser`, split into sentences by `SentenceSplitter`, each sentence synthesized by TTS in parallel (gRPC or HTTP), PCM audio paced through `TTSOutputBuffer` at steady 30ms frames. Barge-in: concurrent audio receive during AI speech with WebRTC VAD detection, ESL `uuid_break` to stop FreeSWITCH playback. Input audio smoothed through `JitterBuffer`, pre-VAD denoising via configurable denoiser (highpass/noisereduce/rnnoise). ESL (Event Socket Library) client subscribes to CHANNEL_HANGUP for call cancellation via `ActiveCallRegistry`. Conversation history via langchain-redis. Agentic RAG with adaptive retrieval + document grading + query rewriting. VAD using WebRTC VAD for endpointing. ASR/TTS gRPC streaming optional via feature flags (`CALLBOT_ASR_USE_GRPC`, `CALLBOT_TTS_USE_GRPC`).
 
 **java-mcp-server** — Spring Boot 3.5 + Spring AI 1.1.6 stateless MCP server (WebMVC transport). Serves as the user center backend for orchestrator nodes ② and ③. Exposes two MCP tools: `user_identity_query` (phone + biz_type → user_id, phone_masked, id_card_last_four) and `user_credit_query` (user_id → credit_qualified, risk_level). Endpoint: `POST /mcp` on port 9090.
 
@@ -152,7 +156,7 @@ Full adaptive + corrective RAG inside `rag_retrieve_node`:
 
 | Module | Role |
 |--------|------|
-| `main.py` | FastAPI app with lifespan init, ESL lifecycle, `POST /call/speech`, `POST /call/turn`, `WS /ws/call`, `GET /healthz` |
+| `main.py` | FastAPI app with lifespan init, ESL lifecycle, `POST /call/text-turn`, `POST /call/audio-turn`, `WS /ws/streaming-call`, `GET /healthz` |
 | `src/config.py` | pydantic-settings, all config via `CALLBOT_` env prefix |
 | `src/database.py` | SQLAlchemy 2.0 async engine + session factory |
 | `src/graph/flow.py` | LangGraph 7-node StateGraph pipeline + `run_pre_llm_phase` / `run_streaming_pipeline` for streaming mode |

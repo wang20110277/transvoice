@@ -26,7 +26,7 @@
         <variable name="record_format" value="wav"/>
 
         <!-- agent-flow WebSocket 音频流 -->
-        <variable name="agent_flow_ws_url" value="ws://host.docker.internal:8000/ws/call"/>
+        <variable name="agent_flow_ws_url" value="ws://host.docker.internal:8000/ws/streaming-call"/>
         <variable name="agent_flow_temp_dir" value="/tmp/aiphone_tts"/>
 
         <!-- 业务变量默认值 -->

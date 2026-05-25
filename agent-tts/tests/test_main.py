@@ -25,7 +25,7 @@ async def test_synthesize_json():
          patch("ttsadapter.store.storage.upload_audio_async", new_callable=AsyncMock):
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
-            resp = await client.post("/tts/synthesize_json", data={"text": "你好", "params": '{"call_id":"call123"}'})
+            resp = await client.post("/tts/synthesize-json", data={"text": "你好", "params": '{"call_id":"call123"}'})
             assert resp.status_code == 200
             data = resp.json()
             assert "audio" in data

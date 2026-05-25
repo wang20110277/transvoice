@@ -1,4 +1,4 @@
-"""ASR adapter HTTP client — 调用 agent-asr 的 /asr/recognize 端点"""
+"""ASR adapter HTTP client — 调用 agent-asr 的 /asr/recognize-speech 端点"""
 import json
 import logging
 import httpx
@@ -28,7 +28,7 @@ class ASRClient:
             return None
         try:
             resp = await self._client.post(
-                f"{self._base_url}/asr/recognize",
+                f"{self._base_url}/asr/recognize-speech",
                 files={"audio": ("audio.wav", audio_bytes, "audio/wav")},
                 data={"params": json.dumps({"call_id": call_id})},
             )

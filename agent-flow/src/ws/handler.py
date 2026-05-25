@@ -145,7 +145,7 @@ class StreamingCallHandler:
     """流式 WebSocket handler — LLM 流式输出 → 句级 TTS → 音频按序回传 + Barge-in 打断。
 
     协议：
-    - 连接: ws://host:port/ws/call?call_id=x&biz_type=marketing&user_key=138xxx
+    - 连接: ws://host:port/ws/streaming-call?call_id=x&biz_type=marketing&user_key=138xxx
     - 接收: binary frames (PCM 16-bit raw bytes)
     - 发送: binary frames (PCM 16-bit TTS 音频，按句拆分流式发送)
     - 控制: JSON text frames {"type": "action", "action": "say|ask|handoff|end"}
