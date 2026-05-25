@@ -52,22 +52,36 @@ class _OllamaChat:
             content = msg.content if hasattr(msg, "content") else str(msg)
             ollama_msgs.append({"role": role, "content": content})
 
-        resp = await self._client.post(
+        async with self._client.stream(
+            "POST",
             f"{self._base_url}/api/chat",
             json={
                 "model": self._model,
                 "messages": ollama_msgs,
-                "stream": False,
+                "stream": True,
                 "think": False,
                 "options": {
                     "num_predict": self._max_tokens,
                     "temperature": self._temperature,
                 },
             },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("message", {}).get("content", "")
+        ) as resp:
+            resp.raise_for_status()
+            chunks = []
+            async for line in resp.aiter_lines():
+                if not line.strip():
+                    continue
+                import json as _json
+                try:
+                    data = _json.loads(line)
+                    content = data.get("message", {}).get("content", "")
+                    if content:
+                        chunks.append(content)
+                    if data.get("done", False):
+                        break
+                except _json.JSONDecodeError:
+                    pass
+            return "".join(chunks)
 
 
 class LLMService:
@@ -221,8 +235,8 @@ class LLMService:
         if action_match and text_match:
             return LLMAction(action=action_match.group(1), text=text_match.group(1))
 
-        logger.warning("LLM 响应解析失败，使用兜底: %s", raw[:100])
-        return LLMAction(action="say", text=FALLBACK_ACTION_TEXT)
+        logger.warning("LLM 响应非 JSON，直接使用原文: %s", raw[:100])
+        return LLMAction(action="say", text=raw.strip())
 
 
 _service: LLMService | None = None

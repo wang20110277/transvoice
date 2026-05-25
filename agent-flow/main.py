@@ -52,6 +52,9 @@ async def lifespan(app: FastAPI):
     await asr.start()
     await tts.start()
 
+    logger.info("ASR gRPC: enabled=%s target=%s", settings.asr_use_grpc, settings.asr_grpc_target)
+    logger.info("TTS gRPC: enabled=%s target=%s", settings.tts_use_grpc, settings.tts_grpc_target)
+
     # gRPC ASR client (optional — for streaming audio transfer)
     asr_grpc = None
     if settings.asr_use_grpc:
@@ -66,7 +69,7 @@ async def lifespan(app: FastAPI):
         await tts_grpc.start()
         logger.info("TTS gRPC client connected to %s", settings.tts_grpc_target)
 
-    set_services(assembler, mcp, tts, asr, tts_grpc=tts_grpc)
+    set_services(assembler, mcp, tts, asr, tts_grpc=tts_grpc, asr_grpc=asr_grpc)
 
     # ESL client (optional — graceful degradation if FreeSWITCH not reachable)
     esl = ESLClient(host=settings.esl_host, port=settings.esl_port, password=settings.esl_password)

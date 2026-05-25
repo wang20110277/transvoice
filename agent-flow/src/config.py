@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     denoise_enabled: str = ""
     denoise_highpass_cutoff: float = 200.0
 
+    # TTS skip (local testing without GPU)
+    tts_skip: bool = False
+
     # ASR gRPC streaming
     asr_grpc_target: str = "127.0.0.1:50051"
     asr_use_grpc: bool = False

@@ -26,7 +26,9 @@ if _version_not_supported:
 
 
 class TTSServiceStub(object):
-    """TTS synthesis service — unary RPC: send text, receive audio
+    """── TTS 语音合成服务（一元调用）──────────────────────────────
+    发送文本，返回合成的音频数据。
+    默认端口: 50052
     """
 
     def __init__(self, channel):
@@ -43,11 +45,14 @@ class TTSServiceStub(object):
 
 
 class TTSServiceServicer(object):
-    """TTS synthesis service — unary RPC: send text, receive audio
+    """── TTS 语音合成服务（一元调用）──────────────────────────────
+    发送文本，返回合成的音频数据。
+    默认端口: 50052
     """
 
     def Synthesize(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """文本转语音 — 一元 RPC，发送待合成文本，返回音频数据
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -69,7 +74,9 @@ def add_TTSServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class TTSService(object):
-    """TTS synthesis service — unary RPC: send text, receive audio
+    """── TTS 语音合成服务（一元调用）──────────────────────────────
+    发送文本，返回合成的音频数据。
+    默认端口: 50052
     """
 
     @staticmethod

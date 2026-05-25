@@ -30,6 +30,7 @@ class TTSGrpcServicer(tts_pb2_grpc.TTSServiceServicer):
         text = request.text
         call_id = request.call_id
         biz_type = request.biz_type or "marketing"
+        logger.info("[gRPC] Synthesize call_id=%s text=%r biz_type=%s", call_id, text[:50], biz_type)
         params = {"call_id": call_id, "biz_type": biz_type}
 
         try:

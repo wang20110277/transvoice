@@ -26,7 +26,9 @@ if _version_not_supported:
 
 
 class ASRServiceStub(object):
-    """ASR streaming service — client sends audio chunks, server returns final result
+    """── ASR 语音识别服务（客户端流式）────────────────────────────
+    客户端逐帧发送音频，流结束后服务端返回识别结果。
+    默认端口: 50051
     """
 
     def __init__(self, channel):
@@ -43,11 +45,14 @@ class ASRServiceStub(object):
 
 
 class ASRServiceServicer(object):
-    """ASR streaming service — client sends audio chunks, server returns final result
+    """── ASR 语音识别服务（客户端流式）────────────────────────────
+    客户端逐帧发送音频，流结束后服务端返回识别结果。
+    默认端口: 50051
     """
 
     def StreamingRecognize(self, request_iterator, context):
-        """Missing associated documentation comment in .proto file."""
+        """流式语音识别 — 客户端流式发送音频帧，服务端在流结束时返回最终识别结果
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -69,7 +74,9 @@ def add_ASRServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class ASRService(object):
-    """ASR streaming service — client sends audio chunks, server returns final result
+    """── ASR 语音识别服务（客户端流式）────────────────────────────
+    客户端逐帧发送音频，流结束后服务端返回识别结果。
+    默认端口: 50051
     """
 
     @staticmethod

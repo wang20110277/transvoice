@@ -38,6 +38,7 @@ class ASRGrpcServicer(asr_pb2_grpc.ASRServiceServicer):
                 audio_chunks.append(request.audio_chunk)
 
         audio_bytes = b"".join(audio_chunks)
+        logger.info("[gRPC] StreamingRecognize call_id=%s size=%d bytes", call_id, len(audio_bytes))
         if not audio_bytes:
             return asr_pb2.StreamingRecognizeResponse(
                 text="", confidence=0.0, is_final=True,

@@ -11,6 +11,7 @@ from ttsadapter.config import load_tts_engine
 from ttsadapter.store import storage
 from ttsadapter.grpc_server import serve_grpc
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 engine = None

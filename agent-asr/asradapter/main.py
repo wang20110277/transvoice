@@ -10,6 +10,7 @@ from asradapter.config import load_asr_engine
 from asradapter.store import storage
 from asradapter.grpc_server import serve_grpc
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 engine = None

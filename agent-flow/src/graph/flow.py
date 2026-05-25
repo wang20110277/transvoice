@@ -30,6 +30,7 @@ _mcp_client: MCPClient | None = None
 _tts_client: TTSClient | None = None
 _asr_client: ASRClient | None = None
 _tts_grpc_client: "TTSGrpcClient | None" = None
+_asr_grpc_client: "ASRGrpcClient | None" = None
 
 
 def set_services(
@@ -38,13 +39,15 @@ def set_services(
     tts: TTSClient,
     asr: ASRClient | None = None,
     tts_grpc: "TTSGrpcClient | None" = None,
+    asr_grpc: "ASRGrpcClient | None" = None,
 ) -> None:
-    global _assembler, _mcp_client, _tts_client, _asr_client, _tts_grpc_client
+    global _assembler, _mcp_client, _tts_client, _asr_client, _tts_grpc_client, _asr_grpc_client
     _assembler = assembler
     _mcp_client = mcp
     _tts_client = tts
     _asr_client = asr
     _tts_grpc_client = tts_grpc
+    _asr_grpc_client = asr_grpc
 
 
 class CallGraphState(TypedDict, total=False):
@@ -72,9 +75,16 @@ async def receive_asr_node(state: CallGraphState) -> dict:
     call_id = state.get("call_id", "?")
 
     audio_bytes = state.get("audio_bytes")
-    if audio_bytes and _asr_client is not None:
+    if audio_bytes:
         try:
-            asr_result = await _asr_client.recognize(audio_bytes, call_id)
+            if _asr_grpc_client is not None:
+                asr_result = await _asr_grpc_client.recognize(audio_bytes, call_id)
+                logger.info("[%s] ASR via gRPC: %s", call_id, asr_result.get("text", "")[:50] if asr_result else "None")
+            elif _asr_client is not None:
+                asr_result = await _asr_client.recognize(audio_bytes, call_id)
+                logger.info("[%s] ASR via HTTP: %s", call_id, asr_result.get("text", "")[:50] if asr_result else "None")
+            else:
+                asr_result = None
             if asr_result:
                 user_input = asr_result.get("text", "")
                 asr_minio_key = asr_result.get("minio_key")
@@ -221,10 +231,19 @@ async def tts_synthesize_node(state: CallGraphState) -> dict:
     if not action:
         return {}
 
+    if settings.tts_skip:
+        logger.info("[%s] TTS skipped (tts_skip=true), LLM reply: %s", state.get("call_id", "?"), action.text[:80])
+        return {"tts_audio": None, "tts_minio_key": None}
+
     tts_result = None
     try:
-        if _tts_client is not None and action.text:
-            tts_result = await _tts_client.synthesize(action.text, state["call_id"], state["biz_type"])
+        if action.text:
+            if _tts_grpc_client is not None:
+                tts_result = await _tts_grpc_client.synthesize(action.text, state["call_id"], state["biz_type"])
+                logger.info("[%s] TTS via gRPC: %d bytes", state.get("call_id", "?"), len(tts_result.get("audio", "")) if tts_result else 0)
+            elif _tts_client is not None:
+                tts_result = await _tts_client.synthesize(action.text, state["call_id"], state["biz_type"])
+                logger.info("[%s] TTS via HTTP: %d bytes", state.get("call_id", "?"), len(tts_result.get("audio", "")) if tts_result else 0)
     except Exception as e:
         logger.error(f"[{state.get('call_id', '?')}] TTS 合成异常: {e}")
         tts_result = None

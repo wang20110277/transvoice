@@ -76,7 +76,7 @@ services:
     ports:
       - "${MCP_PORT:-9090}:9090"
     volumes:
-      - ./mcp-server/java-mcp-server/target/app.jar:/app/app.jar:ro
+      - ./mcp-server/java-mcp-server/target/mcp-server-0.0.1-SNAPSHOT.jar:/app/app.jar:ro
     command: ["java", "-jar", "/app/app.jar"]
 
 volumes:
