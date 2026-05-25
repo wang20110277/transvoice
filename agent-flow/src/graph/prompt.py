@@ -25,5 +25,5 @@ def build_messages(
     if chat_history:
         messages.extend(chat_history)
 
-    messages.append(HumanMessage(content=user_input))
+    messages.append(HumanMessage(content=f"{user_input}\n/no_think"))
     return messages
