@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-智能外呼系统 (Smart Outbound Call System) — a telephony AI platform using FreeSWITCH for SIP/RTP with mod_audio_fork WebSocket audio streaming, built-in GPU ASR/TTS inference, and a LangGraph-orchestrated Python agent driving LLM-powered conversations with full streaming pipeline, barge-in support, gRPC streaming (ASR/TTS), uvloop event loop, and pre-VAD audio denoising.
+智能外呼系统 (Smart Outbound Call System) — a telephony AI platform using FreeSWITCH for SIP/RTP with mod_audio_fork WebSocket audio streaming, built-in GPU ASR/TTS inference (SenseVoice + CosyVoice3), and a LangGraph-orchestrated Python agent driving LLM-powered conversations with full streaming pipeline, barge-in support, gRPC streaming (ASR/TTS), uvloop event loop, pre-VAD audio denoising, ESL auto-reconnect + heartbeat, and Docker Compose deployment.
 
 ## Coding Conventions
 
@@ -42,6 +42,36 @@ cd agent-flow && PYTHONPATH=$(pwd):$(pwd)/src uvicorn main:app --host 0.0.0.0 --
 ### DB Migrations
 ```bash
 cd agent-flow && PYTHONPATH=$(pwd)/src alembic upgrade head
+```
+
+### Local (conda, all services)
+```bash
+# Start all
+./scripts/local.sh
+
+# Start specific services
+./scripts/local.sh asr        # ASR only
+./scripts/local.sh tts        # TTS only
+./scripts/local.sh flow       # agent-flow only
+./scripts/local.sh asr tts    # ASR + TTS
+
+# Management
+./scripts/local.sh stop       # Stop all
+./scripts/local.sh status     # Check status
+```
+
+### Docker Compose (production)
+```bash
+# Full deployment
+./scripts/prod.sh
+
+# With rebuild
+./scripts/prod.sh --build
+
+# Management
+./scripts/prod.sh --down      # Stop all
+./scripts/prod.sh --status    # Check status
+./scripts/prod.sh --logs [svc] # View logs
 ```
 
 ### MCP Server (Java)
@@ -83,7 +113,7 @@ Data flow per turn (two modes):
 
 **agent-asr** — FastAPI + gRPC service with pluggable ASR engines and built-in GPU inference. Loads SenseVoice (FunASR) model directly in-process, no separate inference server needed. Receives audio from agent-flow, runs recognition, uploads to MinIO. HTTP endpoints: `POST /asr/recognize-speech`, `GET /asr/audio-meta/{call_id}`, `GET /healthz`. gRPC endpoint: `ASRService.StreamingRecognize` (client-streaming, port 50051).
 
-**agent-tts** — FastAPI + gRPC service with pluggable TTS engines and built-in GPU inference. Loads CosyVoice2 model directly in-process, no separate inference server needed. Receives text from orchestrator, synthesizes audio, uploads to MinIO. Disk cache keyed by voice+text hash, biz_type voice profiles. HTTP endpoints: `POST /tts/synthesize-binary` (binary audio response), `POST /tts/synthesize-json` (JSON with base64 audio + minio_key), `GET /healthz`. gRPC endpoint: `TTSService.Synthesize` (unary, port 50052).
+**agent-tts** — FastAPI + gRPC service with pluggable TTS engines and built-in GPU inference. Loads CosyVoice3 model directly in-process, no separate inference server needed. Receives text from orchestrator, synthesizes audio, uploads to MinIO. Disk cache keyed by voice+text hash, biz_type voice profiles. HTTP endpoints: `POST /tts/synthesize-binary` (binary audio response), `POST /tts/synthesize-json` (JSON with base64 audio + minio_key), `GET /healthz`. gRPC endpoint: `TTSService.Synthesize` (unary, port 50052).
 
 **agent-flow** — FastAPI HTTP + WebSocket service (uvloop event loop). FreeSWITCH connects via mod_audio_fork WebSocket (`/ws/streaming-call`) for bidirectional audio streaming. Also exposes HTTP endpoints: `POST /call/text-turn` (text input), `POST /call/audio-turn` (audio input). Two execution modes: **sync mode** (HTTP path, full LangGraph pipeline) and **streaming mode** (WebSocket path, production). Streaming mode: LLM tokens streamed via `IncrementalJSONParser`, split into sentences by `SentenceSplitter`, each sentence synthesized by TTS in parallel (gRPC or HTTP), PCM audio paced through `TTSOutputBuffer` at steady 30ms frames. Barge-in: concurrent audio receive during AI speech with WebRTC VAD detection, ESL `uuid_break` to stop FreeSWITCH playback. Input audio smoothed through `JitterBuffer`, pre-VAD denoising via configurable denoiser (highpass/noisereduce/rnnoise). ESL (Event Socket Library) client subscribes to CHANNEL_HANGUP for call cancellation via `ActiveCallRegistry`. Conversation history via langchain-redis. Agentic RAG with adaptive retrieval + document grading + query rewriting. VAD using WebRTC VAD for endpointing. ASR/TTS gRPC streaming optional via feature flags (`CALLBOT_ASR_USE_GRPC`, `CALLBOT_TTS_USE_GRPC`).
 
@@ -114,7 +144,7 @@ Parallel fan-out: nodes ② mcp_identity, ④ recall_memory, ⑤ rag_retrieve ex
 
 To add a new engine: create engine directory + `engine.py` implementing the ABC, update `config.yaml`.
 
-Current engines: SenseVoice (ASR, built-in FunASR GPU inference), VibeVoice (ASR, remote HTTP), CosyVoice (TTS, built-in CosyVoice2 GPU inference), VibeVoice (TTS, remote HTTP).
+Current engines: SenseVoice (ASR, built-in FunASR GPU inference), VibeVoice (ASR, remote HTTP), CosyVoice (TTS, built-in CosyVoice3 GPU inference), VibeVoice (TTS, remote HTTP).
 
 ### Business Type Isolation
 
@@ -139,7 +169,7 @@ Full adaptive + corrective RAG inside `rag_retrieve_node`:
 - **ASR/TTS**: `config.yaml` for engine name + env vars for model paths, API URLs and MinIO
 - **MinIO**: `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, `MINIO_BUCKET` (optional, disabled when empty)
 - **ASR model**: `MODEL_DIR` (SenseVoice path), `SENSEVOICE_LANGUAGE`
-- **TTS model**: `MODEL_DIR` (CosyVoice2 path), `COSYVOICE_RUNTIME`
+- **TTS model**: `MODEL_DIR` (CosyVoice3-0.5B path), `COSYVOICE_RUNTIME`, `VOICES_DIR`, `TTS_CACHE_DIR`
 - **Remote engines**: `VIBEVOICE_ASR_API_URL`, `VIBEVOICE_TTS_API_URL`
 - **RAG**: `CALLBOT_RAG_TOP_K` (default 3), `CALLBOT_RAG_SIMILARITY_THRESHOLD` (default 0.7), `CALLBOT_RAG_MAX_RETRIES` (default 2)
 - **ESL**: `CALLBOT_ESL_HOST`, `CALLBOT_ESL_PORT` (default 8021), `CALLBOT_ESL_PASSWORD`, `CALLBOT_HANDOFF_EXT` (default 1001)
@@ -162,7 +192,7 @@ Full adaptive + corrective RAG inside `rag_retrieve_node`:
 | `src/graph/flow.py` | LangGraph 7-node StateGraph pipeline + `run_pre_llm_phase` / `run_streaming_pipeline` for streaming mode |
 | `src/graph/prompt.py` | System prompt + RAG + memory + chat history assembly |
 | `src/clients/mcp.py` | MCP client → java-mcp-server (identity/credit query via langchain-mcp-adapters) |
-| `src/clients/esl.py` | Async ESL client → FreeSWITCH Event Socket (hangup, transfer, break_media, event subscription) |
+| `src/clients/esl.py` | Async ESL client → FreeSWITCH Event Socket (auto-reconnect, heartbeat, hangup, transfer, break_media, event subscription) |
 | `src/clients/tts.py` | TTS adapter HTTP client (full + raw WAV for streaming) |
 | `src/clients/tts_grpc_client.py` | TTS gRPC client — unary synthesis, used by streaming pipeline when `CALLBOT_TTS_USE_GRPC=true` |
 | `src/clients/asr.py` | ASR adapter HTTP client |
@@ -190,22 +220,26 @@ Full adaptive + corrective RAG inside `rag_retrieve_node`:
 ```
 aiphone/
 ├── agent-asr/           # ASR service (FastAPI + gRPC, built-in GPU inference)
-│   ├── asradapter/      # main.py, base.py, config.py
+│   ├── asradapter/      # main.py, base.py, config.py, requirements.txt
 │   │   ├── store/       # storage.py (MinIO upload)
 │   │   ├── engines/     # sensevoice/ (GPU), vibevoice/ (remote HTTP)
 │   │   ├── grpc_server.py  # gRPC ASR service (client-streaming, :50051)
 │   │   └── proto/       # asr.proto + generated stubs (asr_pb2, asr_pb2_grpc)
+│   ├── models/          # SenseVoiceSmall/ (local model weights)
 │   ├── deploy/          # systemd units (sensevoice-asr.service, vibevoice-asr.service)
 │   ├── Dockerfile       # PyTorch GPU image, model download
+│   ├── README.md        # Component docs
 │   └── tests/           # test_base, test_main, test_storage, engines/
 ├── agent-tts/           # TTS service (FastAPI + gRPC, built-in GPU inference)
-│   ├── ttsadapter/      # main.py, base.py, config.py
+│   ├── ttsadapter/      # main.py, base.py, config.py, requirements.txt
 │   │   ├── store/       # storage.py (MinIO upload)
-│   │   ├── engines/     # cosyvoice/ (GPU), vibevoice/ (remote HTTP)
+│   │   ├── engines/     # cosyvoice/ (CosyVoice3 GPU), vibevoice/ (remote HTTP)
 │   │   ├── grpc_server.py  # gRPC TTS service (unary, :50052)
 │   │   └── proto/       # tts.proto + generated stubs (tts_pb2, tts_pb2_grpc)
+│   ├── models/          # CosyVoice3-0.5B/ (local model weights)
 │   ├── deploy/          # systemd units (cosyvoice-tts.service, vibevoice-tts.service)
 │   ├── Dockerfile       # PyTorch GPU image, model download
+│   ├── README.md        # Component docs
 │   └── tests/           # test_base, test_main, test_storage, engines/
 ├── agent-flow/  # LangGraph 7-node pipeline (FastAPI HTTP + WebSocket)
 │   ├── main.py          # FastAPI entry point (HTTP + WebSocket + ESL lifecycle)
@@ -223,22 +257,41 @@ aiphone/
 │   │   ├── db/          # models.py (ORM)
 │   │   └── storage/     # repository.py
 │   ├── llm/             # Qwen LLM 推理引擎 Dockerfile (vLLM)
-│   ├── alembic/         # DB migrations
+│   ├── alembic/         # DB migrations (alembic.ini at root)
+│   ├── alembic.ini      # Alembic config
+│   ├── requirements.txt # Python dependencies
 │   ├── Dockerfile       # Application image (auto alembic upgrade head)
-│   └── tests/           # test suite (incl. test_jitter_buffer)
+│   ├── README.md        # Component docs
+│   └── tests/           # test suite + memory/
 ├── mcp-server/              # MCP servers (user center backend)
 │   └── java-mcp-server/ # Spring Boot 3.5 + Spring AI 1.1.6 stateless MCP server
 │       ├── src/main/java/com/trans/mcp/
 │       │   ├── McpApplication.java     # Entry point + tool registration
 │       │   ├── model/                  # IdentityResult, CreditResult records
 │       │   └── service/                # UserService, CreditService (@Tool)
-│       └── src/main/resources/
-│           └── application.yaml        # MCP server config (STATELESS, /mcp endpoint)
+│       ├── src/test/java/              # McpApplicationTests
+│       ├── src/main/resources/
+│       │   └── application.yaml        # MCP server config (STATELESS, /mcp endpoint)
+│       ├── Dockerfile       # MCP server container
+│       └── pom.xml          # Maven build
 ├── freeswitch/          # FreeSWITCH configs
 │   ├── vars.xml         # Global variables (SIP, RTP, WebSocket URL)
 │   ├── modules.conf     # mod_sofia, mod_audio_fork, mod_event_socket
+│   ├── autoload_configs/    # modules.conf.xml (XML modules config)
+│   ├── sip_profiles/        # internal.xml (SIP profile)
 │   ├── event_socket.conf.xml  # ESL listener config
-│   └── dialplan/public.xml    # Call routing + audio_fork WebSocket
+│   ├── dialplan/public.xml    # Call routing + audio_fork WebSocket
+│   └── mrcp-plugin/          # UniMRCP 1.5.0 (MRCP/ASR fallback)
+├── scripts/             # Startup scripts
+│   ├── local.sh         # Local dev (conda): asr/tts/flow, stop, status
+│   └── prod.sh          # Production deploy (Docker Compose): GPU check, ordered startup
+├── voices/              # TTS voice samples
+│   ├── default_female.wav
+│   └── tts_test.wav
+├── openspec/            # Change proposals (OpenSpec)
+├── docker-compose.yml       # Base Docker Compose (infra + services)
+├── docker-compose.prod.yml  # Production overrides (GPU pinning, health checks)
+├── env.example              # Environment variable template
 └── docs/                # design specs, implementation plans
 ```
 
@@ -252,3 +305,5 @@ aiphone/
 - **GPU allocation**: ASR=GPU0 (agent-asr内置), TTS=GPU1 (agent-tts内置), LLM(Qwen3.5-9B)=GPU2(:8083)
 - **uvloop**: libuv C-based event loop replacing std asyncio in agent-flow (via `--loop uvloop`), reduces GC pauses under high concurrency
 - **gRPC**: ASR client-streaming (:50051), TTS unary (:50052), both optional feature-flagged alongside HTTP fallback
+- **ESL**: Auto-reconnect with heartbeat detection, recovers from FreeSWITCH restarts without service interruption
+- **Docker Compose**: `docker-compose.yml` (base) + `docker-compose.prod.yml` (production overrides), GPU pinning, health checks, ordered startup
