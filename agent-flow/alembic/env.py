@@ -10,6 +10,7 @@ if _src not in sys.path:
 import asyncio
 from logging.config import fileConfig
 from sqlalchemy.ext.asyncio import create_async_engine
+import sqlalchemy as sa
 from alembic import context
 
 from db.models import Base
@@ -38,6 +39,8 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection):
+    # alembic_version 表在 callbot schema 中，迁移前需确保 schema 已存在
+    connection.execute(sa.text("CREATE SCHEMA IF NOT EXISTS callbot"))
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
