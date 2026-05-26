@@ -1,4 +1,12 @@
 """Alembic 异步环境配置"""
+import sys
+from pathlib import Path
+
+# 确保 src/ 在 sys.path 中，兼容 Docker 和本地开发
+_src = str(Path(__file__).resolve().parent.parent / "src")
+if _src not in sys.path:
+    sys.path.insert(0, _src)
+
 import asyncio
 from logging.config import fileConfig
 from sqlalchemy.ext.asyncio import create_async_engine
