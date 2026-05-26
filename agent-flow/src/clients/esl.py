@@ -42,6 +42,7 @@ class ESLClient:
         self._reconnect_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._reconnect_delay = self.RECONNECT_BASE_DELAY
+        self._io_lock = asyncio.Lock()
 
     async def start(self) -> None:
         """连接并认证, 启动事件监听。"""
@@ -199,17 +200,18 @@ class ESLClient:
     # ── Low-level IO ──
 
     async def _send_command(self, command: str) -> Optional[ESLEvent]:
-        """发送命令并读取响应。"""
+        """发送命令并读取响应（加锁防止事件循环和心跳并发读取）。"""
         if self._writer is None:
             return None
-        try:
-            self._writer.write(command.encode())
-            await self._writer.drain()
-            return await self._read_response()
-        except Exception as e:
-            logger.error("ESL send error: %s", e)
-            await self._reconnect()
-            return None
+        async with self._io_lock:
+            try:
+                self._writer.write(command.encode())
+                await self._writer.drain()
+                return await self._read_response()
+            except Exception as e:
+                logger.error("ESL send error: %s", e)
+                await self._reconnect()
+                return None
 
     async def _read_response(self) -> Optional[ESLEvent]:
         """读取一个 ESL 响应/事件。"""
@@ -246,7 +248,8 @@ class ESLClient:
         """后台事件监听循环。"""
         while self._connected:
             try:
-                event = await self._read_response()
+                async with self._io_lock:
+                    event = await self._read_response()
                 if event is None:
                     if self._connected:
                         await asyncio.sleep(0.1)
