@@ -1,4 +1,12 @@
 """Agent Orchestrator — FastAPI HTTP 服务"""
+import sys
+from pathlib import Path
+
+# 确保 src/ 在 sys.path 中，兼容 Docker 挂载、本地开发等场景
+_src = str(Path(__file__).resolve().parent / "src")
+if _src not in sys.path:
+    sys.path.insert(0, _src)
+
 import base64
 import json
 import logging
