@@ -53,21 +53,10 @@ class ASRGrpcServicer(asr_pb2_grpc.ASRServiceServicer):
                 text="", confidence=0.0, is_final=True,
             )
 
-        # Upload to MinIO in background (fire-and-forget)
-        minio_key = ""
-        try:
-            from asradapter.store.storage import upload_audio
-            key = upload_audio(audio_bytes, call_id)
-            if key:
-                minio_key = key
-        except Exception:
-            pass
-
         return asr_pb2.StreamingRecognizeResponse(
             text=result.text,
             confidence=result.confidence,
             is_final=True,
-            minio_key=minio_key,
         )
 
 

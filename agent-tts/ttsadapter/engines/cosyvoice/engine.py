@@ -3,8 +3,11 @@ import hashlib
 import io
 import logging
 import os
+from collections.abc import AsyncIterator
 
-from ttsadapter.base import TTSEngine, TTSResult
+import numpy as np
+
+from ttsadapter.base import TTSEngine, TTSChunk, TTSResult
 
 logger = logging.getLogger(__name__)
 
@@ -13,10 +16,10 @@ COSYVOICE_MAX_CONCURRENT = int(os.environ.get("COSYVOICE_MAX_CONCURRENT", "5"))
 
 VOICES_DIR = os.environ.get("VOICES_DIR", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "voices"))
 
-BIZ_TYPE_PROFILES = {                                                                                                                                        
-      "customer_service": {"voice": "default_female.wav", "instruct": "You are a helpful assistant. 请用温柔的客服语气说话。<|endofprompt|>", "speed": 1.0},   
-      "collection": {"voice": "default_female.wav", "instruct": "You are a helpful assistant. 请用严肃的催收语气说话。<|endofprompt|>", "speed": 0.9},         
-      "marketing": {"voice": "default_female.wav", "instruct": "You are a helpful assistant. 请用活泼的营销语气说话。<|endofprompt|>", "speed": 1.1},          
+BIZ_TYPE_PROFILES = {
+      "customer_service": {"voice": "default_female.wav", "instruct": "You are a helpful assistant. 请用温柔的客服语气说话。<|endofprompt|>", "speed": 1.0},
+      "collection": {"voice": "default_female.wav", "instruct": "You are a helpful assistant. 请用严肃的催收语气说话。<|endofprompt|>", "speed": 0.9},
+      "marketing": {"voice": "default_female.wav", "instruct": "You are a helpful assistant. 请用活泼的营销语气说话。<|endofprompt|>", "speed": 1.1},
 }
 
 DEFAULT_PROFILE = BIZ_TYPE_PROFILES["customer_service"]
@@ -52,6 +55,41 @@ class CosyVoiceTTSEngine(TTSEngine):
 
     def _voice_path(self, profile: dict) -> str:
         return os.path.join(VOICES_DIR, profile["voice"])
+
+    @property
+    def supports_streaming(self) -> bool:
+        return True
+
+    async def synthesize_stream(self, text: str, params: dict) -> AsyncIterator[TTSChunk]:
+        """流式合成: 调用 CosyVoice stream=True，逐块 yield PCM int16 音频。"""
+        if self._model is None:
+            raise RuntimeError("CosyVoice model not loaded")
+
+        async with self._semaphore:
+            profile = self._get_profile(params)
+            prompt_wav = self._voice_path(profile)
+            instruct_text = profile.get("instruct", "")
+            loop = asyncio.get_event_loop()
+            stream_gen = self._model.inference_instruct2(
+                text, instruct_text, prompt_wav, stream=True, speed=profile["speed"],
+            )
+
+            chunk_index = 0
+            for chunk in await loop.run_in_executor(None, list, stream_gen):
+                tensor = chunk["tts_speech"]
+                pcm_float = tensor.numpy().flatten()
+                pcm_int16 = (pcm_float * 32767).clip(-32768, 32767).astype(np.int16)
+                chunk_index += 1
+                yield TTSChunk(
+                    audio=pcm_int16.tobytes(),
+                    is_final=False,
+                    duration_ms=len(pcm_int16) * 1000 // 22050,
+                )
+
+            if chunk_index == 0:
+                yield TTSChunk(audio=b"", is_final=True, duration_ms=0)
+            else:
+                yield TTSChunk(audio=b"", is_final=True, duration_ms=0)
 
     async def synthesize(self, text: str, params: dict) -> TTSResult:
         if self._model is None:

@@ -11,10 +11,12 @@ from ws.vad import SimpleVAD
 from ws.jitter_buffer import JitterBuffer, TTSOutputBuffer
 from ws.registry import ActiveCallRegistry
 from ws.denoise import BaseDenoiser, PassThroughDenoiser
+from storage import minio_storage
 
 if TYPE_CHECKING:
     from clients.esl import ESLClient
     from clients.asr_grpc_client import ASRGrpcClient, ASRStream
+    from clients.asr_ws_client import ASRWebSocketClient, ASRWsStream
     from ws.registry import ActiveCall
 
 logger = logging.getLogger(__name__)
@@ -172,6 +174,9 @@ class StreamingCallHandler:
         denoiser: BaseDenoiser | None = None,
         asr_grpc_client: "ASRGrpcClient | None" = None,
         use_grpc_streaming: bool = False,
+        asr_ws_client: "ASRWebSocketClient | None" = None,
+        use_ws_streaming: bool = False,
+        use_streaming_asr: bool = False,
     ) -> None:
         self._pre_llm_fn = pre_llm_fn
         self._streaming_fn = streaming_fn
@@ -187,6 +192,9 @@ class StreamingCallHandler:
         self._denoiser = denoiser or PassThroughDenoiser()
         self._asr_grpc_client = asr_grpc_client
         self._use_grpc_streaming = use_grpc_streaming
+        self._asr_ws_client = asr_ws_client
+        self._use_ws_streaming = use_ws_streaming
+        self._use_streaming_asr = use_streaming_asr
 
     async def handle(self, websocket: WebSocket, call_id: str, biz_type: str, user_key: str) -> None:
         await websocket.accept()
@@ -194,7 +202,9 @@ class StreamingCallHandler:
 
         active_call = None
         if self._registry:
-            active_call = self._registry.register(call_id, biz_type)
+            active_call = self._registry.get(call_id)
+            if not active_call:
+                active_call = self._registry.register(call_id, biz_type, user_key)
 
         vad = SimpleVAD(
             aggressiveness=self._vad_aggressiveness,
@@ -214,6 +224,8 @@ class StreamingCallHandler:
         asr_stream: ASRStream | None = None
         speech_started = False
         precomputed_asr_result: dict | None = None
+        # Streaming ASR partial text tracking
+        asr_partial_text = ""
 
         try:
             while True:
@@ -275,11 +287,23 @@ class StreamingCallHandler:
                         denoised_frame = self._denoiser.process(smooth_frame)
                         audio_buffer.extend(denoised_frame)
 
-                        # gRPC streaming: start stream on first speech, feed frames
-                        if self._use_grpc_streaming and self._asr_grpc_client:
+                        # Streaming ASR: WS > gRPC (same interface)
+                        asr_provider = self._asr_ws_client if self._use_ws_streaming else (
+                            self._asr_grpc_client if self._use_grpc_streaming else None
+                        )
+                        if asr_provider:
                             if not speech_started and vad.is_speech(denoised_frame):
                                 speech_started = True
-                                asr_stream = self._asr_grpc_client.create_stream(call_id)
+
+                                def _on_asr_partial(text: str, stability: float) -> None:
+                                    nonlocal asr_partial_text
+                                    asr_partial_text = text
+                                    logger.debug("[%s] ASR partial: %s (stability=%.2f)", call_id, text, stability)
+
+                                asr_stream = asr_provider.create_stream(
+                                    call_id, streaming=self._use_streaming_asr,
+                                    on_partial=_on_asr_partial if self._use_streaming_asr else None,
+                                )
                                 if asr_stream:
                                     await asr_stream.start()
                             if asr_stream:
@@ -300,6 +324,15 @@ class StreamingCallHandler:
                                 precomputed_asr_result = await asr_stream.finish()
                                 asr_stream = None
                                 speech_started = False
+                                # Fallback: use partial text if finish returned nothing
+                                if not precomputed_asr_result and asr_partial_text:
+                                    precomputed_asr_result = {
+                                        "text": asr_partial_text,
+                                        "confidence": 0.8,
+                                        "is_final": True,
+                                    }
+                                    logger.info("[%s] ASR using partial text fallback: %s", call_id, asr_partial_text[:50])
+                                asr_partial_text = ""
 
                             # Launch streaming as a concurrent task so we can
                             # receive audio for barge-in while it runs
@@ -442,6 +475,7 @@ class StreamingCallHandler:
         barge_in_event: 如果设置，检测到打断时提前终止管线。
         """
         tts_buffer: TTSOutputBuffer | None = None
+        downstream_pcm = bytearray()
         try:
             if active_call and active_call.cancel.is_set():
                 return
@@ -459,7 +493,8 @@ class StreamingCallHandler:
 
             # Phase 2: Streaming LLM+TTS with TTSOutputBuffer for steady frame delivery
             next_to_send = 0
-            pending: dict[int, bytes] = {}
+            # dict[int, list[bytes]] — 支持流式 TTS 多 chunk per sentence
+            pending: dict[int, list[bytes]] = {}
 
             # TTS Jitter Buffer: 接收 TTS PCM，以 30ms 间隔匀速发送给 FreeSWITCH
             async def _send_frame(frame: bytes) -> None:
@@ -477,14 +512,18 @@ class StreamingCallHandler:
                 if barge_in_event and barge_in_event.is_set():
                     return
 
-                pending[index] = pcm
+                if index not in pending:
+                    pending[index] = []
+                pending[index].append(pcm)
+                downstream_pcm.extend(pcm)
 
                 # Write consecutive chunks to TTS buffer in order
                 while next_to_send in pending:
-                    chunk = pending.pop(next_to_send)
-                    tts_buffer.write(chunk)
-                    logger.debug("[%s] queued TTS chunk %d (%d bytes)",
-                                 call_id, next_to_send, len(chunk))
+                    chunks = pending.pop(next_to_send)
+                    for chunk in chunks:
+                        tts_buffer.write(chunk)
+                    logger.debug("[%s] queued TTS sentence %d (%d chunks, %d bytes)",
+                                 call_id, next_to_send, len(chunks), sum(len(c) for c in chunks))
                     next_to_send += 1
 
             async def action_callback(action: str) -> None:
@@ -505,6 +544,18 @@ class StreamingCallHandler:
             if tts_buffer and tts_buffer.is_running:
                 tts_buffer.finish()
                 await tts_buffer.wait_drained(timeout=5.0)
+
+            # Save upstream + downstream audio for this turn (fire-and-forget)
+            if audio or downstream_pcm:
+                from config import settings
+                downstream_sr = 22050 if settings.tts_streaming_enabled else 8000
+                await minio_storage.save_turn_audio(
+                    upstream_pcm=audio,
+                    downstream_pcm=bytes(downstream_pcm),
+                    call_id=call_id,
+                    turn=turn,
+                    downstream_sr=downstream_sr,
+                )
 
         except asyncio.CancelledError:
             logger.info("[%s] streaming turn %d cancelled (barge-in)", call_id, turn)

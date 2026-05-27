@@ -92,6 +92,33 @@ class ESLClient:
         """设置通道变量。"""
         return await self.api(f"uuid_setvar {uuid} {var} {value}")
 
+    # ── Audio Fork (uuid_audio_fork) ──
+
+    async def audio_fork_start(
+        self, uuid: str, ws_url: str, mode: str = "mono", sample_rate: int = 16000,
+    ) -> str:
+        """启动音频旁路 — FreeSWITCH 将作为 WebSocket 客户端连接到 ws_url，双向收发音频。
+
+        通过同一 WebSocket 连接:
+            FreeSWITCH → agent-flow: 用户上行音频 (PCM 16-bit, sample_rate Hz)
+            agent-flow → FreeSWITCH: TTS 下行音频 (PCM 16-bit, sample_rate Hz)
+
+        Args:
+            uuid: 通话 UUID
+            ws_url: WebSocket 接收地址，如 ws://127.0.0.1:8000/media/{uuid}
+            mode: mono (混合双向) / both (分别发送)
+            sample_rate: 采样率 (默认 16000)
+        """
+        return await self.api(f"uuid_audio_fork {uuid} start {ws_url} {mode} {sample_rate}")
+
+    async def audio_fork_stop(self, uuid: str) -> str:
+        """停止音频旁路。"""
+        return await self.api(f"uuid_audio_fork {uuid} stop")
+
+    async def get_var(self, uuid: str, var: str) -> str:
+        """获取通道变量。"""
+        return await self.api(f"uuid_getvar {uuid} {var}")
+
     # ── Event subscription ──
 
     def on_event(self, event_name: str, handler) -> None:

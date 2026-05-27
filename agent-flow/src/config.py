@@ -50,6 +50,11 @@ class Settings(BaseSettings):
     esl_password: str = "ClueCon"
     handoff_extension: str = "1001"
 
+    # Media (uuid_audio_fork 双向音频)
+    media_sample_rate: int = 16000  # 16kHz for ASR/TTS quality
+    media_ws_host: str = "127.0.0.1"
+    media_ws_port: int = 8000
+
     # RAG
     rag_top_k: int = 3
     rag_similarity_threshold: float = 0.7
@@ -84,6 +89,25 @@ class Settings(BaseSettings):
     # TTS gRPC streaming
     tts_grpc_target: str = "127.0.0.1:50052"
     tts_use_grpc: bool = False
+
+    # ASR WebSocket streaming
+    asr_use_ws: bool = False
+    asr_ws_url: str = "ws://127.0.0.1:8080/ws/asr/streaming-recognize"
+
+    # TTS WebSocket streaming
+    tts_use_ws: bool = False
+    tts_ws_url: str = "ws://127.0.0.1:8081/ws/tts/streaming-synthesize"
+
+    # Streaming ASR (engine-level streaming, requires streaming-capable engine)
+    asr_streaming_enabled: bool = False
+
+    # Streaming TTS (chunk-level streaming, requires CosyVoice stream=True)
+    tts_streaming_enabled: bool = False
+
+    # Sentence splitter tuning (streaming optimization)
+    splitter_min_length: int = 2
+    splitter_flush_timeout: float = 0.2
+    splitter_eager_first: bool = True
 
     model_config = {"env_prefix": "CALLBOT_", "env_file": ".env", "extra": "ignore"}
 

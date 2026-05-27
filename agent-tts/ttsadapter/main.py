@@ -1,15 +1,14 @@
-import asyncio
 import os
 import json
 import base64
 import yaml
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Form
+from fastapi import FastAPI, Form, WebSocket
 from fastapi.responses import Response, JSONResponse
 from ttsadapter.config import load_tts_engine
-from ttsadapter.store import storage
 from ttsadapter.grpc_server import serve_grpc
+from ttsadapter.ws_server import TTSWebSocketHandler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -75,15 +74,8 @@ async def synthesize_binary(text: str = Form(...), params: str = Form("{}")):
         若启用 MinIO，响应头包含 X-Minio-Key。
     """
     params_dict = json.loads(params)
-    call_id = params_dict.get("call_id", "")
     result = await engine.synthesize(text, params_dict)
-    minio_key = storage.build_object_key(prefix="tts", call_id=call_id)
-    if minio_key:
-        asyncio.create_task(storage.upload_audio_async(result.audio, minio_key))
-    headers = {}
-    if minio_key:
-        headers["X-Minio-Key"] = minio_key
-    return Response(content=result.audio, media_type=result.content_type, headers=headers)
+    return Response(content=result.audio, media_type=result.content_type)
 
 
 @app.post("/tts/synthesize-json")
@@ -98,20 +90,32 @@ async def synthesize_json(text: str = Form(...), params: str = Form("{}")):
             - voice_id (str): 指定音色ID
 
     Returns:
-        {"audio": str(base64), "content_type": str, "duration_ms": int, "minio_key": str|None}
+        {"audio": str(base64), "content_type": str, "duration_ms": int}
     """
     params_dict = json.loads(params)
-    call_id = params_dict.get("call_id", "")
     result = await engine.synthesize(text, params_dict)
-    minio_key = storage.build_object_key(prefix="tts", call_id=call_id)
-    if minio_key:
-        asyncio.create_task(storage.upload_audio_async(result.audio, minio_key))
     audio_b64 = base64.b64encode(result.audio).decode("ascii") if result.audio else ""
-    resp = {
+    return JSONResponse(content={
         "audio": audio_b64,
         "content_type": result.content_type,
         "duration_ms": result.duration_ms,
-    }
-    if minio_key:
-        resp["minio_key"] = minio_key
-    return JSONResponse(content=resp)
+    })
+
+
+# ── WebSocket 接口 ───────────────────────────────────────────
+
+@app.websocket("/ws/tts/streaming-synthesize")
+async def ws_streaming_synthesize(websocket: WebSocket):
+    """语音合成（WebSocket）— 文本转音频，支持连接复用。
+
+    协议:
+        发送 (客户端 → 服务端):
+            - Text JSON 帧: {"type": "synthesize", "text": "...", "call_id": "...",
+                             "biz_type": "...", "request_id": "..."}
+        接收 (服务端 → 客户端):
+            - Binary 帧: WAV 音频数据
+            - Text JSON 帧: {"type": "result", "duration_ms": ..., "minio_key": "...", "request_id": "..."}
+            - Text JSON 帧: {"type": "error", "message": "...", "request_id": "..."}
+    """
+    handler = TTSWebSocketHandler(engine)
+    await handler.handle(websocket)

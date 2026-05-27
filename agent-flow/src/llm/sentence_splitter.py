@@ -16,11 +16,19 @@ class SentenceSplitter:
     """
 
     SENTENCE_ENDINGS = frozenset('。！？.!?\\n；;')
-    MIN_LENGTH = 4
-    MAX_LENGTH = 60
-    FLUSH_TIMEOUT = 0.3  # 300ms 无新 token 自动刷新
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        min_length: int = 2,
+        max_length: int = 60,
+        flush_timeout: float = 0.2,
+        eager_first: bool = True,
+    ) -> None:
+        self._min_length = min_length
+        self._max_length = max_length
+        self._flush_timeout = flush_timeout
+        self._eager_first = eager_first
+        self._is_first = True
         self._buffer = ""
         self._index = 0
         self._last_feed_time: float = 0.0
@@ -34,7 +42,7 @@ class SentenceSplitter:
     def check_timeout(self) -> list[Sentence]:
         """检查是否超时需要刷新。在有新 token 到来之间周期性调用。"""
         if (self._buffer
-                and time.monotonic() - self._last_feed_time > self.FLUSH_TIMEOUT):
+                and time.monotonic() - self._last_feed_time > self._flush_timeout):
             return self._flush_buffer()
         return []
 
@@ -51,16 +59,19 @@ class SentenceSplitter:
     def _try_split(self) -> list[Sentence]:
         """尝试按标点拆分缓冲区。"""
         results: list[Sentence] = []
+        effective_min = 1 if (self._eager_first and self._is_first) else self._min_length
 
-        while len(self._buffer) >= self.MIN_LENGTH:
-            split_pos = self._find_split_pos()
+        while len(self._buffer) >= effective_min:
+            split_pos = self._find_split_pos(effective_min)
             if split_pos < 0:
-                # 无标点但超长 → 强制拆分
-                if len(self._buffer) > self.MAX_LENGTH:
-                    text = self._buffer[:self.MAX_LENGTH]
-                    self._buffer = self._buffer[self.MAX_LENGTH:]
+                if len(self._buffer) > self._max_length:
+                    text = self._buffer[:self._max_length]
+                    self._buffer = self._buffer[self._max_length:]
                     results.append(Sentence(text=text, index=self._index))
                     self._index += 1
+                    if self._is_first:
+                        self._is_first = False
+                        effective_min = self._min_length
                 break
 
             text = self._buffer[:split_pos + 1].strip()
@@ -68,13 +79,16 @@ class SentenceSplitter:
             if text:
                 results.append(Sentence(text=text, index=self._index))
                 self._index += 1
+                if self._is_first:
+                    self._is_first = False
+                    effective_min = self._min_length
 
         return results
 
-    def _find_split_pos(self) -> int:
+    def _find_split_pos(self, min_length: int) -> int:
         """在缓冲区中查找第一个句末标点的位置。"""
         for i, ch in enumerate(self._buffer):
-            if ch in self.SENTENCE_ENDINGS and i >= self.MIN_LENGTH - 1:
+            if ch in self.SENTENCE_ENDINGS and i >= min_length - 1:
                 return i
         return -1
 
@@ -84,6 +98,8 @@ class SentenceSplitter:
         self._buffer = ""
         if not text:
             return []
+        if self._is_first:
+            self._is_first = False
         sent = Sentence(text=text, index=self._index)
         self._index += 1
         return [sent]

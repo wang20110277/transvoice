@@ -31,6 +31,8 @@ from src.ws.registry import ActiveCallRegistry
 from src.ws.denoise import create_denoiser
 from src.clients.asr_grpc_client import ASRGrpcClient
 from src.clients.tts_grpc_client import TTSGrpcClient
+from src.clients.asr_ws_client import ASRWebSocketClient
+from src.clients.tts_ws_client import TTSWebSocketClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,6 +64,12 @@ async def lifespan(app: FastAPI):
 
     logger.info("ASR gRPC: enabled=%s target=%s", settings.asr_use_grpc, settings.asr_grpc_target)
     logger.info("TTS gRPC: enabled=%s target=%s", settings.tts_use_grpc, settings.tts_grpc_target)
+    logger.info("ASR WS: enabled=%s url=%s", settings.asr_use_ws, settings.asr_ws_url)
+    logger.info("TTS WS: enabled=%s url=%s", settings.tts_use_ws, settings.tts_ws_url)
+    logger.info("Streaming ASR: enabled=%s", settings.asr_streaming_enabled)
+    logger.info("Streaming TTS: enabled=%s", settings.tts_streaming_enabled)
+    logger.info("Splitter: min=%d timeout=%.1fs eager_first=%s",
+                settings.splitter_min_length, settings.splitter_flush_timeout, settings.splitter_eager_first)
 
     # gRPC ASR client (optional — for streaming audio transfer)
     asr_grpc = None
@@ -77,7 +85,22 @@ async def lifespan(app: FastAPI):
         await tts_grpc.start()
         logger.info("TTS gRPC client connected to %s", settings.tts_grpc_target)
 
-    set_services(assembler, mcp, tts, asr, tts_grpc=tts_grpc, asr_grpc=asr_grpc)
+    # WebSocket ASR client (optional — third transport)
+    asr_ws = None
+    if settings.asr_use_ws:
+        asr_ws = ASRWebSocketClient(settings.asr_ws_url)
+        await asr_ws.start()
+        logger.info("ASR WS client ready, url=%s", settings.asr_ws_url)
+
+    # WebSocket TTS client (optional — third transport)
+    tts_ws = None
+    if settings.tts_use_ws:
+        tts_ws = TTSWebSocketClient(settings.tts_ws_url)
+        await tts_ws.start()
+        logger.info("TTS WS client connected to %s", settings.tts_ws_url)
+
+    set_services(assembler, mcp, tts, asr, tts_grpc=tts_grpc, asr_grpc=asr_grpc,
+                 tts_ws=tts_ws, asr_ws=asr_ws)
 
     # ESL client (optional — graceful degradation if FreeSWITCH not reachable)
     esl = ESLClient(host=settings.esl_host, port=settings.esl_port, password=settings.esl_password)
@@ -121,6 +144,9 @@ async def lifespan(app: FastAPI):
         denoiser=denoiser,
         asr_grpc_client=asr_grpc,
         use_grpc_streaming=settings.asr_use_grpc,
+        asr_ws_client=asr_ws,
+        use_ws_streaming=settings.asr_use_ws,
+        use_streaming_asr=settings.asr_streaming_enabled,
     )
 
     logger.info("=== Agent Orchestrator 启动 ===")
@@ -137,6 +163,10 @@ async def lifespan(app: FastAPI):
         await asr_grpc.close()
     if tts_grpc:
         await tts_grpc.close()
+    if asr_ws:
+        await asr_ws.close()
+    if tts_ws:
+        await tts_ws.close()
     await asr.close()
     await tts.close()
     _initialized = False
@@ -310,6 +340,64 @@ async def handle_audio_turn(audio: UploadFile, params: str = Form("{}")):
     }
 
 
+# ── 通话控制 API (uuid_audio_fork) ─────────────────────
+
+class CallStartRequest(BaseModel):
+    """启动通话请求体 — POST /call/start 使用。"""
+    call_id: str            # FreeSWITCH 通话 UUID
+    biz_type: str = "marketing"
+    user_key: str = ""      # 用户标识（手机号等）
+
+
+@app.post("/call/start")
+async def handle_call_start(request: CallStartRequest):
+    """注册通话并通过 ESL uuid_audio_fork 启动音频旁路。
+
+    流程:
+        1. 注册 call_id + biz_type + user_key 到 ActiveCallRegistry
+        2. ESL uuid_audio_fork {uuid} start ws://host:port/media/{uuid} mono 8000
+        3. FreeSWITCH 作为 WebSocket 客户端连接 /media/{uuid}
+    """
+    call_id = request.call_id
+    biz_type = request.biz_type
+    user_key = request.user_key
+
+    _call_registry.register(call_id, biz_type, user_key)
+
+    # Start audio fork via ESL
+    esl = _streaming_handler._esl if _streaming_handler else None
+    if esl:
+        ws_url = f"ws://{settings.media_ws_host}:{settings.media_ws_port}/media/{call_id}"
+        try:
+            result = await esl.audio_fork_start(
+                call_id, ws_url, sample_rate=settings.media_sample_rate,
+            )
+            logger.info("[%s] uuid_audio_fork start: %s → %s", call_id, ws_url, result)
+        except Exception as e:
+            logger.error("[%s] uuid_audio_fork start failed: %s", call_id, e)
+            return {"status": "error", "message": str(e)}
+
+    return {"status": "ok", "call_id": call_id, "ws_url": f"/media/{call_id}"}
+
+
+@app.post("/call/stop")
+async def handle_call_stop(request: CallStartRequest):
+    """停止音频旁路并注销通话。"""
+    call_id = request.call_id
+
+    # Stop audio fork via ESL
+    esl = _streaming_handler._esl if _streaming_handler else None
+    if esl:
+        try:
+            result = await esl.audio_fork_stop(call_id)
+            logger.info("[%s] uuid_audio_fork stop: %s", call_id, result)
+        except Exception as e:
+            logger.error("[%s] uuid_audio_fork stop failed: %s", call_id, e)
+
+    _call_registry.unregister(call_id)
+    return {"status": "ok", "call_id": call_id}
+
+
 # ── WebSocket 接口 ────────────────────────────────────────────
 
 @app.websocket("/ws/streaming-call")
@@ -319,7 +407,7 @@ async def ws_streaming_call(
     biz_type: str = Query(default="marketing"),
     user_key: str = Query(default=""),
 ):
-    """双向音频流（流式模式，生产路径）— FreeSWITCH mod_audio_fork 连接。
+    """双向音频流（流式模式）— FreeSWITCH uuid_audio_fork 连接。
 
     连接地址: ws://host:8000/ws/streaming-call?call_id=xxx&biz_type=marketing&user_key=138xxx
 
@@ -344,4 +432,29 @@ async def ws_streaming_call(
     if handler is None:
         await websocket.close(code=503, reason="Service not initialized")
         return
+    await handler.handle(websocket, call_id, biz_type, user_key)
+
+
+@app.websocket("/media/{call_id}")
+async def ws_media_fork(websocket: WebSocket, call_id: str):
+    """uuid_audio_fork 专用端点 — FreeSWITCH 作为 WS 客户端连接。
+
+    通过 POST /call/start 先注册通话信息，再由 ESL uuid_audio_fork 触发连接。
+    连接后自动从注册表查找 biz_type 和 user_key。
+
+    启动流程:
+        1. POST /call/start 注册 call_id + biz_type + user_key
+        2. ESL uuid_audio_fork {uuid} start ws://host:8000/media/{uuid} mono 8000
+        3. FreeSWITCH 连接本端点，开始双向音频流
+    """
+    handler = _streaming_handler or _ws_handler
+    if handler is None:
+        await websocket.close(code=503, reason="Service not initialized")
+        return
+
+    # 从注册表查找 call info
+    call = _call_registry.get(call_id)
+    biz_type = call.biz_type if call else "marketing"
+    user_key = call.user_key if call else ""
+
     await handler.handle(websocket, call_id, biz_type, user_key)

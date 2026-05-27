@@ -1,5 +1,6 @@
 """LangGraph 1.2 通话状态图 - 7 节点管线 + 流式管线"""
 import asyncio
+import base64
 import logging
 import os
 import time
@@ -21,6 +22,7 @@ from memory.chat_history import get_chat_history, save_turn
 from clients.mcp import MCPClient
 from clients.tts import TTSClient
 from clients.asr import ASRClient
+from storage import minio_storage
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +33,8 @@ _tts_client: TTSClient | None = None
 _asr_client: ASRClient | None = None
 _tts_grpc_client: "TTSGrpcClient | None" = None
 _asr_grpc_client: "ASRGrpcClient | None" = None
+_tts_ws_client: "TTSWebSocketClient | None" = None
+_asr_ws_client: "ASRWebSocketClient | None" = None
 
 
 def set_services(
@@ -40,14 +44,19 @@ def set_services(
     asr: ASRClient | None = None,
     tts_grpc: "TTSGrpcClient | None" = None,
     asr_grpc: "ASRGrpcClient | None" = None,
+    tts_ws: "TTSWebSocketClient | None" = None,
+    asr_ws: "ASRWebSocketClient | None" = None,
 ) -> None:
-    global _assembler, _mcp_client, _tts_client, _asr_client, _tts_grpc_client, _asr_grpc_client
+    global _assembler, _mcp_client, _tts_client, _asr_client
+    global _tts_grpc_client, _asr_grpc_client, _tts_ws_client, _asr_ws_client
     _assembler = assembler
     _mcp_client = mcp
     _tts_client = tts
     _asr_client = asr
     _tts_grpc_client = tts_grpc
     _asr_grpc_client = asr_grpc
+    _tts_ws_client = tts_ws
+    _asr_ws_client = asr_ws
 
 
 class CallGraphState(TypedDict, total=False):
@@ -76,10 +85,17 @@ async def receive_asr_node(state: CallGraphState) -> dict:
 
     audio_bytes = state.get("audio_bytes")
     if audio_bytes:
+        # Upload ASR input audio to MinIO (fire-and-forget)
+        asr_minio_key = minio_storage.build_object_key(prefix="asr", call_id=call_id)
+        if asr_minio_key:
+            asyncio.create_task(minio_storage.upload_audio_async(audio_bytes, asr_minio_key))
         try:
             if _asr_grpc_client is not None:
                 asr_result = await _asr_grpc_client.recognize(audio_bytes, call_id)
                 logger.info("[%s] ASR via gRPC: %s", call_id, asr_result.get("text", "")[:50] if asr_result else "None")
+            elif _asr_ws_client is not None:
+                asr_result = await _asr_ws_client.recognize(audio_bytes, call_id)
+                logger.info("[%s] ASR via WS: %s", call_id, asr_result.get("text", "")[:50] if asr_result else "None")
             elif _asr_client is not None:
                 asr_result = await _asr_client.recognize(audio_bytes, call_id)
                 logger.info("[%s] ASR via HTTP: %s", call_id, asr_result.get("text", "")[:50] if asr_result else "None")
@@ -87,14 +103,11 @@ async def receive_asr_node(state: CallGraphState) -> dict:
                 asr_result = None
             if asr_result:
                 user_input = asr_result.get("text", "")
-                asr_minio_key = asr_result.get("minio_key")
             else:
                 user_input = ""
-                asr_minio_key = None
         except Exception as e:
             logger.error("[%s] ASR 调用失败: %s", call_id, e)
             user_input = ""
-            asr_minio_key = None
     else:
         user_input = state.get("user_input", "")
         asr_minio_key = state.get("asr_minio_key")
@@ -238,7 +251,10 @@ async def tts_synthesize_node(state: CallGraphState) -> dict:
     tts_result = None
     try:
         if action.text:
-            if _tts_grpc_client is not None:
+            if _tts_ws_client is not None:
+                tts_result = await _tts_ws_client.synthesize(action.text, state["call_id"], state["biz_type"])
+                logger.info("[%s] TTS via WS: %d bytes", state.get("call_id", "?"), len(tts_result.get("audio", "")) if tts_result else 0)
+            elif _tts_grpc_client is not None:
                 tts_result = await _tts_grpc_client.synthesize(action.text, state["call_id"], state["biz_type"])
                 logger.info("[%s] TTS via gRPC: %d bytes", state.get("call_id", "?"), len(tts_result.get("audio", "")) if tts_result else 0)
             elif _tts_client is not None:
@@ -248,6 +264,17 @@ async def tts_synthesize_node(state: CallGraphState) -> dict:
         logger.error(f"[{state.get('call_id', '?')}] TTS 合成异常: {e}")
         tts_result = None
 
+    # Upload TTS output audio to MinIO (fire-and-forget)
+    tts_minio_key = None
+    if tts_result and tts_result.get("audio"):
+        try:
+            audio_data = base64.b64decode(tts_result["audio"])
+            tts_minio_key = minio_storage.build_object_key(prefix="tts", call_id=state["call_id"])
+            if tts_minio_key:
+                asyncio.create_task(minio_storage.upload_audio_async(audio_data, tts_minio_key))
+        except Exception as e:
+            logger.warning("[%s] TTS MinIO upload failed: %s", state.get("call_id", "?"), e)
+
     try:
         history = get_chat_history(state["call_id"], state["biz_type"])
         await save_turn(history, state["user_input"], action.text)
@@ -256,7 +283,7 @@ async def tts_synthesize_node(state: CallGraphState) -> dict:
 
     return {
         "tts_audio": tts_result.get("audio") if tts_result else None,
-        "tts_minio_key": tts_result.get("minio_key") if tts_result else None,
+        "tts_minio_key": tts_minio_key,
     }
 
 
@@ -336,9 +363,10 @@ async def run_pre_llm_phase(
     }
 
     if precomputed_asr_result:
-        # Use gRPC-streamed ASR result directly
+        # Use gRPC/WS-streamed ASR result directly
         state["user_input"] = precomputed_asr_result.get("text", "")
-        state["asr_minio_key"] = precomputed_asr_result.get("minio_key")
+        # Clear audio_bytes so receive_asr_node skips the ASR call (result already known)
+        state["audio_bytes"] = None
         # Load chat history
         asr_result = await receive_asr_node(state)
         state.update(asr_result)
@@ -417,7 +445,11 @@ async def run_streaming_pipeline(
         chat_history=state.get("chat_history", []),
     )
 
-    splitter = SentenceSplitter()
+    splitter = SentenceSplitter(
+        min_length=settings.splitter_min_length,
+        flush_timeout=settings.splitter_flush_timeout,
+        eager_first=settings.splitter_eager_first,
+    )
     action_sent = False
     full_text = ""
     tts_tasks: list[asyncio.Task] = []
@@ -426,7 +458,22 @@ async def run_streaming_pipeline(
         """TTS 合成单句并通过回调发送。"""
         if not sentence.text:
             return
-        client = _tts_grpc_client if _tts_grpc_client else _tts_client
+
+        # Streaming TTS path: WS streaming yields raw PCM chunks — 逐块发送
+        if settings.tts_streaming_enabled and _tts_ws_client:
+            try:
+                async for chunk in _tts_ws_client.synthesize_streaming_raw(
+                    sentence.text, call_id, biz_type,
+                ):
+                    if chunk:
+                        await audio_callback(chunk, sentence.index)
+                return
+            except Exception as e:
+                logger.error("[%s] streaming TTS sentence %d failed: %s", call_id, sentence.index, e)
+                return
+
+        # Batch TTS path: WS > gRPC > HTTP
+        client = _tts_ws_client or _tts_grpc_client or _tts_client
         if client is None:
             return
         try:

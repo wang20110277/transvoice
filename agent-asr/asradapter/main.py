@@ -1,30 +1,18 @@
-import asyncio
 import os
 import json
 import yaml
 import logging
-from collections import OrderedDict
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, Form
+from fastapi import FastAPI, UploadFile, Form, WebSocket
 from asradapter.config import load_asr_engine
-from asradapter.store import storage
 from asradapter.grpc_server import serve_grpc
+from asradapter.ws_server import ASRWebSocketHandler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 engine = None
 _grpc_server = None
-_audio_cache: OrderedDict[str, dict] = OrderedDict()
-_CACHE_MAX = 10000
-
-
-def _save_audio_meta(call_id: str, minio_key: str | None, text: str):
-    if not call_id:
-        return
-    _audio_cache[call_id] = {"minio_key": minio_key, "text": text}
-    if len(_audio_cache) > _CACHE_MAX:
-        _audio_cache.popitem(last=False)
 
 
 def _load_config():
@@ -79,34 +67,28 @@ async def recognize_speech(audio: UploadFile, params: str = Form("{}")):
             - language (str): 语言代码，默认 "zh"
 
     Returns:
-        {"text": str, "confidence": float, "is_final": bool, "minio_key": str|None}
+        {"text": str, "confidence": float, "is_final": bool}
     """
     audio_bytes = await audio.read()
     params_dict = json.loads(params)
-    call_id = params_dict.get("call_id", "")
-    minio_key = storage.build_object_key(prefix="asr", call_id=call_id)
     result = await engine.recognize(audio_bytes, params_dict)
-    if minio_key:
-        asyncio.create_task(storage.upload_audio_async(audio_bytes, minio_key))
-    _save_audio_meta(call_id, minio_key, result.text)
-    resp = {"text": result.text, "confidence": result.confidence, "is_final": result.is_final}
-    if minio_key:
-        resp["minio_key"] = minio_key
-    return resp
+    return {"text": result.text, "confidence": result.confidence, "is_final": result.is_final}
 
 
-@app.get("/asr/audio-meta/{call_id}")
-async def get_audio_meta(call_id: str):
-    """音频元数据查询 — 按通话ID查询音频存储信息（非音频本身，为 MinIO key + 识别文本）。
+# ── WebSocket 接口 ───────────────────────────────────────────
 
-    Args:
-        call_id: 通话唯一标识
+@app.websocket("/ws/asr/streaming-recognize")
+async def ws_streaming_recognize(websocket: WebSocket):
+    """流式语音识别（WebSocket）— 客户端逐帧发送音频，服务端在流结束时返回识别结果。
 
-    Returns:
-        {"call_id": str, "minio_key": str|None, "text": str}
-        或 {"error": "not found", "call_id": str}
+    协议:
+        发送 (客户端 → 服务端):
+            - Text JSON 帧: {"type": "config", "call_id": "xxx", "language": "zh"}
+            - Binary 帧: PCM 16-bit 8kHz mono 音频数据
+            - Text JSON 帧: {"type": "end"} 标记流结束
+        接收 (服务端 → 客户端):
+            - Text JSON 帧: {"type": "result", "text": "...", "confidence": 0.95, ...}
+            - Text JSON 帧: {"type": "error", "message": "..."}
     """
-    meta = _audio_cache.get(call_id)
-    if not meta:
-        return {"error": "not found", "call_id": call_id}
-    return {"call_id": call_id, "minio_key": meta["minio_key"], "text": meta["text"]}
+    handler = ASRWebSocketHandler(engine)
+    await handler.handle(websocket)

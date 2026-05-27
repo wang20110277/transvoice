@@ -49,7 +49,7 @@ class ASRGrpcClient:
             logger.error("ASR gRPC recognize failed call_id=%s: %s", call_id, e)
             return None
 
-    def create_stream(self, call_id: str) -> "ASRStream | None":
+    def create_stream(self, call_id: str, **kwargs) -> "ASRStream | None":
         """Create a streaming context for incremental audio upload."""
         if self._channel is None:
             return None

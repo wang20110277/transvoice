@@ -9,9 +9,6 @@ pyyaml>=6.0
 # HTTP client
 httpx>=0.25.0
 
-# Storage
-minio>=7.2.0
-
 # Audio
 librosa>=0.10.0
 scipy>=1.10.0
@@ -28,3 +25,6 @@ torch-complex>=0.4.4
 grpcio>=1.60.0
 grpcio-tools>=1.60.0
 protobuf>=5.0.0
+
+# WebSocket
+websockets>=12.0

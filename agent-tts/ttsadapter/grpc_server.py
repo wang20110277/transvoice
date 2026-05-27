@@ -39,22 +39,10 @@ class TTSGrpcServicer(tts_pb2_grpc.TTSServiceServicer):
             logger.error("gRPC TTS synthesize error call_id=%s: %s", call_id, e)
             return tts_pb2.SynthesizeResponse()
 
-        minio_key = ""
-        if result.audio:
-            try:
-                from ttsadapter.store.storage import build_object_key, upload_audio_async
-                key = build_object_key(prefix="tts", call_id=call_id)
-                if key:
-                    asyncio.create_task(upload_audio_async(result.audio, key))
-                    minio_key = key
-            except Exception:
-                pass
-
         return tts_pb2.SynthesizeResponse(
             audio=result.audio or b"",
             content_type=result.content_type or "audio/wav",
             duration_ms=result.duration_ms or 0,
-            minio_key=minio_key,
         )
 
 
