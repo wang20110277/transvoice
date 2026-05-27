@@ -34,3 +34,4 @@ htmlcov/
 models
 openspec/
 .openflow
+.codegraph
