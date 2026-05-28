@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     handoff_extension: str = "1001"
 
     # Media (uuid_audio_fork 双向音频)
-    media_sample_rate: int = 16000  # 16kHz for ASR/TTS quality
+    media_sample_rate: int = 16000  # 16kHz HD Voice, FreeSWITCH internal resampling
     media_ws_host: str = "127.0.0.1"
     media_ws_port: int = 8000
 

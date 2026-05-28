@@ -1,7 +1,7 @@
 """Audio denoising — configurable pre-VAD noise reduction.
 
 Insertion point: after JitterBuffer.drain(), before VAD and audio_buffer.
-All frames are 480 bytes (30ms @ 8kHz 16-bit mono).
+All frames are 960 bytes (30ms @ 16kHz 16-bit mono).
 """
 
 import logging
@@ -10,9 +10,9 @@ from abc import ABC, abstractmethod
 
 logger = logging.getLogger(__name__)
 
-SAMPLE_RATE = 8000
-FRAME_BYTES = 480  # 30ms @ 8kHz 16-bit mono
-SAMPLES_PER_FRAME = FRAME_BYTES // 2  # 240 samples
+SAMPLE_RATE = 16000
+FRAME_BYTES = 960  # 30ms @ 16kHz 16-bit mono
+SAMPLES_PER_FRAME = FRAME_BYTES // 2  # 480 samples
 
 
 class BaseDenoiser(ABC):

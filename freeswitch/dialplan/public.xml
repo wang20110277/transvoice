@@ -1,18 +1,41 @@
 <document type="freeswitch/xml">
   <section name="dialplan">
     <context name="public">
-      <extension name="callbot-entry">
-        <condition field="destination_number" expression="^(.*)$">
-          <action application="set" data="call_start_time=${strftime(%Y-%m-%d %H:%M:%S)}"/>
-          <action application="set" data="biz_type=marketing"/>
-          <action application="answer"/>
 
-          <!-- mod_audio_fork: bidirectional audio to agent-flow WebSocket -->
-          <!-- rw=read+write (bidirectional), L16/8000 = 16-bit PCM 8kHz -->
-          <action application="start_dialplan"/>
-          <action application="audio_fork" data="ws://host.docker.internal:8000/ws/streaming-call?call_id=${uuid}&amp;biz_type=${biz_type}&amp;user_key=${caller_id_number} rw L16/8000/20"/>
+      <!-- 客服: 拨打 8001 -->
+      <extension name="callbot-customer-service">
+        <condition field="destination_number" expression="^8001$">
+          <action application="set" data="call_start_time=${strftime(%Y-%m-%d %H:%M:%S)}"/>
+          <action application="set" data="biz_type=customer_service"/>
+          <!-- 呼入: caller_id_number=客户手机号; 呼出: destination_number=客户手机号 -->
+          <action application="set" data="user_key=${cond(${call_direction} == outbound ? ${destination_number} : ${caller_id_number})}"/>
+          <action application="answer"/>
+          <action application="park"/>
         </condition>
       </extension>
+
+      <!-- 催收: 拨打 8002 -->
+      <extension name="callbot-collection">
+        <condition field="destination_number" expression="^8002$">
+          <action application="set" data="call_start_time=${strftime(%Y-%m-%d %H:%M:%S)}"/>
+          <action application="set" data="biz_type=collection"/>
+          <action application="set" data="user_key=${cond(${call_direction} == outbound ? ${destination_number} : ${caller_id_number})}"/>
+          <action application="answer"/>
+          <action application="park"/>
+        </condition>
+      </extension>
+
+      <!-- 营销: 拨打 8003 -->
+      <extension name="callbot-marketing">
+        <condition field="destination_number" expression="^8003$">
+          <action application="set" data="call_start_time=${strftime(%Y-%m-%d %H:%M:%S)}"/>
+          <action application="set" data="biz_type=marketing"/>
+          <action application="set" data="user_key=${cond(${call_direction} == outbound ? ${destination_number} : ${caller_id_number})}"/>
+          <action application="answer"/>
+          <action application="park"/>
+        </condition>
+      </extension>
+
     </context>
   </section>
 </document>

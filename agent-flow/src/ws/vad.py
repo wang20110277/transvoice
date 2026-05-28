@@ -4,10 +4,10 @@ import webrtcvad
 
 logger = logging.getLogger(__name__)
 
-# 8kHz 16-bit mono PCM: 30ms frame = 480 bytes, 20ms = 320 bytes, 10ms = 160 bytes
+# 16kHz 16-bit mono PCM: 30ms frame = 960 bytes
 FRAME_DURATION_MS = 30
-SAMPLE_RATE = 8000
-FRAME_BYTES = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000) * 2  # 480 bytes
+SAMPLE_RATE = 16000
+FRAME_BYTES = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000) * 2  # 960 bytes
 
 
 class WebRTCVAD:

@@ -548,7 +548,7 @@ class StreamingCallHandler:
             # Save upstream + downstream audio for this turn (fire-and-forget)
             if audio or downstream_pcm:
                 from config import settings
-                downstream_sr = 22050 if settings.tts_streaming_enabled else 8000
+                downstream_sr = settings.media_sample_rate
                 await minio_storage.save_turn_audio(
                     upstream_pcm=audio,
                     downstream_pcm=bytes(downstream_pcm),

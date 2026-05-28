@@ -8,6 +8,8 @@ import yaml
 from collections.abc import Awaitable, Callable
 from typing import TypedDict
 
+import numpy as np
+
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import BaseMessage
 
@@ -409,6 +411,22 @@ def _strip_wav_header(wav_bytes: bytes) -> bytes:
     return wav_bytes
 
 
+def _resample_pcm(pcm: bytes, orig_rate: int, target_rate: int) -> bytes:
+    """PCM int16 重采样 (numpy 线性插值)。"""
+    if orig_rate == target_rate or not pcm:
+        return pcm
+    samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+    target_len = int(len(samples) * target_rate / orig_rate)
+    if target_len == 0:
+        return b""
+    resampled = np.interp(
+        np.linspace(0, len(samples) - 1, target_len),
+        np.arange(len(samples)),
+        samples,
+    )
+    return resampled.astype(np.int16).tobytes()
+
+
 async def run_streaming_pipeline(
     state: CallGraphState,
     audio_callback: Callable[[bytes, int], Awaitable[None]],
@@ -466,7 +484,8 @@ async def run_streaming_pipeline(
                     sentence.text, call_id, biz_type,
                 ):
                     if chunk:
-                        await audio_callback(chunk, sentence.index)
+                        resampled = _resample_pcm(chunk, 22050, settings.media_sample_rate)
+                        await audio_callback(resampled, sentence.index)
                 return
             except Exception as e:
                 logger.error("[%s] streaming TTS sentence %d failed: %s", call_id, sentence.index, e)
@@ -480,6 +499,7 @@ async def run_streaming_pipeline(
             wav = await client.synthesize_raw(sentence.text, call_id, biz_type)
             if wav:
                 pcm = _strip_wav_header(wav)
+                pcm = _resample_pcm(pcm, 22050, settings.media_sample_rate)
                 await audio_callback(pcm, sentence.index)
         except Exception as e:
             logger.error("[%s] streaming TTS sentence %d failed: %s", call_id, sentence.index, e)
