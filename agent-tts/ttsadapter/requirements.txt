@@ -23,8 +23,8 @@ modelscope>=1.20.0
 HyperPyYAML>=1.2.0
 
 # gRPC
-grpcio>=1.60.0
-grpcio-tools>=1.60.0
+grpcio==1.57.0
+grpcio-tools==1.57.0
 protobuf>=5.0.0
 
 # WebSocket
