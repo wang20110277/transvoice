@@ -32,3 +32,5 @@ htmlcov/
 *.pyc
 
 models
+.codegraph
+.code-review-graph
