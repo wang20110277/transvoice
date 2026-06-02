@@ -45,11 +45,16 @@ class ESLClient:
         self._io_lock = asyncio.Lock()
 
     async def start(self) -> None:
-        """连接并认证, 启动事件监听。"""
-        await self._connect()
-        self._event_task = asyncio.create_task(self._event_loop())
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        logger.info("ESL connected to %s:%d", self._host, self._port)
+        """连接并认证, 启动事件监听。初始连接失败时启动后台重连。"""
+        try:
+            await self._connect()
+            self._event_task = asyncio.create_task(self._event_loop())
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            logger.info("ESL connected to %s:%d", self._host, self._port)
+        except Exception:
+            logger.warning("ESL initial connection to %s:%d failed, starting background reconnect",
+                           self._host, self._port)
+            self._reconnect_task = asyncio.create_task(self._reconnect_loop())
 
     async def close(self) -> None:
         """关闭连接, 停止重连。"""
@@ -96,20 +101,32 @@ class ESLClient:
 
     async def audio_fork_start(
         self, uuid: str, ws_url: str, mode: str = "mono", sample_rate: int = 16000,
+        *,
+        bidirectional_enabled: bool = True,
+        bidirectional_stream: bool = True,
+        bidirectional_sample_rate: int = 16000,
     ) -> str:
         """启动音频旁路 — FreeSWITCH 将作为 WebSocket 客户端连接到 ws_url，双向收发音频。
 
         通过同一 WebSocket 连接:
             FreeSWITCH → agent-flow: 用户上行音频 (PCM 16-bit, sample_rate Hz)
-            agent-flow → FreeSWITCH: TTS 下行音频 (PCM 16-bit, sample_rate Hz)
+            agent-flow → FreeSWITCH: TTS 下行音频 (PCM 16-bit, bidirectional_sample_rate Hz)
 
         Args:
             uuid: 通话 UUID
             ws_url: WebSocket 接收地址，如 ws://127.0.0.1:8000/media/{uuid}
             mode: mono (混合双向) / both (分别发送)
-            sample_rate: 采样率 (默认 16000)
+            sample_rate: 上行采样率 (默认 16000)
+            bidirectional_enabled: 启用双向音频 (默认 True)
+            bidirectional_stream: 启用 binary 音频流接收 (默认 True)
+            bidirectional_sample_rate: 下行音频采样率 (默认 16000)
         """
-        return await self.api(f"uuid_audio_fork {uuid} start {ws_url} {mode} {sample_rate}")
+        be = "true" if bidirectional_enabled else "false"
+        bs = "true" if bidirectional_stream else "false"
+        return await self.bgapi(
+            f"uuid_audio_fork {uuid} start {ws_url} {mode} {sample_rate} "
+            f"audio_fork {{}} {be} {bs} {bidirectional_sample_rate}"
+        )
 
     async def audio_fork_stop(self, uuid: str) -> str:
         """停止音频旁路。"""
@@ -284,6 +301,11 @@ class ESLClient:
 
                 content_type = event.headers.get("Content-Type", "")
                 if content_type == "text/event-plain":
+                    # plain 事件: 所有事件数据在 body 中，需要解析合并到 headers
+                    for line in event.body.splitlines():
+                        if ": " in line:
+                            key, _, val = line.partition(": ")
+                            event.headers[key] = val
                     event_name = event.headers.get("Event-Name", "")
                     handlers = self._event_handlers.get(event_name, [])
                     for handler in handlers:

@@ -115,8 +115,10 @@ async def receive_asr_node(state: CallGraphState) -> dict:
         asr_minio_key = state.get("asr_minio_key")
 
     try:
-        history = get_chat_history(state["call_id"], state["biz_type"])
-        chat_history = list(await history.aget_messages())
+        # TODO: re-enable after fixing RedisSearch (FT._LIST)
+        # history = get_chat_history(state["call_id"], state["biz_type"])
+        # chat_history = list(await history.aget_messages())
+        chat_history = []
     except Exception as e:
         logger.warning("[%s] 对话历史加载失败: %s", call_id, e)
         chat_history = []
@@ -378,21 +380,19 @@ async def run_pre_llm_phase(
         state.update(asr_result)
 
     # Parallel fan-out: mcp_identity + recall_memory + rag_retrieve
-    identity_coro = mcp_identity_node(state)
-    memory_coro = recall_memory_node(state)
-    rag_coro = rag_retrieve_node(state)
+    # TODO: re-enable after fixing MCP phone format + RedisSearch + Ollama structured_output
+    # identity_coro = mcp_identity_node(state)
+    # memory_coro = recall_memory_node(state)
+    # rag_coro = rag_retrieve_node(state)
+    # identity, memory, rag = await asyncio.gather(identity_coro, memory_coro, rag_coro)
+    # state.update(identity)
+    # state.update(memory)
+    # state.update(rag)
+    # if biz_type == "marketing" and _mcp_client:
+    #     credit = await credit_query_node(state)
+    #     state.update(credit)
 
-    identity, memory, rag = await asyncio.gather(identity_coro, memory_coro, rag_coro)
-    state.update(identity)
-    state.update(memory)
-    state.update(rag)
-
-    # Conditional credit query
-    if biz_type == "marketing" and _mcp_client:
-        credit = await credit_query_node(state)
-        state.update(credit)
-
-    elapsed = (time.monotony() - t0) * 1000
+    elapsed = (time.monotonic() - t0) * 1000
     logger.info("[%s] pre-llm phase done in %.0fms, user_input=%s",
                 call_id, elapsed, state.get("user_input", "")[:50])
 
@@ -526,6 +526,7 @@ async def run_streaming_pipeline(
 
             # Final event
             if event.is_complete:
+                logger.info("[%s] LLM full text: %s", call_id, full_text)
                 # Flush remaining buffer
                 final_sent = splitter.flush()
                 if final_sent:
@@ -547,12 +548,14 @@ async def run_streaming_pipeline(
 
     # Save chat history
     try:
-        history = get_chat_history(call_id, biz_type)
-        await save_turn(history, state.get("user_input", ""), full_text)
+        # TODO: re-enable after fixing RedisSearch (FT._LIST)
+        # history = get_chat_history(call_id, biz_type)
+        # await save_turn(history, state.get("user_input", ""), full_text)
+        pass
     except Exception as e:
         logger.warning("[%s] streaming save history failed: %s", call_id, e)
 
-    elapsed = (time.monotony() - t0) * 1000
+    elapsed = (time.monotonic() - t0) * 1000
     logger.info("[%s] streaming pipeline done in %.0fms, text=%s",
                 call_id, elapsed, full_text[:50])
 

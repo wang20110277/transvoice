@@ -31,6 +31,12 @@ class LLMAction(BaseModel):
     labels: dict = Field(default_factory=dict, description="附加标签")
 
 
+class _StreamChunk:
+    """Minimal LangChain-compatible stream chunk."""
+    def __init__(self, content: str):
+        self.content = content
+
+
 class _OllamaChat:
     """Lightweight Ollama native /api/chat client — bypasses OpenAI compat layer to support think:false."""
 
@@ -46,11 +52,7 @@ class _OllamaChat:
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(timeout=None, connect=30.0), trust_env=False)
 
     async def ainvoke(self, messages: list) -> str:
-        ollama_msgs = []
-        for msg in messages:
-            role = msg.role if hasattr(msg, "role") else "user"
-            content = msg.content if hasattr(msg, "content") else str(msg)
-            ollama_msgs.append({"role": role, "content": content})
+        ollama_msgs = self._to_ollama_messages(messages)
 
         async with self._client.stream(
             "POST",
@@ -82,6 +84,69 @@ class _OllamaChat:
                 except _json.JSONDecodeError:
                     pass
             return "".join(chunks)
+
+    async def astream(self, messages: list) -> AsyncIterator:
+        """Stream tokens as LangChain-compatible chunks."""
+        ollama_msgs = self._to_ollama_messages(messages)
+
+        async with self._client.stream(
+            "POST",
+            f"{self._base_url}/api/chat",
+            json={
+                "model": self._model,
+                "messages": ollama_msgs,
+                "stream": True,
+                "think": False,
+                "options": {
+                    "num_predict": self._max_tokens,
+                    "temperature": self._temperature,
+                },
+            },
+        ) as resp:
+            resp.raise_for_status()
+            token_count = 0
+            async for line in resp.aiter_lines():
+                if not line.strip():
+                    continue
+                import json as _json
+                try:
+                    data = _json.loads(line)
+                    msg = data.get("message", {})
+                    content = msg.get("content", "")
+                    thinking = msg.get("thinking", "")
+                    if content:
+                        token_count += 1
+                        if token_count <= 3:
+                            logger.info("[Ollama astream] content=%s", content[:100])
+                        yield _StreamChunk(content)
+                    elif thinking and token_count == 0:
+                        logger.debug("[Ollama astream] thinking (skipped): %s", thinking[:80])
+                    if data.get("done", False):
+                        logger.info("[Ollama astream] done, total content tokens=%d", token_count)
+                        break
+                except _json.JSONDecodeError:
+                    pass
+
+    @staticmethod
+    def _to_ollama_messages(messages: list) -> list[dict]:
+        result = []
+        for msg in messages:
+            role = msg.role if hasattr(msg, "role") else "user"
+            content = msg.content if hasattr(msg, "content") else str(msg)
+            result.append({"role": role, "content": content})
+        return result
+
+
+def _parse_action_from_text(text: str) -> str:
+    """Guess action type from plain LLM text (Ollama fallback)."""
+    lower = text.lower()
+    if any(kw in lower for kw in ("再见", "拜拜", "再见", "goodbye", "bye", "挂断")):
+        return "end"
+    if any(kw in lower for kw in ("转人工", "转接", "transfer", "handoff")):
+        return "handoff"
+    if "?" in text or "？" in text or any(kw in lower for kw in ("吗", "呢", "什么", "怎么", "哪里")):
+        return "ask"
+    return "say"
 
 
 class LLMService:
@@ -145,14 +210,33 @@ class LLMService:
     async def astream_action(self, messages: list) -> AsyncIterator[StreamEvent]:
         """流式输出 + 增量 JSON 解析，逐步提取 action/text 字段。"""
         lc_messages = self._to_lc_messages(messages)
-        parser = IncrementalJSONParser()
 
-        async for chunk in self._chat.astream(lc_messages):
-            if chunk.content:
-                for event in parser.feed(chunk.content):
-                    yield event
-
-        final = parser.finalize()
+        if self._is_gpu:
+            # GPU (ChatOpenAI): expects structured JSON output
+            parser = IncrementalJSONParser()
+            async for chunk in self._chat.astream(lc_messages):
+                if chunk.content:
+                    for event in parser.feed(chunk.content):
+                        yield event
+            final = parser.finalize()
+        else:
+            # CPU (Ollama): plain text output, wrap directly as StreamEvent
+            full_text = ""
+            async for chunk in self._chat.astream(lc_messages):
+                if chunk.content:
+                    full_text += chunk.content
+                    yield StreamEvent(
+                        partial_text=full_text,
+                        text_delta=chunk.content,
+                        action=None,
+                    )
+            final = StreamEvent(
+                partial_text=full_text,
+                text_delta=None,
+                action=_parse_action_from_text(full_text),
+                is_complete=True,
+                parsed={"action": _parse_action_from_text(full_text), "text": full_text},
+            )
         yield final
 
     async def chat_for_action(self, messages: list) -> LLMAction:

@@ -1,6 +1,6 @@
 system: |
   你是一名客服AI助手。语气温柔、专业、有耐心。
-  回答用户问题，必要时转接人工。
+  回答用户问题，必要时转接人工。始终使用中文回复。
 response_schema:
   action: {type: string, enum: [say, ask, handoff, end]}
   text: {type: string}

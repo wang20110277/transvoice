@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from fastapi import WebSocket, WebSocketDisconnect
 
 from ws.vad import SimpleVAD
-from ws.jitter_buffer import JitterBuffer, TTSOutputBuffer
+from ws.jitter_buffer import JitterBuffer
 from ws.registry import ActiveCallRegistry
 from ws.denoise import BaseDenoiser, PassThroughDenoiser
 from storage import minio_storage
@@ -196,9 +196,25 @@ class StreamingCallHandler:
         self._use_ws_streaming = use_ws_streaming
         self._use_streaming_asr = use_streaming_asr
 
+    # 30ms 静音帧 @ 16kHz 16-bit mono — 用于连接建立后的保活
+    _SILENCE_FRAME = b'\x00' * 960
+
     async def handle(self, websocket: WebSocket, call_id: str, biz_type: str, user_key: str) -> None:
         await websocket.accept()
         logger.info("[%s] streaming WS connected biz_type=%s", call_id, biz_type)
+
+        # 立即启动静音保活：在 TTS 音频到来前持续发送静音帧，防止 FreeSWITCH 媒体超时
+        # 使用局部变量而非实例属性，避免并发通话互相覆盖
+        _silence_stop = asyncio.Event()
+        async def _silence_keepalive():
+            while not _silence_stop.is_set():
+                try:
+                    await websocket.send_bytes(self._SILENCE_FRAME)
+                    await asyncio.sleep(0.03)
+                except Exception as e:
+                    logger.warning("[%s] silence keepalive stopped: %s", call_id, e)
+                    break
+        _silence_task = asyncio.create_task(_silence_keepalive(), name="silence-keepalive")
 
         active_call = None
         if self._registry:
@@ -361,6 +377,9 @@ class StreamingCallHandler:
 
         except WebSocketDisconnect:
             logger.info("[%s] WS disconnected after %d turns", call_id, turn_count)
+        except RuntimeError:
+            # WebSocket 已断连（disconnect 消息被其他 receive 消费后触发）
+            logger.info("[%s] WS already disconnected after %d turns", call_id, turn_count)
         except Exception as e:
             logger.error("[%s] streaming WS error: %s", call_id, e, exc_info=True)
         finally:
@@ -371,6 +390,9 @@ class StreamingCallHandler:
                     await streaming_task
                 except (asyncio.CancelledError, Exception):
                     pass
+            _silence_stop.set()
+            if _silence_task and not _silence_task.done():
+                _silence_task.cancel()
             if self._registry:
                 self._registry.unregister(call_id)
             logger.info("[%s] streaming WS ended, total turns=%d", call_id, turn_count)
@@ -400,7 +422,7 @@ class StreamingCallHandler:
             return False
         except WebSocketDisconnect:
             streaming_task.cancel()
-            return False
+            raise  # 向外层传播断连，让 handle() 的 except WebSocketDisconnect 统一处理
         except Exception as e:
             logger.error("[%s] receive during streaming error: %s", call_id, e)
             return False
@@ -422,7 +444,7 @@ class StreamingCallHandler:
                     logger.info("[%s] barge-in: user speech detected (%d bytes buffered)",
                                 call_id, len(audio_buffer))
 
-                    # 1. Cancel streaming task (which stops TTSOutputBuffer in its finally)
+                    # 1. Cancel streaming task
                     streaming_task.cancel()
                     barge_in_event.set()
 
@@ -470,11 +492,11 @@ class StreamingCallHandler:
         barge_in_event: asyncio.Event | None = None,
         precomputed_asr_result: dict | None = None,
     ) -> None:
-        """运行流式管线：Pre-LLM 阶段 → 流式 LLM+TTS → TTS Jitter Buffer 匀速回传。
+        """运行流式管线：Pre-LLM → 流式 LLM+TTS → 音频直接回传。
 
-        barge_in_event: 如果设置，检测到打断时提前终止管线。
+        静音保活在 handle() 中全程运行，保证连接不断。
+        TTS PCM 直接通过 WebSocket 发送，由 FreeSWITCH 内部缓冲处理 pacing。
         """
-        tts_buffer: TTSOutputBuffer | None = None
         downstream_pcm = bytearray()
         try:
             if active_call and active_call.cancel.is_set():
@@ -491,25 +513,15 @@ class StreamingCallHandler:
                 logger.info("[%s] barge-in during pre-llm, aborting stream", call_id)
                 return
 
-            # Phase 2: Streaming LLM+TTS with TTSOutputBuffer for steady frame delivery
+            # Phase 2: Streaming LLM+TTS — TTS PCM 直接发送，不做帧 pacing
             next_to_send = 0
-            # dict[int, list[bytes]] — 支持流式 TTS 多 chunk per sentence
             pending: dict[int, list[bytes]] = {}
-
-            # TTS Jitter Buffer: 接收 TTS PCM，以 30ms 间隔匀速发送给 FreeSWITCH
-            async def _send_frame(frame: bytes) -> None:
-                try:
-                    await websocket.send_bytes(frame)
-                except Exception as e:
-                    logger.error("[%s] TTS buffer send error: %s", call_id, e)
-
-            tts_buffer = TTSOutputBuffer(send_fn=_send_frame)
-            await tts_buffer.start()
+            _ws_broken = False
 
             async def audio_callback(pcm: bytes, index: int) -> None:
-                nonlocal next_to_send
+                nonlocal next_to_send, _ws_broken
 
-                if barge_in_event and barge_in_event.is_set():
+                if _ws_broken or (barge_in_event and barge_in_event.is_set()):
                     return
 
                 if index not in pending:
@@ -517,12 +529,17 @@ class StreamingCallHandler:
                 pending[index].append(pcm)
                 downstream_pcm.extend(pcm)
 
-                # Write consecutive chunks to TTS buffer in order
+                # 按句序直接发送，FreeSWITCH 内部缓冲处理 pacing
                 while next_to_send in pending:
                     chunks = pending.pop(next_to_send)
                     for chunk in chunks:
-                        tts_buffer.write(chunk)
-                    logger.debug("[%s] queued TTS sentence %d (%d chunks, %d bytes)",
+                        try:
+                            await websocket.send_bytes(chunk)
+                        except Exception as e:
+                            logger.error("[%s] send audio error: %s", call_id, e)
+                            _ws_broken = True
+                            return
+                    logger.debug("[%s] sent TTS sentence %d (%d chunks, %d bytes)",
                                  call_id, next_to_send, len(chunks), sum(len(c) for c in chunks))
                     next_to_send += 1
 
@@ -539,11 +556,6 @@ class StreamingCallHandler:
                     await self._execute_terminal_action(action, call_id)
 
             await self._streaming_fn(state, audio_callback, action_callback)
-
-            # Signal TTS buffer that all data has been written
-            if tts_buffer and tts_buffer.is_running:
-                tts_buffer.finish()
-                await tts_buffer.wait_drained(timeout=5.0)
 
             # Save upstream + downstream audio for this turn (fire-and-forget)
             if audio or downstream_pcm:
@@ -570,9 +582,6 @@ class StreamingCallHandler:
                 })
             except Exception:
                 pass
-        finally:
-            if tts_buffer and tts_buffer.is_running:
-                await tts_buffer.stop()
 
     async def _execute_terminal_action(self, action: str, call_id: str) -> None:
         """通过 ESL 执行终态动作（挂断/转接）。"""

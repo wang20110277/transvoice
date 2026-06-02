@@ -7,6 +7,7 @@ _src = str(Path(__file__).resolve().parent / "src")
 if _src not in sys.path:
     sys.path.insert(0, _src)
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket
@@ -43,8 +44,8 @@ async def lifespan(app: FastAPI):
     assembler = MemoryAssembler()
     mcp = MCPClient(settings.mcp_server_url, settings.mcp_transport)
     try:
-        await mcp.initialize()
-    except Exception as e:
+        await asyncio.wait_for(mcp.initialize(), timeout=10)
+    except (asyncio.TimeoutError, Exception) as e:
         logger.warning("MCP 初始化失败，将跳过身份/征信查询: %s", e)
     tts = TTSClient(settings.tts_adapter_url)
     asr = ASRClient(settings.asr_adapter_url)
@@ -93,52 +94,54 @@ async def lifespan(app: FastAPI):
 
     # ESL client (optional — graceful degradation if FreeSWITCH not reachable)
     esl = ESLClient(host=settings.esl_host, port=settings.esl_port, password=settings.esl_password)
+
+    # CHANNEL_HANGUP: stop audio fork + cancel active call
+    async def _on_channel_hangup(event):
+        hangup_uuid = event.headers.get("Unique-ID", "")
+        if not hangup_uuid:
+            return
+        logger.info("[%s] CHANNEL_HANGUP received", hangup_uuid)
+        try:
+            await esl.audio_fork_stop(hangup_uuid)
+        except Exception:
+            pass
+        _call_registry.cancel_call(hangup_uuid)
+
+    # CHANNEL_ANSWER: register call + start dynamic audio fork
+    async def _on_channel_answer(event):
+        uuid = event.headers.get("Unique-ID", "")
+        if not uuid:
+            return
+        biz_type = event.headers.get("variable_biz_type", "marketing")
+        user_key = (
+            event.headers.get("variable_user_key", "")
+            or event.headers.get("Caller-Caller-ID-Number", "")
+        )
+        logger.info("[%s] CHANNEL_ANSWER biz_type=%s user_key=%s", uuid, biz_type, user_key)
+
+        _call_registry.register(uuid, biz_type, user_key)
+
+        ws_url = f"ws://{settings.media_ws_host}:{settings.media_ws_port}/media/{uuid}"
+        try:
+            result = await esl.audio_fork_start(
+                uuid, ws_url, sample_rate=settings.media_sample_rate,
+            )
+            logger.info("[%s] uuid_audio_fork start on CHANNEL_ANSWER: %s → %s", uuid, ws_url, result)
+        except Exception as e:
+            logger.error("[%s] uuid_audio_fork start failed: %s", uuid, e)
+            _call_registry.unregister(uuid)
+
+    esl.on_event("CHANNEL_HANGUP", _on_channel_hangup)
+    esl.on_event("CHANNEL_ANSWER", _on_channel_answer)
+    # 先记录事件列表到 _subscribed_events（离线也能记录，重连后自动重订阅）
+    esl._subscribed_events = ["CHANNEL_HANGUP", "CHANNEL_ANSWER"]
     try:
         await esl.start()
-
-        # CHANNEL_HANGUP: stop audio fork + cancel active call
-        async def _on_channel_hangup(event):
-            hangup_uuid = event.headers.get("Unique-ID", "")
-            if not hangup_uuid:
-                return
-            logger.info("[%s] CHANNEL_HANGUP received", hangup_uuid)
-            try:
-                await esl.audio_fork_stop(hangup_uuid)
-            except Exception:
-                pass
-            _call_registry.cancel_call(hangup_uuid)
-
-        # CHANNEL_ANSWER: register call + start dynamic audio fork
-        async def _on_channel_answer(event):
-            uuid = event.headers.get("Unique-ID", "")
-            if not uuid:
-                return
-            biz_type = event.headers.get("variable_biz_type", "marketing")
-            user_key = (
-                event.headers.get("variable_user_key", "")
-                or event.headers.get("Caller-Caller-ID-Number", "")
-            )
-            logger.info("[%s] CHANNEL_ANSWER biz_type=%s user_key=%s", uuid, biz_type, user_key)
-
-            _call_registry.register(uuid, biz_type, user_key)
-
-            ws_url = f"ws://{settings.media_ws_host}:{settings.media_ws_port}/media/{uuid}"
-            try:
-                result = await esl.audio_fork_start(
-                    uuid, ws_url, sample_rate=settings.media_sample_rate,
-                )
-                logger.info("[%s] uuid_audio_fork start on CHANNEL_ANSWER: %s → %s", uuid, ws_url, result)
-            except Exception as e:
-                logger.error("[%s] uuid_audio_fork start failed: %s", uuid, e)
-                _call_registry.unregister(uuid)
-
-        esl.on_event("CHANNEL_HANGUP", _on_channel_hangup)
-        esl.on_event("CHANNEL_ANSWER", _on_channel_answer)
+        # start() 成功后 _connected=True，此时真正向 FreeSWITCH 发送订阅命令
         await esl.subscribe(["CHANNEL_HANGUP", "CHANNEL_ANSWER"])
         logger.info("ESL subscribed to CHANNEL_HANGUP + CHANNEL_ANSWER")
     except Exception as e:
-        logger.warning("ESL connection failed (call control disabled): %s", e)
-        esl = None
+        logger.warning("ESL connection failed (background reconnect started): %s", e)
 
     _initialized = True
 

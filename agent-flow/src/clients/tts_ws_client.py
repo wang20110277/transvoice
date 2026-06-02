@@ -25,9 +25,15 @@ class TTSWebSocketClient:
         self._request_counter = 0
 
     async def start(self) -> None:
-        """建立持久 WebSocket 连接。"""
-        self._ws = await websockets.connect(self._base_url, max_size=None)
-        logger.info("TTS WS client connected to %s", self._base_url)
+        """建立持久 WebSocket 连接。超时不阻塞启动，后续请求会触发重连。"""
+        try:
+            self._ws = await websockets.connect(
+                self._base_url, max_size=None, open_timeout=30,
+            )
+            logger.info("TTS WS client connected to %s", self._base_url)
+        except Exception as e:
+            logger.warning("TTS WS client connect deferred (will retry on first use): %s", e)
+            self._ws = None
 
     async def close(self) -> None:
         if self._ws:
@@ -42,7 +48,9 @@ class TTSWebSocketClient:
     ) -> bytes | None:
         """合成文本为音频，返回原始 WAV bytes。"""
         if self._ws is None:
-            return None
+            await self._reconnect()
+            if self._ws is None:
+                return None
         async with self._lock:
             try:
                 self._request_counter += 1
@@ -86,7 +94,9 @@ class TTSWebSocketClient:
     ) -> AsyncIterator[bytes]:
         """流式合成: 返回 PCM int16 音频块异步迭代器。"""
         if self._ws is None:
-            return
+            await self._reconnect()
+            if self._ws is None:
+                return
         async with self._lock:
             try:
                 self._request_counter += 1
@@ -151,7 +161,7 @@ class TTSWebSocketClient:
         except Exception:
             pass
         try:
-            self._ws = await websockets.connect(self._base_url, max_size=None)
+            self._ws = await websockets.connect(self._base_url, max_size=None, open_timeout=30)
             logger.info("[WS-TTS] reconnected")
         except Exception as e:
             logger.error("[WS-TTS] reconnect failed: %s", e)

@@ -187,6 +187,8 @@ class TTSOutputBuffer:
 
     def write(self, pcm: bytes) -> None:
         """写入 PCM 数据（拆帧入队，由发送任务匀速输出）。"""
+        if self._task is not None and self._task.done():
+            return  # 发送循环已退出，丢弃数据
         self._partial.extend(pcm)
         while len(self._partial) >= self._frame_size:
             frame = bytes(self._partial[:self._frame_size])
@@ -235,7 +237,11 @@ class TTSOutputBuffer:
             await self.stop()
 
     async def _send_loop(self) -> None:
-        """匀速发送循环：以 frame_interval 间隔逐帧调用 send_fn。"""
+        """匀速发送循环：以 frame_interval 间隔逐帧调用 send_fn。
+
+        无数据时发送静音帧保持连接活跃，防止 FreeSWITCH 媒体超时断连。
+        """
+        silence_frame = b'\x00' * self._frame_size
         try:
             while not self._cancel.is_set():
                 if self._buffer:
@@ -250,8 +256,12 @@ class TTSOutputBuffer:
                     # 所有数据已发送完毕
                     return
                 else:
-                    # 等待新数据或取消信号
-                    self._data_ready.clear()
-                    await self._data_ready.wait()
+                    # 无数据时发静音帧保活，避免 FreeSWITCH 因句间间隙超时断连
+                    try:
+                        await self._send_fn(silence_frame)
+                    except Exception as e:
+                        logger.error("TTSOutputBuffer send error: %s", e)
+                        return
+                    await asyncio.sleep(self._frame_interval)
         except asyncio.CancelledError:
             pass

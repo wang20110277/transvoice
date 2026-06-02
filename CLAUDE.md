@@ -222,19 +222,23 @@ cd agent-flow && PYTHONPATH=$(pwd)/src alembic upgrade head
 ```
 
 ### Local (conda, all services)
+
+**启动顺序（必须严格遵守）**：`fs → asr → tts → flow`，每步等前一个服务就绪再启动下一个。FreeSWITCH 必须先于 agent-flow，否则 ESL 连接失败；ASR/TTS 必须先于 agent-flow，否则首轮通话 TTS/ASR 请求超时。
+
 ```bash
-# Start all
-./scripts/local.sh
+# 重启所有服务（按顺序逐个启动）
+./scripts/local.sh stop           # 先停全部
+./scripts/local.sh fs             # 1. FreeSWITCH (SIP/RTP)
+./scripts/local.sh asr            # 2. ASR (GPU 推理)
+./scripts/local.sh tts            # 3. TTS (GPU 推理)
+./scripts/local.sh flow           # 4. agent-flow (最后启动，依赖以上全部)
 
-# Start specific services
-./scripts/local.sh asr        # ASR only
-./scripts/local.sh tts        # TTS only
-./scripts/local.sh flow       # agent-flow only
-./scripts/local.sh asr tts    # ASR + TTS
+# 单独管理
+./scripts/local.sh status         # 检查运行状态
+./scripts/local.sh stop           # 停止全部
 
-# Management
-./scripts/local.sh stop       # Stop all
-./scripts/local.sh status     # Check status
+# 仅重启 agent-flow（其他服务不变）
+./scripts/local.sh stop flow && ./scripts/local.sh flow
 ```
 
 ### Docker Compose (production)

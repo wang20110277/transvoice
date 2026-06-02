@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════
-# 本地启动脚本 — ASR / TTS / Flow 逐个启动
+# 本地启动脚本 — FreeSWITCH / ASR / TTS / Flow 逐个启动
 #
 # 用法:
-#   ./scripts/local.sh              # 启动全部
+#   ./scripts/local.sh              # 启动全部 (fs asr tts flow)
+#   ./scripts/local.sh fs           # 仅启动 FreeSWITCH
 #   ./scripts/local.sh asr          # 仅启动 ASR
 #   ./scripts/local.sh tts          # 仅启动 TTS
 #   ./scripts/local.sh flow         # 仅启动 Flow
-#   ./scripts/local.sh asr tts      # 启动 ASR + TTS
+#   ./scripts/local.sh fs asr tts   # 启动 FreeSWITCH + ASR + TTS
 #   ./scripts/local.sh stop         # 停止全部
 #   ./scripts/local.sh status       # 查看状态
 # ══════════════════════════════════════════════════
@@ -26,6 +27,8 @@ LOG_DIR="/tmp/callbot-local-logs"
 mkdir -p "$PID_DIR" "$LOG_DIR"
 
 # ── 配置 ──
+FS_BIN="$HOME/freeswitch/bin/freeswitch"
+FS_ESL_PORT=8021
 ASR_PORT=8080
 TTS_PORT=8081
 FLOW_PORT=8000
@@ -40,6 +43,10 @@ COSYVOICE_RUNTIME="$HOME/Documents/project/CosyVoice"
 is_running() {
   local port=$1
   curl -sf "http://127.0.0.1:${port}/healthz" -o /dev/null 2>/dev/null
+}
+
+is_fs_running() {
+  pgrep -f "freeswitch -nc" >/dev/null 2>/dev/null
 }
 
 wait_http() {
@@ -73,6 +80,42 @@ stop_svc() {
 }
 
 # ── 启动函数 ──
+
+start_fs() {
+  if is_fs_running; then
+    info "FreeSWITCH 已在运行"
+    return 0
+  fi
+  if [[ ! -x "$FS_BIN" ]]; then
+    error "FreeSWITCH 未找到: $FS_BIN"
+    return 1
+  fi
+
+  info "启动 FreeSWITCH ..."
+  "$FS_BIN" -nc -nonat >> "$LOG_DIR/fs.log" 2>&1
+
+  # 等待 ESL 端口就绪
+  info "等待 FreeSWITCH 就绪 (ESL port $FS_ESL_PORT) ..."
+  for i in $(seq 1 30); do
+    if lsof -i:"$FS_ESL_PORT" >/dev/null 2>/dev/null; then
+      info "FreeSWITCH 已就绪"
+      # 确认 mod_sofia 加载
+      sleep 3
+      if lsof -i:5060 >/dev/null 2>/dev/null; then
+        info "SIP profiles 已就绪 (5060/5080)"
+      else
+        warn "mod_sofia 可能未加载，尝试手动加载 ..."
+        "$HOME/freeswitch/bin/fs_cli" -H 127.0.0.1 -P 8021 -p ClueCon -x "load mod_sofia" 2>/dev/null || true
+        sleep 3
+      fi
+      return 0
+    fi
+    sleep 1
+  done
+  warn "FreeSWITCH 在 30s 后未就绪"
+  return 1
+}
+
 start_asr() {
   if is_running "$ASR_PORT"; then
     info "ASR 已在运行 (port $ASR_PORT)"
@@ -131,13 +174,16 @@ show_status() {
   printf "${CYAN}%-16s %-10s %-8s %-8s %s${NC}\n" "服务" "引擎" "端口" "状态" "PID"
   printf "%-16s %-10s %-8s %-8s %s\n" "────────────────" "──────" "────" "──────" "─────"
 
-  for row in "ASR|SenseVoice|$ASR_PORT|asr" \
+  for row in "FreeSWITCH|SIP/RTP|5060/8021|fs" \
+             "ASR|SenseVoice|$ASR_PORT|asr" \
              "TTS|CosyVoice|$TTS_PORT|tts" \
              "agent-flow|LangGraph|$FLOW_PORT|flow"; do
     IFS='|' read -r name engine port svc <<< "$row"
     local s="stopped" pid
     pid=$(get_pid "$svc")
-    if is_running "$port"; then
+    if [[ "$svc" == "fs" ]]; then
+      if is_fs_running; then s="running"; fi
+    elif is_running "$port"; then
       s="running"
     fi
     printf "%-16s %-10s %-8s %-8s %s\n" "$name" "$engine" "$port" "$s" "${pid:--}"
@@ -150,6 +196,10 @@ stop_all() {
   stop_svc asr
   stop_svc tts
   stop_svc flow
+  if is_fs_running; then
+    info "停止 FreeSWITCH ..."
+    pkill -f "freeswitch -nc" 2>/dev/null || true
+  fi
   info "已停止"
 }
 
@@ -162,8 +212,9 @@ for arg in "$@"; do
     stop)    ACTION="stop" ;;
     status)  ACTION="status" ;;
     -h|--help)
-      echo "用法: $0 [asr|tts|flow|stop|status]"
-      echo "  无参数   启动全部"
+      echo "用法: $0 [fs|asr|tts|flow|stop|status]"
+      echo "  无参数   启动全部 (fs asr tts flow)"
+      echo "  fs       仅启动 FreeSWITCH"
       echo "  asr      仅启动 ASR"
       echo "  tts      仅启动 TTS"
       echo "  flow     仅启动 agent-flow"
@@ -184,20 +235,22 @@ case "$ACTION" in
     info "══════════════════════════════════════"
 
     # 默认全部
-    [[ ${#SERVICES[@]} -eq 0 ]] && SERVICES=(asr tts flow)
+    [[ ${#SERVICES[@]} -eq 0 ]] && SERVICES=(fs asr tts flow)
 
     for svc in "${SERVICES[@]}"; do
       case "$svc" in
+        fs)   start_fs ;;
         asr)  start_asr ;;
         tts)  start_tts ;;
         flow) start_flow ;;
-        *)    error "未知服务: $svc (可选: asr, tts, flow)" ;;
+        *)    error "未知服务: $svc (可选: fs, asr, tts, flow)" ;;
       esac
     done
 
     echo ""
     show_status
     info "日志目录: $LOG_DIR/"
+    info "  tail -f $LOG_DIR/fs.log"
     info "  tail -f $LOG_DIR/asr.log"
     info "  tail -f $LOG_DIR/tts.log"
     info "  tail -f $LOG_DIR/flow.log"
