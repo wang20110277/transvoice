@@ -37,7 +37,7 @@ ASR_MODEL_DIR="$PROJECT_DIR/agent-asr/models/SenseVoiceSmall"
 TTS_MODEL_DIR="$PROJECT_DIR/agent-tts/models/CosyVoice3-0.5B"
 VOICES_DIR="$PROJECT_DIR/voices"
 TTS_CACHE_DIR="/tmp/tts_cache"
-COSYVOICE_RUNTIME="$HOME/Documents/project/CosyVoice"
+COSYVOICE_RUNTIME="$PROJECT_DIR/agent-tts/CosyVoice"
 
 # ── 工具函数 ──
 is_running() {

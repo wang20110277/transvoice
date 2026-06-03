@@ -367,14 +367,17 @@ async def run_pre_llm_phase(
     }
 
     if precomputed_asr_result:
-        # Use gRPC/WS-streamed ASR result directly
-        state["user_input"] = precomputed_asr_result.get("text", "")
-        # Clear audio_bytes so receive_asr_node skips the ASR call (result already known)
-        state["audio_bytes"] = None
-        # Load chat history
+        # Use gRPC/WS-streamed ASR result — 但空文本时保留 audio_bytes 走 HTTP ASR 回退
+        precomputed_text = precomputed_asr_result.get("text", "")
+        if precomputed_text:
+            # 流式 ASR 有结果，跳过 HTTP ASR
+            state["user_input"] = precomputed_text
+            state["audio_bytes"] = None
+        # else: 流式 ASR 返回空，保留 audio_bytes 走 HTTP ASR 回退
         asr_result = await receive_asr_node(state)
         state.update(asr_result)
-        state["user_input"] = precomputed_asr_result.get("text", "") or state.get("user_input", "")
+        if precomputed_text:
+            state["user_input"] = precomputed_text
     else:
         asr_result = await receive_asr_node(state)
         state.update(asr_result)

@@ -236,6 +236,8 @@ class StreamingCallHandler:
         # Barge-in state
         streaming_task: asyncio.Task | None = None
         barge_in_event = asyncio.Event()
+        # Barge-in grace period: end-of-speech 后短暂忽略音频，防止残余帧误判
+        _barge_in_grace_until: float = 0.0
         # gRPC ASR streaming state
         asr_stream: ASRStream | None = None
         speech_started = False
@@ -255,6 +257,7 @@ class StreamingCallHandler:
                     barge_detected = await self._receive_during_streaming(
                         websocket, call_id, vad, jitter, audio_buffer,
                         streaming_task, barge_in_event, active_call,
+                        _barge_in_grace_until,
                     )
                     if barge_detected:
                         # Cancel streaming and start processing the interruption
@@ -303,12 +306,12 @@ class StreamingCallHandler:
                         denoised_frame = self._denoiser.process(smooth_frame)
                         audio_buffer.extend(denoised_frame)
 
-                        # Streaming ASR: WS > gRPC (same interface)
+                        # Streaming ASR: 首帧即创建 stream，全量发送 PCM
                         asr_provider = self._asr_ws_client if self._use_ws_streaming else (
                             self._asr_grpc_client if self._use_grpc_streaming else None
                         )
                         if asr_provider:
-                            if not speech_started and vad.is_speech(denoised_frame):
+                            if not speech_started:
                                 speech_started = True
 
                                 def _on_asr_partial(text: str, stability: float) -> None:
@@ -353,6 +356,8 @@ class StreamingCallHandler:
                             # Launch streaming as a concurrent task so we can
                             # receive audio for barge-in while it runs
                             barge_in_event.clear()
+                            # Grace period: 500ms 内忽略音频，防止 end-of-speech 残余帧误判 barge-in
+                            _barge_in_grace_until = time.monotonic() + 0.5
                             streaming_task = asyncio.create_task(
                                 self._process_streaming_turn(
                                     websocket, call_id, biz_type, user_key,
@@ -407,6 +412,7 @@ class StreamingCallHandler:
         streaming_task: asyncio.Task,
         barge_in_event: asyncio.Event,
         active_call: "ActiveCall | None",
+        grace_until: float = 0.0,
     ) -> bool:
         """Receive audio while streaming TTS is in progress. Returns True if barge-in detected.
 
@@ -440,7 +446,9 @@ class StreamingCallHandler:
 
                 # Barge-in VAD: use shorter thresholds for faster detection
                 # during AI speech — just need to detect that user started talking
-                if len(audio_buffer) >= self._barge_in_min_audio_bytes and self._is_speech_frame(denoised_frame, vad):
+                # Grace period: 忽略 end-of-speech 后的残余帧，防止误判
+                in_grace = time.monotonic() < grace_until
+                if not in_grace and len(audio_buffer) >= self._barge_in_min_audio_bytes and self._is_speech_frame(denoised_frame, vad):
                     logger.info("[%s] barge-in: user speech detected (%d bytes buffered)",
                                 call_id, len(audio_buffer))
 
