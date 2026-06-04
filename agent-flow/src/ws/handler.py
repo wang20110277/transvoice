@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from fastapi import WebSocket, WebSocketDisconnect
 
 from ws.vad import SimpleVAD
-from ws.jitter_buffer import JitterBuffer
+from ws.jitter_buffer import JitterBuffer, TTSOutputBuffer
 from ws.registry import ActiveCallRegistry
 from ws.denoise import BaseDenoiser, PassThroughDenoiser
 from storage import minio_storage
@@ -203,18 +203,11 @@ class StreamingCallHandler:
         await websocket.accept()
         logger.info("[%s] streaming WS connected biz_type=%s", call_id, biz_type)
 
-        # 立即启动静音保活：在 TTS 音频到来前持续发送静音帧，防止 FreeSWITCH 媒体超时
-        # 使用局部变量而非实例属性，避免并发通话互相覆盖
-        _silence_stop = asyncio.Event()
-        async def _silence_keepalive():
-            while not _silence_stop.is_set():
-                try:
-                    await websocket.send_bytes(self._SILENCE_FRAME)
-                    await asyncio.sleep(0.03)
-                except Exception as e:
-                    logger.warning("[%s] silence keepalive stopped: %s", call_id, e)
-                    break
-        _silence_task = asyncio.create_task(_silence_keepalive(), name="silence-keepalive")
+        # TTSOutputBuffer: 单 writer 统一出口，将 TTS PCM 拆为固定 960B 帧匀速发送。
+        # 无 TTS 数据时自动发静音帧保活，替代独立的 silence keepalive task。
+        # 避免两个 writer 并发写 WebSocket 导致帧不对齐。
+        tts_buffer = TTSOutputBuffer(send_fn=websocket.send_bytes)
+        await tts_buffer.start()
 
         active_call = None
         if self._registry:
@@ -238,6 +231,10 @@ class StreamingCallHandler:
         barge_in_event = asyncio.Event()
         # Barge-in grace period: end-of-speech 后短暂忽略音频，防止残余帧误判
         _barge_in_grace_until: float = 0.0
+        # AI 是否已发出过 TTS 音频 — 只有 AI 开口后才允许 barge-in
+        _ai_has_spoken = asyncio.Event()
+        # AI 开口后是否已清空累积音频 — 防止开口前的音频被误判为 barge-in
+        _ai_spoken_buffer_cleared = False
         # gRPC ASR streaming state
         asr_stream: ASRStream | None = None
         speech_started = False
@@ -254,12 +251,30 @@ class StreamingCallHandler:
                 # If a streaming task is running, concurrently receive audio
                 # to detect barge-in while AI is speaking
                 if streaming_task and not streaming_task.done():
+                    # AI 开口瞬间，清空之前累积的音频（用户残余语音/噪声），
+                    # 只保留 AI 开口之后收到的音频用于 barge-in 检测
+                    if _ai_has_spoken.is_set() and not _ai_spoken_buffer_cleared:
+                        audio_buffer.clear()
+                        jitter.reset()
+                        self._denoiser.reset()
+                        _ai_spoken_buffer_cleared = True
+                        logger.info("[%s] AI started speaking, cleared pre-speech audio buffer", call_id)
+
                     barge_detected = await self._receive_during_streaming(
                         websocket, call_id, vad, jitter, audio_buffer,
                         streaming_task, barge_in_event, active_call,
-                        _barge_in_grace_until,
+                        _barge_in_grace_until, _ai_has_spoken,
                     )
                     if barge_detected:
+                        # Cancel active ASR stream on barge-in
+                        if asr_stream is not None:
+                            try:
+                                await asr_stream.cancel()
+                            except Exception:
+                                pass
+                            asr_stream = None
+                            speech_started = False
+
                         # Cancel streaming and start processing the interruption
                         turn_count += 1
                         logger.info("[%s] barge-in detected, processing turn %d", call_id, turn_count)
@@ -268,6 +283,8 @@ class StreamingCallHandler:
                         await self._process_streaming_turn(
                             websocket, call_id, biz_type, user_key,
                             bytes(audio_buffer), turn_count, active_call,
+                            ai_spoken_event=_ai_has_spoken,
+                            tts_buffer=tts_buffer,
                         )
 
                         audio_buffer.clear()
@@ -356,6 +373,8 @@ class StreamingCallHandler:
                             # Launch streaming as a concurrent task so we can
                             # receive audio for barge-in while it runs
                             barge_in_event.clear()
+                            _ai_has_spoken.clear()
+                            _ai_spoken_buffer_cleared = False
                             # Grace period: 500ms 内忽略音频，防止 end-of-speech 残余帧误判 barge-in
                             _barge_in_grace_until = time.monotonic() + 0.5
                             streaming_task = asyncio.create_task(
@@ -364,6 +383,8 @@ class StreamingCallHandler:
                                     bytes(audio_buffer), turn_count, active_call,
                                     barge_in_event=barge_in_event,
                                     precomputed_asr_result=precomputed_asr_result,
+                                    ai_spoken_event=_ai_has_spoken,
+                                    tts_buffer=tts_buffer,
                                 ),
                                 name=f"stream-{call_id}-{turn_count}",
                             )
@@ -395,9 +416,14 @@ class StreamingCallHandler:
                     await streaming_task
                 except (asyncio.CancelledError, Exception):
                     pass
-            _silence_stop.set()
-            if _silence_task and not _silence_task.done():
-                _silence_task.cancel()
+            # Cancel any active ASR stream to prevent gRPC task leaks
+            if asr_stream is not None:
+                try:
+                    await asr_stream.cancel()
+                except Exception:
+                    pass
+                asr_stream = None
+            await tts_buffer.stop()
             if self._registry:
                 self._registry.unregister(call_id)
             logger.info("[%s] streaming WS ended, total turns=%d", call_id, turn_count)
@@ -413,12 +439,12 @@ class StreamingCallHandler:
         barge_in_event: asyncio.Event,
         active_call: "ActiveCall | None",
         grace_until: float = 0.0,
+        ai_spoken_event: asyncio.Event | None = None,
     ) -> bool:
         """Receive audio while streaming TTS is in progress. Returns True if barge-in detected.
 
-        This method polls the WebSocket for new audio frames, feeds them through the
-        jitter buffer and VAD. If user speech is detected, it cancels the streaming
-        task and signals barge-in.
+        Barge-in 只在 AI 已经发出过 TTS 音频（ai_spoken_event.is_set()）后才触发。
+        AI 未开口时用户不可能在"打断"，此时接收到的音频是残余语音/噪声，应丢弃。
         """
         try:
             # Use a short timeout so we can check streaming_task completion
@@ -428,7 +454,11 @@ class StreamingCallHandler:
             return False
         except WebSocketDisconnect:
             streaming_task.cancel()
-            raise  # 向外层传播断连，让 handle() 的 except WebSocketDisconnect 统一处理
+            raise
+        except RuntimeError:
+            # WS 已断连（disconnect 消息被其他 receive 消费后触发）— 向外层传播
+            streaming_task.cancel()
+            raise
         except Exception as e:
             logger.error("[%s] receive during streaming error: %s", call_id, e)
             return False
@@ -444,11 +474,11 @@ class StreamingCallHandler:
                 denoised_frame = self._denoiser.process(smooth_frame)
                 audio_buffer.extend(denoised_frame)
 
-                # Barge-in VAD: use shorter thresholds for faster detection
-                # during AI speech — just need to detect that user started talking
+                # Barge-in VAD: only trigger after AI has spoken (user can't interrupt silence)
                 # Grace period: 忽略 end-of-speech 后的残余帧，防止误判
                 in_grace = time.monotonic() < grace_until
-                if not in_grace and len(audio_buffer) >= self._barge_in_min_audio_bytes and self._is_speech_frame(denoised_frame, vad):
+                ai_speaking = ai_spoken_event is not None and ai_spoken_event.is_set()
+                if not in_grace and ai_speaking and len(audio_buffer) >= self._barge_in_min_audio_bytes and self._is_speech_frame(denoised_frame, vad):
                     logger.info("[%s] barge-in: user speech detected (%d bytes buffered)",
                                 call_id, len(audio_buffer))
 
@@ -499,11 +529,13 @@ class StreamingCallHandler:
         active_call: "ActiveCall | None" = None,
         barge_in_event: asyncio.Event | None = None,
         precomputed_asr_result: dict | None = None,
+        ai_spoken_event: asyncio.Event | None = None,
+        tts_buffer: TTSOutputBuffer | None = None,
     ) -> None:
-        """运行流式管线：Pre-LLM → 流式 LLM+TTS → 音频直接回传。
+        """运行流式管线：Pre-LLM → 流式 LLM+TTS → 音频通过 TTSOutputBuffer 回传。
 
-        静音保活在 handle() 中全程运行，保证连接不断。
-        TTS PCM 直接通过 WebSocket 发送，由 FreeSWITCH 内部缓冲处理 pacing。
+        TTSOutputBuffer 在 handle() 中全程运行，统一所有音频输出：
+        拆帧（固定 960B）、匀速 30ms、无数据时自动静音保活。
         """
         downstream_pcm = bytearray()
         try:
@@ -521,15 +553,14 @@ class StreamingCallHandler:
                 logger.info("[%s] barge-in during pre-llm, aborting stream", call_id)
                 return
 
-            # Phase 2: Streaming LLM+TTS — TTS PCM 直接发送，不做帧 pacing
+            # Phase 2: Streaming LLM+TTS — TTS PCM 写入 tts_buffer 统一输出
             next_to_send = 0
             pending: dict[int, list[bytes]] = {}
-            _ws_broken = False
 
             async def audio_callback(pcm: bytes, index: int) -> None:
-                nonlocal next_to_send, _ws_broken
+                nonlocal next_to_send
 
-                if _ws_broken or (barge_in_event and barge_in_event.is_set()):
+                if barge_in_event and barge_in_event.is_set():
                     return
 
                 if index not in pending:
@@ -537,17 +568,17 @@ class StreamingCallHandler:
                 pending[index].append(pcm)
                 downstream_pcm.extend(pcm)
 
-                # 按句序直接发送，FreeSWITCH 内部缓冲处理 pacing
+                # 按句序写入 tts_buffer，由其拆帧匀速发送
                 while next_to_send in pending:
                     chunks = pending.pop(next_to_send)
                     for chunk in chunks:
-                        try:
-                            await websocket.send_bytes(chunk)
-                        except Exception as e:
-                            logger.error("[%s] send audio error: %s", call_id, e)
-                            _ws_broken = True
-                            return
-                    logger.debug("[%s] sent TTS sentence %d (%d chunks, %d bytes)",
+                        if tts_buffer and tts_buffer.is_running:
+                            tts_buffer.write(chunk)
+                    # AI 首次写入 TTS 音频 — 通知 barge-in 检测可以开始
+                    if ai_spoken_event and not ai_spoken_event.is_set():
+                        ai_spoken_event.set()
+                        logger.info("[%s] AI first audio queued, barge-in detection enabled", call_id)
+                    logger.debug("[%s] queued TTS sentence %d (%d chunks, %d bytes)",
                                  call_id, next_to_send, len(chunks), sum(len(c) for c in chunks))
                     next_to_send += 1
 

@@ -239,9 +239,11 @@ class TTSOutputBuffer:
     async def _send_loop(self) -> None:
         """匀速发送循环：以 frame_interval 间隔逐帧调用 send_fn。
 
-        无数据时发送静音帧保持连接活跃，防止 FreeSWITCH 媒体超时断连。
+        无数据时等待 _data_ready 事件唤醒，不发静音帧。
+        FreeSWITCH mod_audio_fork 的 dub_speech_frame 在 playout buffer 空时
+        自动向通话方发送静音，无需 agent-flow 侧填充。
         """
-        silence_frame = b'\x00' * self._frame_size
+        frames_sent = 0
         try:
             while not self._cancel.is_set():
                 if self._buffer:
@@ -251,17 +253,14 @@ class TTSOutputBuffer:
                     except Exception as e:
                         logger.error("TTSOutputBuffer send error: %s", e)
                         return
+                    frames_sent += 1
                     await asyncio.sleep(self._frame_interval)
                 elif self._finished:
-                    # 所有数据已发送完毕
+                    logger.info("TTSOutputBuffer drained: %d audio frames sent", frames_sent)
                     return
                 else:
-                    # 无数据时发静音帧保活，避免 FreeSWITCH 因句间间隙超时断连
-                    try:
-                        await self._send_fn(silence_frame)
-                    except Exception as e:
-                        logger.error("TTSOutputBuffer send error: %s", e)
-                        return
-                    await asyncio.sleep(self._frame_interval)
+                    # 等待数据写入，stop() 也会 set 此事件以唤醒退出
+                    self._data_ready.clear()
+                    await self._data_ready.wait()
         except asyncio.CancelledError:
-            pass
+            logger.info("TTSOutputBuffer cancelled: %d audio frames sent", frames_sent)

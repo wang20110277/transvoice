@@ -111,57 +111,48 @@ class NoisereduceDenoiser(BaseDenoiser):
 
 
 class RNNoiseDenoiser(BaseDenoiser):
-    """RNNoise denoiser with 8kHz→48kHz resampling.
+    """RNNoise denoiser — pyrnnoise with native 16kHz support.
 
-    RNNoise operates at 48kHz with 480-sample (20ms) frames.
-    We resample each 240-sample (30ms @ 8kHz) frame up, denoise, then back down.
+    pyrnnoise handles internal resampling transparently.
+    Input/output: 960 bytes (480 samples @ 16kHz 16-bit mono, 30ms frame).
     """
 
     def __init__(self) -> None:
-        import numpy as np
-        from scipy.signal import butter, sosfilt, resample
-
-        self._np = np
-        self._resample = resample
-
-        # RNNoise expects 480 samples at 48kHz = 10ms
-        # We feed it 240 samples upsampled to 1440 samples at 48kHz (30ms)
-        # then split into 3 x 480-sample chunks for RNNoise
         try:
-            from rnnoise import RNNoise as _RNNoise
-            self._denoiser = _RNNoise()
+            from pyrnnoise import RNNoise as _RNNoise
+            self._denoiser = _RNNoise(16000)
+            logger.info("Denoiser: RNNoise (pyrnnoise, 16kHz native)")
         except ImportError:
-            logger.warning("rnnoise-python not installed, falling back to pass-through")
+            logger.warning("pyrnnoise not installed, falling back to pass-through")
             self._denoiser = None
 
     def process(self, frame: bytes) -> bytes:
         if self._denoiser is None:
             return frame
 
-        np = self._np
-        samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
+        import numpy as np
 
-        # 8kHz → 48kHz: 240 samples → 1440 samples
-        upsampled = self._resample(samples, int(len(samples) * 6))
-        float_pcm = upsampled / 32768.0
+        samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32768.0
 
-        # Process in 480-sample chunks (RNNoise frame size at 48kHz)
-        denoised_chunks = []
-        for i in range(0, len(float_pcm), 480):
-            chunk = float_pcm[i : i + 480]
-            if len(chunk) < 480:
-                chunk = np.pad(chunk, (0, 480 - len(chunk)))
-            denoised, _ = self._denoiser.process(chunk)
-            denoised_chunks.append(denoised)
+        denoised_samples = []
+        for _, denoised in self._denoiser.denoise_chunk(samples):
+            denoised_samples.append(np.array(denoised).flatten())
 
-        denoised_full = np.concatenate(denoised_chunks)
+        if not denoised_samples:
+            return frame
 
-        # 48kHz → 8kHz: 1440 samples → 240 samples
-        downsampled = self._resample(denoised_full, len(samples))
-        return np.clip(downsampled * 32768.0, -32768, 32767).astype(np.int16).tobytes()
+        result = np.concatenate(denoised_samples)
+        # Ensure output matches input length exactly
+        if len(result) != len(samples):
+            result = result[:len(samples)]
+
+        return np.clip(result * 32768.0, -32768, 32767).astype(np.int16).tobytes()
 
     def reset(self) -> None:
-        pass
+        # Re-create to clear internal state
+        if self._denoiser is not None:
+            from pyrnnoise import RNNoise as _RNNoise
+            self._denoiser = _RNNoise(16000)
 
 
 def create_denoiser() -> BaseDenoiser:

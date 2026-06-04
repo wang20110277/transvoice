@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 class ASRGrpcClient:
     """gRPC client for ASR streaming recognition."""
 
-    def __init__(self, target: str, timeout: float = 15.0):
+    def __init__(self, target: str, timeout: float = 120.0):
         self._target = target
         self._timeout = timeout
         self._channel: grpc.aio.Channel | None = None
@@ -81,11 +81,15 @@ class ASRStream:
         )
 
     async def _request_iterator(self):
-        while True:
-            item = await self._queue.get()
-            if item is None:
-                break
-            yield item
+        try:
+            while True:
+                item = await self._queue.get()
+                if item is None:
+                    break
+                yield item
+        except asyncio.CancelledError:
+            # Generator被取消时确保干净退出，不留 pending task
+            pass
 
     def send_audio(self, chunk: bytes) -> None:
         """Send an audio chunk. Call as frames arrive from JitterBuffer."""
@@ -117,6 +121,11 @@ class ASRStream:
 
     async def cancel(self) -> None:
         if self._queue is not None:
-            self._queue.put_nowait(None)
+            try:
+                self._queue.put_nowait(None)
+            except Exception:
+                pass
         if self._rpc is not None:
             self._rpc.cancel()
+            self._rpc = None
+        self._queue = None

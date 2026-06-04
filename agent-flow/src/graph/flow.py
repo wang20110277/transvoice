@@ -538,6 +538,15 @@ async def run_streaming_pipeline(
                 if not full_text and event.parsed:
                     full_text = event.parsed.get("text", "")
 
+    except asyncio.CancelledError:
+        logger.info("[%s] streaming pipeline cancelled", call_id)
+        # Cancel all pending TTS tasks immediately
+        for t in tts_tasks:
+            if not t.done():
+                t.cancel()
+        if tts_tasks:
+            await asyncio.gather(*tts_tasks, return_exceptions=True)
+        raise
     except Exception as e:
         logger.error("[%s] streaming LLM failed: %s", call_id, e)
 
