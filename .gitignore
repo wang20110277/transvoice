@@ -34,3 +34,6 @@ htmlcov/
 models
 .codegraph
 .code-review-graph
+
+# FreeSWITCH source tree (binaries, build artifacts)
+freeswitch/freeswitch-1.11.0/
