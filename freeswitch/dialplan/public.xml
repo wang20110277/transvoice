@@ -10,7 +10,7 @@
           <!-- 呼入: caller_id_number=客户手机号; 呼出: destination_number=客户手机号 -->
           <action application="set" data="user_key=${caller_id_number}"/>
           <action application="answer"/>
-          <action application="park"/>
+          <action application="playback" data="silence_stream://-1"/>
         </condition>
       </extension>
 
@@ -21,7 +21,7 @@
           <action application="set" data="biz_type=collection"/>
           <action application="set" data="user_key=${caller_id_number}"/>
           <action application="answer"/>
-          <action application="park"/>
+          <action application="playback" data="silence_stream://-1"/>
         </condition>
       </extension>
 
@@ -32,7 +32,7 @@
           <action application="set" data="biz_type=marketing"/>
           <action application="set" data="user_key=${caller_id_number}"/>
           <action application="answer"/>
-          <action application="park"/>
+          <action application="playback" data="silence_stream://-1"/>
         </condition>
       </extension>
 

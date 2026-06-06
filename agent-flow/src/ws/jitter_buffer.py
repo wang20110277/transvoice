@@ -251,7 +251,10 @@ class TTSOutputBuffer:
                     try:
                         await self._send_fn(frame)
                     except Exception as e:
-                        logger.error("TTSOutputBuffer send error: %s", e)
+                        logger.error(
+                            "TTSOutputBuffer send error (type=%s, repr=%r, frames_sent=%d): %s",
+                            type(e).__name__, e, frames_sent, e,
+                        )
                         return
                     frames_sent += 1
                     await asyncio.sleep(self._frame_interval)

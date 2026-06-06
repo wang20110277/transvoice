@@ -139,14 +139,19 @@ start_tts() {
     return 0
   fi
 
-  info "启动 TTS (CosyVoice, port $TTS_PORT) ..."
+  # Mac: default auto (MPS+fallback); Linux: auto (CUDA or CPU)
+  local tts_device="${COSYVOICE_DEVICE:-auto}"
+
+  info "启动 TTS (CosyVoice, port $TTS_PORT, device=$tts_device) ..."
   conda run -n cosyvoice bash -c \
     "cd '$PROJECT_DIR/agent-tts/ttsadapter' \
+     && export PYTORCH_ENABLE_MPS_FALLBACK=1 \
      && PYTHONPATH='$PROJECT_DIR/agent-tts' \
         MODEL_DIR='$TTS_MODEL_DIR' \
         VOICES_DIR='$VOICES_DIR' \
         TTS_CACHE_DIR='$TTS_CACHE_DIR' \
         COSYVOICE_RUNTIME='$COSYVOICE_RUNTIME' \
+        COSYVOICE_DEVICE='$tts_device' \
         uvicorn main:app --host 0.0.0.0 --port $TTS_PORT \
         >> '$LOG_DIR/tts.log' 2>&1" &
   echo $! > "$PID_DIR/tts.pid"

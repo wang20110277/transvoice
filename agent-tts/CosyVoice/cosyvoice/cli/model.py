@@ -194,7 +194,7 @@ class CosyVoiceModel:
             while True:
                 time.sleep(0.1)
                 if len(self.tts_speech_token_dict[this_uuid]) >= token_hop_len + self.token_overlap_len:
-                    this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid][:token_hop_len + self.token_overlap_len]) \
+                    this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid][:token_hop_len + self.token_overlap_len], dtype=torch.float32) \
                         .unsqueeze(dim=0)
                     this_tts_speech = self.token2wav(token=this_tts_speech_token,
                                                      prompt_token=flow_prompt_speech_token,
@@ -211,7 +211,7 @@ class CosyVoiceModel:
                     break
             p.join()
             # deal with remain tokens, make sure inference remain token len equals token_hop_len when cache_speech is not None
-            this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
+            this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid], dtype=torch.float32).unsqueeze(dim=0)
             this_tts_speech = self.token2wav(token=this_tts_speech_token,
                                              prompt_token=flow_prompt_speech_token,
                                              prompt_feat=prompt_speech_feat,
@@ -222,7 +222,7 @@ class CosyVoiceModel:
         else:
             # deal with all tokens
             p.join()
-            this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
+            this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid], dtype=torch.float32).unsqueeze(dim=0)
             this_tts_speech = self.token2wav(token=this_tts_speech_token,
                                              prompt_token=flow_prompt_speech_token,
                                              prompt_feat=prompt_speech_feat,
@@ -347,7 +347,7 @@ class CosyVoice2Model(CosyVoiceModel):
                 time.sleep(0.1)
                 this_token_hop_len = self.token_hop_len + prompt_token_pad if token_offset == 0 else self.token_hop_len
                 if len(self.tts_speech_token_dict[this_uuid]) - token_offset >= this_token_hop_len + self.flow.pre_lookahead_len:
-                    this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid][:token_offset + this_token_hop_len + self.flow.pre_lookahead_len]).unsqueeze(dim=0)
+                    this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid][:token_offset + this_token_hop_len + self.flow.pre_lookahead_len], dtype=torch.float32).unsqueeze(dim=0)
                     this_tts_speech = self.token2wav(token=this_tts_speech_token,
                                                      prompt_token=flow_prompt_speech_token,
                                                      prompt_feat=prompt_speech_feat,
@@ -363,7 +363,7 @@ class CosyVoice2Model(CosyVoiceModel):
                     break
             p.join()
             # deal with remain tokens, make sure inference remain token len equals token_hop_len when cache_speech is not None
-            this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
+            this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid], dtype=torch.float32).unsqueeze(dim=0)
             this_tts_speech = self.token2wav(token=this_tts_speech_token,
                                              prompt_token=flow_prompt_speech_token,
                                              prompt_feat=prompt_speech_feat,
@@ -375,7 +375,7 @@ class CosyVoice2Model(CosyVoiceModel):
         else:
             # deal with all tokens
             p.join()
-            this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
+            this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid], dtype=torch.float32).unsqueeze(dim=0)
             this_tts_speech = self.token2wav(token=this_tts_speech_token,
                                              prompt_token=flow_prompt_speech_token,
                                              prompt_feat=prompt_speech_feat,

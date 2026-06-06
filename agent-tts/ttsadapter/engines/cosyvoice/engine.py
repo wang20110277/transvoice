@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/cosyvoice/models/CosyVoice3-0.5B")
 COSYVOICE_MAX_CONCURRENT = int(os.environ.get("COSYVOICE_MAX_CONCURRENT", "5"))
+# cpu | mps | auto (mps if available, else cpu)
+COSYVOICE_DEVICE = os.environ.get("COSYVOICE_DEVICE", "auto")
 
 VOICES_DIR = os.environ.get("VOICES_DIR", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "voices"))
 
@@ -33,6 +35,9 @@ class CosyVoiceTTSEngine(TTSEngine):
 
     async def load_model(self):
         import sys
+
+        import torch
+
         runtime_path = os.environ.get("COSYVOICE_RUNTIME", "/opt/cosyvoice/runtime")
         if runtime_path not in sys.path:
             sys.path.insert(0, runtime_path)
@@ -40,6 +45,32 @@ class CosyVoiceTTSEngine(TTSEngine):
 
         logger.info("Loading CosyVoice model from %s", MODEL_DIR)
         self._model = AutoModel(model_dir=MODEL_DIR, fp16=False)
+
+        # Device placement: cpu | mps | auto
+        use_mps = (
+            COSYVOICE_DEVICE == "mps"
+            or (COSYVOICE_DEVICE == "auto"
+                and not torch.cuda.is_available()
+                and hasattr(torch.backends, "mps")
+                and torch.backends.mps.is_available())
+        )
+        if use_mps:
+            mps = torch.device("mps")
+            self._model.model.device = mps
+            self._model.model.llm.to(mps)
+            self._model.model.flow.to(mps)
+            self._model.model.hift.to(mps)
+            # np.hamming returns float64 → MPS only supports float32
+            m = self._model.model
+            if hasattr(m, 'mel_window') and not isinstance(m.mel_window, torch.Tensor):
+                m.mel_window = torch.tensor(m.mel_window, dtype=torch.float32)
+            if hasattr(m, 'speech_window') and not isinstance(m.speech_window, torch.Tensor):
+                m.speech_window = torch.tensor(m.speech_window, dtype=torch.float32)
+            logger.info("CosyVoice model moved to MPS device")
+        else:
+            device = self._model.model.device
+            logger.info("CosyVoice model on %s", device)
+
         logger.info("CosyVoice model loaded")
 
     def _get_profile(self, params: dict) -> dict:
@@ -77,7 +108,8 @@ class CosyVoiceTTSEngine(TTSEngine):
             chunk_index = 0
             for chunk in await loop.run_in_executor(None, list, stream_gen):
                 tensor = chunk["tts_speech"]
-                pcm_float = tensor.numpy().flatten()
+                # MPS doesn't support float64 — force float32 before numpy
+                pcm_float = tensor.cpu().float().numpy().flatten()
                 pcm_int16 = (pcm_float * 32767).clip(-32768, 32767).astype(np.int16)
                 chunk_index += 1
                 yield TTSChunk(
@@ -115,7 +147,7 @@ class CosyVoiceTTSEngine(TTSEngine):
 
                 buffer = io.BytesIO()
                 for chunk in chunks:
-                    sf.write(buffer, chunk["tts_speech"].numpy().flatten(), 22050, format="WAV")
+                    sf.write(buffer, chunk["tts_speech"].cpu().float().numpy().flatten(), 22050, format="WAV")
                     break
 
                 buffer.seek(0)

@@ -106,7 +106,7 @@ class TTSWebSocketHandler:
                 if chunk.is_final:
                     break
         except Exception as e:
-            logger.error("[WS-TTS] streaming error call_id=%s: %s", call_id, e)
+            logger.error("[WS-TTS] streaming error call_id=%s: %s", call_id, e, exc_info=True)
             await websocket.send_json({
                 "type": "error", "message": str(e),
                 "request_id": request_id,

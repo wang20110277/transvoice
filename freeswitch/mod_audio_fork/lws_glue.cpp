@@ -173,7 +173,8 @@ namespace {
         }
         // Push the data into the buffer.
         playoutBuffer->insert(playoutBuffer->end(), out.begin(), out.end());
-        //switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Appended %zu 16-bit samples to the playout buffer.\n", out.size());
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "(%u) processIncomingBinary: appended %zu samples to playout, total=%zu\n",
+          tech_pvt->id, out.size(), playoutBuffer->size());
       } catch (const std::exception& e) {
         switch_mutex_unlock(tech_pvt->mutex);
         cBuffer->clear();
@@ -969,6 +970,12 @@ switch_bool_t dub_speech_frame(switch_media_bug_t *bug, private_t* tech_pvt) {
 
             // Verificar dados disponíveis
             int samplesToCopy = std::min(static_cast<int>(cBuffer->size()), samples_needed);
+
+            if (call_count % 25 == 0) {
+                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                    "(%u) dub_speech_frame: playout=%zu samples, need=%d, copying=%d\n",
+                    tech_pvt->id, cBuffer->size(), samples_needed, samplesToCopy);
+            }
 
             if (samplesToCopy > 0) {
                 // Preparar dados com silêncio

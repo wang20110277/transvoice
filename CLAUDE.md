@@ -225,6 +225,8 @@ cd agent-flow && PYTHONPATH=$(pwd)/src alembic upgrade head
 
 **启动顺序（必须严格遵守）**：`fs → asr → tts → flow`，每步等前一个服务就绪再启动下一个。FreeSWITCH 必须先于 agent-flow，否则 ESL 连接失败；ASR/TTS 必须先于 agent-flow，否则首轮通话 TTS/ASR 请求超时。
 
+**FreeSWITCH 日志**：`/Users/lindaw/freeswitch/var/log/freeswitch/freeswitch.log`（mod_audio_fork 诊断、音频播放问题排查必查此日志）
+
 ```bash
 # 重启所有服务（按顺序逐个启动）
 ./scripts/local.sh stop           # 先停全部

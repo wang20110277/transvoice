@@ -57,7 +57,7 @@ class SentenceSplitter:
         return sent
 
     def _try_split(self) -> list[Sentence]:
-        """尝试按标点拆分缓冲区。"""
+        """尝试按标点拆分缓冲区。超长时优先在空格处切割，避免切碎单词。"""
         results: list[Sentence] = []
         effective_min = 1 if (self._eager_first and self._is_first) else self._min_length
 
@@ -65,10 +65,16 @@ class SentenceSplitter:
             split_pos = self._find_split_pos(effective_min)
             if split_pos < 0:
                 if len(self._buffer) > self._max_length:
-                    text = self._buffer[:self._max_length]
-                    self._buffer = self._buffer[self._max_length:]
-                    results.append(Sentence(text=text, index=self._index))
-                    self._index += 1
+                    # 优先在空格处切割，避免切碎英文单词
+                    cut = self._max_length
+                    space_pos = self._buffer.rfind(' ', 0, self._max_length)
+                    if space_pos > effective_min:
+                        cut = space_pos + 1
+                    text = self._buffer[:cut].strip()
+                    self._buffer = self._buffer[cut:]
+                    if text:
+                        results.append(Sentence(text=text, index=self._index))
+                        self._index += 1
                     if self._is_first:
                         self._is_first = False
                         effective_min = self._min_length
