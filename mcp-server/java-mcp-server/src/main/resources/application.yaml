@@ -18,6 +18,8 @@ spring:
           resource: false
           prompt: false
           completion: false
+        annotation-scanner:
+          enabled: true
         stateless:
           mcp-endpoint: /mcp
 

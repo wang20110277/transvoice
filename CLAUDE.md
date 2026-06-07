@@ -260,10 +260,10 @@ cd agent-flow && PYTHONPATH=$(pwd)/src alembic upgrade head
 ### MCP Server (Java)
 ```bash
 # Build
-cd mcp-server/java-mcp-server && JAVA_HOME=/opt/homebrew/opt/openjdk ./mvnw clean compile
+cd mcp-server/java-mcp-server && JAVA_HOME=/opt/homebrew/opt/openjdk@21 ./mvnw clean compile
 
 # Run (port 9090)
-cd mcp-server/java-mcp-server && JAVA_HOME=/opt/homebrew/opt/openjdk ./mvnw spring-boot:run
+cd mcp-server/java-mcp-server && JAVA_HOME=/opt/homebrew/opt/openjdk@21 ./mvnw spring-boot:run
 ```
 
 ## Architecture
@@ -301,7 +301,7 @@ Data flow per turn (event-driven, dynamic uuid_audio_fork):
 
 **agent-flow** — FastAPI WebSocket service (uvloop event loop). **Event-driven audio fork**: ESL subscribes to `CHANNEL_ANSWER` + `CHANNEL_HANGUP`. On CHANNEL_ANSWER: registers call in `ActiveCallRegistry`, calls `esl.audio_fork_start()` → FreeSWITCH connects WebSocket to `/media/{uuid}` for bidirectional 16kHz audio. On CHANNEL_HANGUP: calls `esl.audio_fork_stop()` + `cancel_call()` for cleanup. Streaming mode: LLM tokens streamed via `IncrementalJSONParser`, split into sentences by `SentenceSplitter`, each sentence synthesized by TTS in parallel (gRPC, HTTP, or WebSocket), resampled from 22050→16000 via `_resample_pcm()`, PCM audio paced through `TTSOutputBuffer` at steady 30ms frames (960B @ 16kHz). TTSOutputBuffer 无 TTS 数据时自动填充静音帧保活（silence_timeout=120s），与拨号计划 `silence_stream://-1` 双重保活。Barge-in: concurrent audio receive during AI speech with WebRTC VAD detection, ESL `uuid_break` to stop FreeSWITCH playback. Input audio smoothed through `JitterBuffer`, pre-VAD denoising via configurable denoiser (highpass/noisereduce/rnnoise). Endpoints: `GET /healthz`, `WS /media/{uuid}`. ASR/TTS gRPC streaming optional via feature flags (`CALLBOT_ASR_USE_GRPC`, `CALLBOT_TTS_USE_GRPC`). WebSocket streaming as third transport via `asr_ws_client.py` and `tts_ws_client.py`.
 
-**java-mcp-server** — Spring Boot 3.5 + Spring AI 1.1.6 stateless MCP server (WebMVC transport). Serves as the user center backend for orchestrator nodes ② and ③. Exposes two MCP tools: `user_identity_query` (phone + biz_type → user_id, phone_masked, id_card_last_four) and `user_credit_query` (user_id → credit_qualified, risk_level). Endpoint: `POST /mcp` on port 9090.
+**java-mcp-server** — Spring Boot 4.0 + Spring AI 2.0 stateless MCP server (WebMVC transport). Serves as the user center backend for orchestrator nodes ② and ③. Uses `@McpTool`/`@McpToolParam` annotations (from `spring-ai-mcp-annotations`) with `annotation-scanner` auto-detection, no manual `ToolCallbackProvider` bean needed. Exposes two MCP tools: `user_identity_query` (phone + biz_type → user_id, phone_masked, id_card_last_four) and `user_credit_query` (user_id → credit_qualified, risk_level). Endpoint: `POST /mcp` on port 9090.
 
 ### LangGraph 7-Node Pipeline
 
@@ -374,7 +374,7 @@ Full adaptive + corrective RAG inside `rag_retrieve_node`:
 - **ASR gRPC**: `CALLBOT_ASR_USE_GRPC` (default false), `CALLBOT_ASR_GRPC_TARGET` (default `127.0.0.1:50051`)
 - **TTS gRPC**: `CALLBOT_TTS_USE_GRPC` (default false), `CALLBOT_TTS_GRPC_TARGET` (default `127.0.0.1:50052`)
 - **uvloop**: enabled via Dockerfile CMD `--loop uvloop`, no config needed
-- **MCP Server**: `application.yaml` with `spring.ai.mcp.server.*` properties, STATELESS protocol, WebMVC transport, port 9090
+- **MCP Server**: `application.yaml` with `spring.ai.mcp.server.*` properties, STATELESS protocol, WebMVC transport, `annotation-scanner.enabled: true`, port 9090
 
 ### Key Orchestrator Modules
 
@@ -463,11 +463,11 @@ aiphone/
 │   ├── README.md        # Component docs
 │   └── tests/           # test suite + memory/
 ├── mcp-server/              # MCP servers (user center backend)
-│   └── java-mcp-server/ # Spring Boot 3.5 + Spring AI 1.1.6 stateless MCP server
+│   └── java-mcp-server/ # Spring Boot 4.0 + Spring AI 2.0 stateless MCP server
 │       ├── src/main/java/com/trans/mcp/
-│       │   ├── McpApplication.java     # Entry point + tool registration
+│       │   ├── McpApplication.java     # Entry point (annotation-scanner auto-registers tools)
 │       │   ├── model/                  # IdentityResult, CreditResult records
-│       │   └── service/                # UserService, CreditService (@Tool)
+│       │   └── service/                # UserService, CreditService (@McpTool + @McpToolParam)
 │       ├── src/test/java/              # McpApplicationTests
 │       ├── src/main/resources/
 │       │   └── application.yaml        # MCP server config (STATELESS, /mcp endpoint)
@@ -498,9 +498,9 @@ aiphone/
 - **PostgreSQL 17** with pgvector extension, schema `callbot`, 9 tables
 - **Redis** for hot memory, conversation history (langchain-redis), session state
 - **MinIO** for audio archiving (optional, disabled when `MINIO_ENDPOINT` empty)
-- **FreeSWITCH 1.10.12** compiled from source with mod_audio_fork + mod_event_socket (ESL)
-- **Java MCP Server** Spring Boot 3.5 + Spring AI 1.1.6, Java 25, Maven build
-- **GPU allocation**: ASR=GPU0 (agent-asr内置), TTS=GPU1 (agent-tts内置), LLM(Qwen3.5-9B)=GPU2(:8083)
+- **FreeSWITCH 1.11.0** compiled from source with mod_audio_fork + mod_event_socket (ESL)
+- **Java MCP Server** Spring Boot 4.0 + Spring AI 2.0, Java 21, Maven build, `@McpTool` annotation-driven tool registration
+- **GPU allocation**: ASR=GPU0 (agent-asr内置), TTS=GPU1 (agent-tts内置), LLM(Qwen3.5:4B)=GPU2(:8083)
 - **uvloop**: libuv C-based event loop replacing std asyncio in agent-flow (via `--loop uvloop`), reduces GC pauses under high concurrency
 - **gRPC**: ASR client-streaming (:50051), TTS unary (:50052), both optional feature-flagged alongside HTTP fallback
 - **WebSocket**: Third transport for ASR/TTS streaming (`ws_server.py` in agent-asr/agent-tts, `asr_ws_client.py`/`tts_ws_client.py` in agent-flow)

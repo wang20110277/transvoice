@@ -76,11 +76,11 @@ aiphone/
 │   ├── README.md           # 组件文档
 │   └── tests/              # test suite + memory/ (含 test_jitter_buffer, test_config, test_mcp_client 等)
 ├── mcp-server/             # MCP 服务器 (用户中心后端)
-│   └── java-mcp-server/    # Spring Boot + Spring AI stateless MCP server
+│   └── java-mcp-server/    # Spring Boot 4.0 + Spring AI 2.0 stateless MCP server
 │       ├── src/main/java/com/trans/mcp/
-│       │   ├── McpApplication.java     # 入口 + 工具注册
+│       │   ├── McpApplication.java     # 入口 (annotation-scanner 自动注册工具)
 │       │   ├── model/                  # IdentityResult, CreditResult
-│       │   └── service/                # UserService, CreditService (@Tool)
+│       │   └── service/                # UserService, CreditService (@McpTool + @McpToolParam)
 │       ├── src/test/java/              # McpApplicationTests
 │       ├── src/main/resources/
 │       │   └── application.yaml        # MCP 配置 (STATELESS, /mcp, :9090)
@@ -492,7 +492,7 @@ aiphone/
 - `agent-tts.service`（GPU1, agent-tts 含内置推理引擎）
 - `llm-engine.service`（GPU2, Qwen3.5-9B）
 - `orchestrator.service`（agent-flow FastAPI + WebSocket）
-- `mcp-server.service`（java-mcp-server Spring Boot, :9090）
+- `mcp-server.service`（java-mcp-server Spring Boot 4.0, :9090）
 - `postgresql.service` `redis.service` `minio.service`（如自建）
 
 关键要求：
@@ -915,7 +915,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 │   ├── alembic/       # 数据库迁移
 │   └── Dockerfile
 ├── mcp-server/
-│   └── java-mcp-server/  # 用户中心 MCP Server (Spring Boot, port 9090)
+│   └── java-mcp-server/  # 用户中心 MCP Server (Spring Boot 4.0 + Spring AI 2.0, port 9090)
 ├── scripts/               # 启动脚本
 │   ├── local.sh           # 本地开发 (conda)
 │   └── prod.sh            # 生产部署 (Docker Compose)
