@@ -291,9 +291,6 @@ Data flow per turn (event-driven, dynamic uuid_audio_fork):
 合成: 每句并行 TTS(gRPC/HTTP/WS) → WAV→PCM → _resample_pcm(22050→16000) → TTSOutputBuffer 稳态30ms帧(960B) → WebSocket → FreeSWITCH
 打断: 用户说话检测 → ESL uuid_break → 取消流式任务 → 新一轮对话
 挂断: ESL CHANNEL_HANGUP → audio_fork_stop → ActiveCallRegistry 取消 → 清理资源
-
-[同步模式] POST /call/text-turn 或 /call/audio-turn (非生产路径)
-呼入: HTTP 文本/音频 → agent-flow → ASR → LangGraph 7节点全量执行 → TTS → 返回
 ```
 
 ### Three Components
@@ -360,11 +357,20 @@ Full adaptive + corrective RAG inside `rag_retrieve_node`:
 - **Remote engines**: `VIBEVOICE_ASR_API_URL`, `VIBEVOICE_TTS_API_URL`
 - **RAG**: `CALLBOT_RAG_TOP_K` (default 3), `CALLBOT_RAG_SIMILARITY_THRESHOLD` (default 0.7), `CALLBOT_RAG_MAX_RETRIES` (default 2)
 - **ESL**: `CALLBOT_ESL_HOST`, `CALLBOT_ESL_PORT` (default 8021), `CALLBOT_ESL_PASSWORD`, `CALLBOT_HANDOFF_EXT` (default 1001)
-- **VAD**: `CALLBOT_VAD_AGGRESSIVENESS` (0-3), `CALLBOT_VAD_SILENCE_FRAMES` (default 15), `CALLBOT_VAD_MIN_AUDIO_BYTES` (default 6400)
-- **Barge-in**: `CALLBOT_BARGE_IN_MIN_AUDIO_BYTES` (default 3200, lower than VAD for faster reaction)
+- **VAD**: `CALLBOT_VAD_AGGRESSIVENESS` (0-3), `CALLBOT_VAD_SILENCE_FRAMES` (default 15), `CALLBOT_VAD_MIN_AUDIO_BYTES` (default 3200)
+- **Barge-in**: `CALLBOT_BARGE_IN_MIN_AUDIO_BYTES` (default 1600, lower than VAD for faster reaction)
 - **Media**: `CALLBOT_MEDIA_SAMPLE_RATE` (default 16000), 全链路 16kHz，帧大小 960B (30ms @ 16kHz 16-bit)，TTS 输出 22050Hz 经 `_resample_pcm()` 降采样到 16kHz，FreeSWITCH 内部下采样到 G.711 8kHz
 - **Jitter Buffer**: `CALLBOT_JITTER_TARGET_DEPTH` (default 3), `CALLBOT_JITTER_MAX_DEPTH` (default 10)
 - **Denoise**: `CALLBOT_DENOISE_ENABLED` (`""` disabled, `"highpass"`, `"noisereduce"`, `"rnnoise"`), `CALLBOT_DENOISE_HIGHPASS_CUTOFF` (default 200.0 Hz)
+- **Audio gain**: `CALLBOT_AUDIO_GAIN` (default 1.0, pre-ASR amplification for quiet SIP audio)
+- **ASR WebSocket**: `CALLBOT_ASR_USE_WS` (default false), `CALLBOT_ASR_WS_URL` (default `ws://127.0.0.1:8080/ws/asr/streaming-recognize`)
+- **TTS WebSocket**: `CALLBOT_TTS_USE_WS` (default false), `CALLBOT_TTS_WS_URL` (default `ws://127.0.0.1:8081/ws/tts/streaming-synthesize`)
+- **Streaming ASR**: `CALLBOT_ASR_STREAMING_ENABLED` (default false, engine-level streaming)
+- **Streaming TTS**: `CALLBOT_TTS_STREAMING_ENABLED` (default false, chunk-level streaming)
+- **TTS pre-buffer**: `CALLBOT_TTS_PREBUFFER_FRAMES` (default 0, accumulate N 30ms frames before playback)
+- **TTS skip**: `CALLBOT_TTS_SKIP` (default false, local testing without GPU)
+- **Sentence splitter**: `CALLBOT_SPLITTER_MIN_LENGTH` (default 2), `CALLBOT_SPLITTER_FLUSH_TIMEOUT` (default 0.2), `CALLBOT_SPLITTER_EAGER_FIRST` (default true)
+- **CosyVoice device**: `COSYVOICE_DEVICE` (engine-level, `cpu`/`mps`/`auto`, local.sh defaults to `cpu` on Mac to avoid MPS fallback overhead)
 - **ASR gRPC**: `CALLBOT_ASR_USE_GRPC` (default false), `CALLBOT_ASR_GRPC_TARGET` (default `127.0.0.1:50051`)
 - **TTS gRPC**: `CALLBOT_TTS_USE_GRPC` (default false), `CALLBOT_TTS_GRPC_TARGET` (default `127.0.0.1:50052`)
 - **uvloop**: enabled via Dockerfile CMD `--loop uvloop`, no config needed
@@ -374,7 +380,7 @@ Full adaptive + corrective RAG inside `rag_retrieve_node`:
 
 | Module | Role |
 |--------|------|
-| `main.py` | FastAPI app with lifespan init, ESL lifecycle, `POST /call/text-turn`, `POST /call/audio-turn`, `WS /ws/streaming-call`, `GET /healthz` |
+| `main.py` | FastAPI app with lifespan init, ESL lifecycle, `WS /media/{uuid}` (event-driven audio fork), `GET /healthz` |
 | `src/config.py` | pydantic-settings, all config via `CALLBOT_` env prefix |
 | `src/database.py` | SQLAlchemy 2.0 async engine + session factory |
 | `src/graph/flow.py` | LangGraph 7-node StateGraph pipeline + `run_pre_llm_phase` / `run_streaming_pipeline` for streaming mode |

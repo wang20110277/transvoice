@@ -53,7 +53,7 @@ aiphone/
 │   ├── README.md           # 组件文档
 │   └── tests/              # test_base, test_main, test_storage, engines/*/
 ├── agent-flow/     # LangGraph 7 节点编排 (FastAPI HTTP + WebSocket)
-│   ├── main.py             # FastAPI 入口: POST /call/text-turn, WS /ws/streaming-call, GET /healthz, ESL生命周期
+│   ├── main.py             # FastAPI 入口: WS /media/{uuid} (事件驱动 audio_fork), GET /healthz, ESL生命周期
 │   ├── src/                # 核心源码 (PYTHONPATH includes src/)
 │   │   ├── config.py       # pydantic-settings, CALLBOT_ 环境变量前缀 (含ESL/VAD/JitterBuffer/gRPC/Denoise配置)
 │   │   ├── database.py     # SQLAlchemy 2.0 async engine
@@ -170,7 +170,7 @@ aiphone/
 │  │  audio_buffer.extend(denoised)                                         │ │
 │  │       ↓                                                                │ │
 │  │  SimpleVAD.is_end_of_speech()  ← WebRTC VAD 端点检测                  │ │
-│  │       ↓ (静音 15帧 = 450ms → 判定说完)                                │ │
+│  │       ↓ (静音 N帧 → 判定说完, 默认15帧=450ms, 生产建议40帧=1200ms)    │ │
 │  │  ┌──────────────────────────────────────────┐                          │ │
 │  │  │ ASR 识别 (三种传输，优先级: WS > gRPC > HTTP)                      │ │
 │  │  │                                                │                    │ │
@@ -383,7 +383,7 @@ aiphone/
 - 在 modules.conf 中添加 `mod_audio_fork`
 
 ### 4.2 WebSocket 连接配置
-- vars.xml 中设置 `agent_flow_ws_url=ws://10.0.0.20:8000/ws/streaming-call`
+- vars.xml 中设置 `agent_flow_ws_url=ws://10.0.0.20:8000/media/{uuid}`
 - dialplan 中 `answer` + `park`，由 agent-flow ESL 事件驱动 `uuid_audio_fork` 动态控制
 
 监控要求：
@@ -414,13 +414,13 @@ aiphone/
 
 ---
 
-## 6. 三大业务TTS隔离详细参数表(音色、语速、音量、音调) [1]
+## 6. 三大业务TTS隔离详细参数表(音色、语速、语调) [1]
 
-| 业务 | voice_id | speed | volume | pitch | 说明 |
-|---|---|---:|---:|---:|---|
-| 客服 | cs_female_soft_01 | 0.95 | 0.0dB | 0 | 温柔慢速平稳女声 |
-| 催收 | col_male_serious_01 | 0.90 | +1.0dB | -1 | 严肃稳重有力男声 |
-| 营销 | mkt_female_lively_01 | 1.05 | 0.0dB | +1 | 热情轻快活力女声 |
+| 业务 | voice | speed | instruct | 说明 |
+|---|---|---:|---|---|
+| 客服 | default_female.wav | 1.0 | 温柔的客服语气 | 温柔平稳女声 |
+| 催收 | default_female.wav | 0.9 | 严肃的催收语气 | 严肃稳重女声 |
+| 营销 | default_female.wav | 1.1 | 活泼的营销语气 | 热情活力女声 |
 
 隔离验收点：
 - profile 配置文件、缓存目录、日志目录必须按 biz_type 分离；TTS 缓存 key 必含 `biz_type + tts_profile_version`。
@@ -439,7 +439,7 @@ aiphone/
 - ASR/TTS 为可插拔引擎，内置 GPU 推理（对客户无感）
 
 ### 7.2 必备模块与职责
-- `main.py`：FastAPI 入口，接收 WebSocket/HTTP 音频流或文本（POST /call/text-turn, WS /ws/streaming-call），ESL生命周期管理
+- `main.py`：FastAPI 入口，接收 WebSocket 双向音频流（`WS /media/{uuid}`），ESL生命周期管理（CHANNEL_ANSWER/HANGUP 事件驱动 uuid_audio_fork）
 - `graph/flow.py`：LangGraph 7 节点 StateGraph（强流程）+ `run_pre_llm_phase` / `run_streaming_pipeline` 流式管道
 - `clients/mcp.py`：MCP Client 调用 java-mcp-server（身份查询 + 征信查询）
 - `clients/esl.py`：ESL Client 调用 FreeSWITCH Event Socket（自动重连+心跳检测，挂断/转接/打断/事件订阅）
@@ -465,10 +465,7 @@ aiphone/
 
 ### 7.3 每轮对话处理流程（agent-flow 统一调度，对客户无感）
 
-**同步模式** (HTTP POST /call/text-turn, /call/audio-turn)：
-- agent-flow 执行完整 LangGraph 7 节点管道，返回结构化动作 + TTS 音频
-
-**流式模式** (WebSocket /ws/streaming-call，生产路径)：
+**流式模式** (WebSocket /media/{uuid}，生产路径，事件驱动)：
 - FreeSWITCH 通过 mod_audio_fork WebSocket 将用户音频流传至 agent-flow：
   1) JitterBuffer 平滑输入音频 → Denoiser 降噪 → WebRTC VAD 检测到用户说完 → 调用 agent-asr 识别（gRPC 流式或 HTTP）
   2) 落库 user turn（含置信度）
@@ -1012,8 +1009,8 @@ FreeSWITCH 拨号计划 `answer` + `park` 后，agent-flow 通过 ESL 订阅 CHA
 - [ ] uuid_audio_fork WebSocket 连接 agent-flow /media/{uuid} 正常
 
 ### Orchestrator
-- [ ] WebSocket /ws/streaming-call 双向音频流通
-- [ ] POST /call/text-turn 接收文本正常
+- [ ] WebSocket /media/{uuid} 双向音频流通 (事件驱动 audio_fork)
+- [ ] ESL CHANNEL_ANSWER 事件触发 uuid_audio_fork start
 - [ ] MCP Client 连接 java-mcp-server 成功
 - [ ] 身份查询工具 (`user_identity_query`) 正常返回
 - [ ] 征信查询工具 (`user_credit_query`) 正常返回 (仅 marketing)
@@ -1043,7 +1040,7 @@ FreeSWITCH 拨号计划 `answer` + `park` 后，agent-flow 通过 ESL 订阅 CHA
 |------|--------|--------|
 | FS | SIP 端口 | 5060 |
 | FS | RTP 范围 | 16384-32768 |
-| FS | WebSocket URL | ws://10.0.0.20:8000/ws/streaming-call |
+| FS | WebSocket URL | ws://agent-flow:8000/media/{uuid} (动态拼接) |
 | FS | Event Socket 端口 | 8021 |
 | ASR | 服务地址 | :8080 |
 | ASR | 模型路径 | MODEL_DIR=/opt/sensevoice/models/SenseVoiceSmall |
@@ -1057,9 +1054,12 @@ FreeSWITCH 拨号计划 `answer` + `park` 后，agent-flow 通过 ESL 订阅 CHA
 | Orchestrator | 降噪模式 | CALLBOT_DENOISE_ENABLED="" (highpass/noisereduce/rnnoise) |
 | Orchestrator | ASR gRPC | CALLBOT_ASR_USE_GRPC=false, CALLBOT_ASR_GRPC_TARGET=:50051 |
 | Orchestrator | TTS gRPC | CALLBOT_TTS_USE_GRPC=false, CALLBOT_TTS_GRPC_TARGET=:50052 |
-| Orchestrator | ASR WebSocket | asr_ws_client.py (第三传输) |
-| Orchestrator | TTS WebSocket | tts_ws_client.py (第三传输) |
+| Orchestrator | ASR WebSocket | CALLBOT_ASR_USE_WS=false, CALLBOT_ASR_WS_URL=ws://127.0.0.1:8080/ws/asr/streaming-recognize |
+| Orchestrator | TTS WebSocket | CALLBOT_TTS_USE_WS=false, CALLBOT_TTS_WS_URL=ws://127.0.0.1:8081/ws/tts/streaming-synthesize |
+| Orchestrator | Audio gain | CALLBOT_AUDIO_GAIN=1.0 (放大安静 SIP 音频) |
+| Orchestrator | TTS pre-buffer | CALLBOT_TTS_PREBUFFER_FRAMES=0 (预缓冲 N 帧) |
 | Orchestrator | 事件循环 | uvloop (Dockerfile --loop uvloop) |
+| TTS | CosyVoice device | COSYVOICE_DEVICE=auto (cpu/mps/auto, Mac本地建议cpu) |
 | MCP Server | 用户中心 | :9090 |
 | Redis | 地址 | 10.0.0.30:6379 |
 | PG | 地址 | 10.0.0.31:5432 |
@@ -1086,8 +1086,8 @@ FreeSWITCH 拨号计划 `answer` + `park` 后，agent-flow 通过 ESL 订阅 CHA
 
 ### 3. TTS 播放无声
 - 检查 agent-tts 服务状态（:8081）
-- 检查 GPU 可用性
 - 检查 CosyVoice 运行时环境（COSYVOICE_RUNTIME）
+- Mac 本地开发: COSYVOICE_DEVICE=cpu 避免 MPS fallback 开销（local.sh 已默认）
 - 检查 biz_type 对应的音色配置
 
 ### 4. 录音文件不存在
