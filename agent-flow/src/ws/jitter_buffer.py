@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 FRAME_DURATION_MS = 30
 SAMPLE_RATE = 16000
 FRAME_BYTES = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000) * 2  # 960 bytes
+SILENCE_FRAME = b'\x00' * FRAME_BYTES
 
 
 @dataclass
@@ -157,29 +158,44 @@ class TTSOutputBuffer:
 
     TTSOutputBuffer 将 PCM 拆帧后以 30ms 间隔匀速输出，消除突发-静默交替，
     同时保持句子间音频的连续性（前句末尾帧和后句首帧间无额外间隔）。
+
+    静音填充策略：write() 后 silence_timeout 秒内，buffer 空时发送静音帧
+    保持流连续。超时后停止静音，避免回合间持续发送导致回声累积触发误 barge-in。
     """
+
+    # write() 后静音填充持续时长
+    # 需覆盖打断 → ASR → LLM → 首句 TTS 的全链路延迟（可达 45s）
+    # 静音帧 RMS=0 不会触发 barge-in（阈值 300），可安全使用较长超时
+    _SILENCE_TIMEOUT = 120.0
 
     def __init__(
         self,
         send_fn: "Callable[[bytes], Awaitable[None]]",
         frame_size: int = FRAME_BYTES,
         frame_interval: float = FRAME_DURATION_MS / 1000.0,
+        prebuffer_frames: int = 0,
     ) -> None:
         """
         Args:
             send_fn: async 回调，每帧调用一次 (websocket.send_bytes)
-            frame_size: 单帧字节数 (默认 480 = 30ms @ 8kHz 16-bit)
+            frame_size: 单帧字节数 (默认 960 = 30ms @ 16kHz 16-bit)
             frame_interval: 帧发送间隔秒数 (默认 0.03 = 30ms)
+            prebuffer_frames: 预缓冲帧数，累积到阈值后才开始匀速发送
+                              0 = 不预缓冲（立即发送），10 = 300ms 延迟换取平滑
         """
         self._send_fn = send_fn
         self._frame_size = frame_size
         self._frame_interval = frame_interval
+        self._prebuffer_frames = prebuffer_frames
+        self._prebuffering = prebuffer_frames > 0
+        self._prebuffer_done = asyncio.Event()
         self._buffer: deque[bytes] = deque()
         self._partial: bytearray = bytearray()
         self._task: asyncio.Task | None = None
         self._cancel = asyncio.Event()
         self._data_ready = asyncio.Event()
         self._finished = False
+        self._last_write_time: float = 0.0
 
     @property
     def is_running(self) -> bool:
@@ -189,11 +205,16 @@ class TTSOutputBuffer:
         """写入 PCM 数据（拆帧入队，由发送任务匀速输出）。"""
         if self._task is not None and self._task.done():
             return  # 发送循环已退出，丢弃数据
+        self._last_write_time = time.monotonic()
         self._partial.extend(pcm)
         while len(self._partial) >= self._frame_size:
             frame = bytes(self._partial[:self._frame_size])
             self._partial = self._partial[self._frame_size:]
             self._buffer.append(frame)
+        # 预缓冲阈值达到 → 唤醒 _send_loop 开始播放
+        if self._prebuffering and len(self._buffer) >= self._prebuffer_frames:
+            self._prebuffering = False
+            self._prebuffer_done.set()
         self._data_ready.set()
 
     def finish(self) -> None:
@@ -201,8 +222,12 @@ class TTSOutputBuffer:
         if self._partial:
             self._buffer.append(bytes(self._partial))
             self._partial.clear()
-            self._data_ready.set()
         self._finished = True
+        # 预缓冲未满但已结束 → 立即开始播放已累积的帧
+        if self._prebuffering:
+            self._prebuffering = False
+            self._prebuffer_done.set()
+        self._data_ready.set()
 
     async def start(self) -> None:
         """启动匀速发送任务。"""
@@ -214,6 +239,8 @@ class TTSOutputBuffer:
     async def stop(self) -> None:
         """停止发送任务。"""
         self._cancel.set()
+        self._prebuffering = False
+        self._prebuffer_done.set()
         self._data_ready.set()  # 唤醒等待
         if self._task and not self._task.done():
             self._task.cancel()
@@ -239,12 +266,28 @@ class TTSOutputBuffer:
     async def _send_loop(self) -> None:
         """匀速发送循环：以 frame_interval 间隔逐帧调用 send_fn。
 
-        无数据时等待 _data_ready 事件唤醒，不发静音帧。
-        FreeSWITCH mod_audio_fork 的 dub_speech_frame 在 playout buffer 空时
-        自动向通话方发送静音，无需 agent-flow 侧填充。
+        预缓冲阶段: 累积到 prebuffer_frames 后才开始发送。
+        无 TTS 数据时发送静音帧，保持音频流连续，防止 FreeSWITCH playout buffer
+        在句间间隙耗尽导致可听到的间断。静音帧与 TTS 帧以相同 30ms 间隔发送，
+        确保句 N 末尾与句 N+1 开头之间无缝衔接。
         """
         frames_sent = 0
+        silence_sent = 0
         try:
+            # 预缓冲阶段: 等待累积足够帧数
+            if self._prebuffer_frames > 0:
+                while self._prebuffering and not self._cancel.is_set():
+                    self._prebuffer_done.clear()
+                    await self._prebuffer_done.wait()
+                    break
+                if self._cancel.is_set():
+                    return
+                buf_count = len(self._buffer)
+                logger.info(
+                    "TTSOutputBuffer pre-buffered %d frames (%dms), starting playback",
+                    buf_count, buf_count * FRAME_DURATION_MS,
+                )
+
             while not self._cancel.is_set():
                 if self._buffer:
                     frame = self._buffer.popleft()
@@ -259,11 +302,42 @@ class TTSOutputBuffer:
                     frames_sent += 1
                     await asyncio.sleep(self._frame_interval)
                 elif self._finished:
-                    logger.info("TTSOutputBuffer drained: %d audio frames sent", frames_sent)
+                    logger.info(
+                        "TTSOutputBuffer drained: %d audio frames, %d silence frames",
+                        frames_sent, silence_sent,
+                    )
                     return
                 else:
-                    # 等待数据写入，stop() 也会 set 此事件以唤醒退出
-                    self._data_ready.clear()
-                    await self._data_ready.wait()
+                    # Buffer 空但 TTS 未结束 — 判断是否应发静音帧
+                    elapsed = time.monotonic() - self._last_write_time
+                    within_silence_window = (
+                        self._last_write_time > 0
+                        and elapsed < self._SILENCE_TIMEOUT
+                    )
+                    if within_silence_window:
+                        # 句间间隙：发静音帧保持音频流连续
+                        self._data_ready.clear()
+                        try:
+                            await asyncio.wait_for(
+                                self._data_ready.wait(),
+                                timeout=self._frame_interval,
+                            )
+                        except asyncio.TimeoutError:
+                            pass
+                        if not self._buffer and not self._cancel.is_set() and not self._finished:
+                            try:
+                                await self._send_fn(SILENCE_FRAME)
+                            except Exception as e:
+                                logger.error("TTSOutputBuffer silence send error: %s", e)
+                                return
+                            silence_sent += 1
+                    else:
+                        # 回合间：无 TTS 数据超过超时阈值，停止静音填充
+                        # 避免持续发送导致 FreeSWITCH 音频路径活跃、回声触发误 barge-in
+                        self._data_ready.clear()
+                        await self._data_ready.wait()
         except asyncio.CancelledError:
-            logger.info("TTSOutputBuffer cancelled: %d audio frames sent", frames_sent)
+            logger.info(
+                "TTSOutputBuffer cancelled: %d audio frames, %d silence frames",
+                frames_sent, silence_sent,
+            )

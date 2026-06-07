@@ -141,9 +141,17 @@ class CosyVoiceTTSEngine(TTSEngine):
 
                 prompt_wav = self._voice_path(profile)
                 instruct_text = profile.get("instruct", "")
-                chunks = list(self._model.inference_instruct2(
-                    text, instruct_text, prompt_wav, stream=False, speed=profile["speed"],
-                ))
+
+                # GPU 推理放线程池，避免阻塞事件循环
+                # 不阻塞才能并发处理多个合成请求 + 响应 WebSocket ping/pong
+                loop = asyncio.get_event_loop()
+                chunks = await loop.run_in_executor(
+                    None,
+                    lambda: list(self._model.inference_instruct2(
+                        text, instruct_text, prompt_wav, stream=False,
+                        speed=profile["speed"],
+                    )),
+                )
 
                 buffer = io.BytesIO()
                 for chunk in chunks:

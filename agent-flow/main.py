@@ -165,6 +165,7 @@ async def lifespan(app: FastAPI):
         asr_ws_client=asr_ws,
         use_ws_streaming=settings.asr_use_ws,
         use_streaming_asr=settings.asr_streaming_enabled,
+        tts_prebuffer_frames=settings.tts_prebuffer_frames,
     )
 
     logger.info("=== Agent Orchestrator 启动 ===")

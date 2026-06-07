@@ -73,6 +73,7 @@ class ASRStream:
         self._stub = asr_pb2_grpc.ASRServiceStub(channel)
         self._queue: asyncio.Queue | None = None
         self._rpc = None
+        self._config_sent = False
 
     async def start(self) -> None:
         self._queue = asyncio.Queue()
@@ -95,7 +96,8 @@ class ASRStream:
         """Send an audio chunk. Call as frames arrive from JitterBuffer."""
         if self._queue is None:
             return
-        if self._queue.empty():
+        if not self._config_sent:
+            self._config_sent = True
             self._queue.put_nowait(asr_pb2.StreamingRecognizeRequest(
                 config=asr_pb2.RecognitionConfig(call_id=self._call_id),
             ))

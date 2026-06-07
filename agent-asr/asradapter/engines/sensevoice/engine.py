@@ -68,6 +68,8 @@ class SenseVoiceASREngine(ASREngine):
                 if torch.backends.mps.is_available():
                     torch.mps.empty_cache()
                 text = result[0]["text"] if result else ""
+                logger.info("SenseVoice raw result: %s (audio=%d bytes, lang=%s)",
+                            text, len(audio_stream), params.get("language", self._language))
                 # Strip SenseVoice special tokens: <|zh|>, <|EMO_UNKNOWN|>, <|Speech|>, <|woitn|>, etc.
                 text = re.sub(r'<\|[^|]*\|>', '', text).strip()
                 return ASRResult(text=text, confidence=0.95, is_final=True)

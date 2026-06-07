@@ -132,6 +132,10 @@ class ESLClient:
         """停止音频旁路。"""
         return await self.api(f"uuid_audio_fork {uuid} stop")
 
+    async def broadcast_silence(self, uuid: str) -> str:
+        """向通话播放无限静音流，保持拨号计划活跃（barge-in打断后重播）。"""
+        return await self.bgapi(f"uuid_broadcast {uuid} silence_stream://-1")
+
     async def get_var(self, uuid: str, var: str) -> str:
         """获取通道变量。"""
         return await self.api(f"uuid_getvar {uuid} {var}")

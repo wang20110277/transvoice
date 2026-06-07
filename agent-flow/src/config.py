@@ -79,6 +79,9 @@ class Settings(BaseSettings):
     denoise_enabled: str = ""
     denoise_highpass_cutoff: float = 200.0
 
+    # Audio gain (pre-ASR amplification for quiet SIP audio)
+    audio_gain: float = 1.0
+
     # TTS skip (local testing without GPU)
     tts_skip: bool = False
 
@@ -103,6 +106,10 @@ class Settings(BaseSettings):
 
     # Streaming TTS (chunk-level streaming, requires CosyVoice stream=True)
     tts_streaming_enabled: bool = False
+
+    # TTS pre-buffering: accumulate N 30ms frames before starting playback
+    # 0 = no pre-buffering, 10 = 300ms latency for smoother inter-sentence output
+    tts_prebuffer_frames: int = 0
 
     # Sentence splitter tuning (streaming optimization)
     splitter_min_length: int = 2

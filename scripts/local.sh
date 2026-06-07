@@ -10,6 +10,9 @@
 #   ./scripts/local.sh flow         # 仅启动 Flow
 #   ./scripts/local.sh fs asr tts   # 启动 FreeSWITCH + ASR + TTS
 #   ./scripts/local.sh stop         # 停止全部
+#   ./scripts/local.sh stop asr     # 仅停止 ASR
+#   ./scripts/local.sh stop flow    # 仅停止 Flow
+#   ./scripts/local.sh stop fs asr  # 停止 FreeSWITCH + ASR
 #   ./scripts/local.sh status       # 查看状态
 # ══════════════════════════════════════════════════
 
@@ -68,15 +71,92 @@ get_pid() {
   [[ -f "$pidfile" ]] && cat "$pidfile" || echo ""
 }
 
+# 按端口杀进程（解决 conda run 子进程不被 PID 杀死的问题）
+kill_by_port() {
+  local port=$1
+  local pids
+  pids=$(lsof -i :"$port" -t 2>/dev/null) || true
+  if [[ -n "$pids" ]]; then
+    echo "$pids" | xargs kill 2>/dev/null || true
+    # 等待进程退出
+    for i in $(seq 1 10); do
+      pids=$(lsof -i :"$port" -t 2>/dev/null) || true
+      [[ -z "$pids" ]] && return 0
+      sleep 0.5
+    done
+    # 强杀
+    echo "$pids" | xargs kill -9 2>/dev/null || true
+  fi
+}
+
+# ── 停止单个服务 ──
+
 stop_svc() {
   local svc=$1
-  local pid
-  pid=$(get_pid "$svc")
-  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-    info "停止 $svc (PID $pid) ..."
-    kill "$pid" 2>/dev/null || true
-  fi
-  rm -f "$PID_DIR/${svc}.pid"
+
+  case "$svc" in
+    fs)
+      if is_fs_running; then
+        info "停止 FreeSWITCH ..."
+        # 先尝试 fs_cli shutdown（优雅关闭）
+        "$HOME/freeswitch/bin/fs_cli" -H 127.0.0.1 -P 8021 -p ClueCon -x "shutdown" 2>/dev/null || true
+        sleep 1
+        # 如果还在运行，SIGTERM
+        if is_fs_running; then
+          pkill -f "freeswitch -nc" 2>/dev/null || true
+          sleep 2
+        fi
+        # 如果还在运行，SIGKILL
+        if is_fs_running; then
+          pkill -9 -f "freeswitch -nc" 2>/dev/null || true
+        fi
+      else
+        info "FreeSWITCH 未在运行"
+      fi
+      ;;
+    asr)
+      if is_running "$ASR_PORT"; then
+        info "停止 ASR ..."
+        kill_by_port "$ASR_PORT"
+        info "ASR 已停止"
+      else
+        info "ASR 未在运行"
+      fi
+      rm -f "$PID_DIR/asr.pid"
+      ;;
+    tts)
+      if is_running "$TTS_PORT"; then
+        info "停止 TTS ..."
+        kill_by_port "$TTS_PORT"
+        info "TTS 已停止"
+      else
+        info "TTS 未在运行"
+      fi
+      rm -f "$PID_DIR/tts.pid"
+      ;;
+    flow)
+      if is_running "$FLOW_PORT"; then
+        info "停止 agent-flow ..."
+        kill_by_port "$FLOW_PORT"
+        info "agent-flow 已停止"
+      else
+        info "agent-flow 未在运行"
+      fi
+      rm -f "$PID_DIR/flow.pid"
+      ;;
+    *)
+      error "未知服务: $svc (可选: fs, asr, tts, flow)"
+      ;;
+  esac
+}
+
+stop_all() {
+  info "停止所有服务 ..."
+  stop_svc flow
+  stop_svc tts
+  stop_svc asr
+  stop_svc fs
+  info "已停止"
 }
 
 # ── 启动函数 ──
@@ -139,8 +219,8 @@ start_tts() {
     return 0
   fi
 
-  # Mac: default auto (MPS+fallback); Linux: auto (CUDA or CPU)
-  local tts_device="${COSYVOICE_DEVICE:-auto}"
+  # Mac: cpu 避免 MPS fallback 开销；Linux: auto (CUDA or CPU)
+  local tts_device="${COSYVOICE_DEVICE:-cpu}"
 
   info "启动 TTS (CosyVoice, port $TTS_PORT, device=$tts_device) ..."
   conda run -n cosyvoice bash -c \
@@ -152,7 +232,7 @@ start_tts() {
         TTS_CACHE_DIR='$TTS_CACHE_DIR' \
         COSYVOICE_RUNTIME='$COSYVOICE_RUNTIME' \
         COSYVOICE_DEVICE='$tts_device' \
-        uvicorn main:app --host 0.0.0.0 --port $TTS_PORT \
+        uvicorn main:app --host 0.0.0.0 --port $TTS_PORT --ws-ping-interval 120 --ws-ping-timeout 180 \
         >> '$LOG_DIR/tts.log' 2>&1" &
   echo $! > "$PID_DIR/tts.pid"
   wait_http "TTS" "$TTS_PORT" 120
@@ -168,7 +248,7 @@ start_flow() {
   conda run -n agent-flow bash -c \
     "cd '$PROJECT_DIR/agent-flow' \
      && PYTHONPATH='$PROJECT_DIR/agent-flow:$PROJECT_DIR/agent-flow/src' \
-        uvicorn main:app --host 0.0.0.0 --port $FLOW_PORT \
+        uvicorn main:app --host 0.0.0.0 --port $FLOW_PORT --ws-ping-interval 86400 --ws-ping-timeout 86400 \
         >> '$LOG_DIR/flow.log' 2>&1" &
   echo $! > "$PID_DIR/flow.pid"
   wait_http "agent-flow" "$FLOW_PORT" 30
@@ -196,19 +276,8 @@ show_status() {
   echo ""
 }
 
-stop_all() {
-  info "停止所有服务 ..."
-  stop_svc asr
-  stop_svc tts
-  stop_svc flow
-  if is_fs_running; then
-    info "停止 FreeSWITCH ..."
-    pkill -f "freeswitch -nc" 2>/dev/null || true
-  fi
-  info "已停止"
-}
-
 # ── 参数解析 ──
+# 支持: stop asr | stop flow | stop (停全部) | stop fs asr
 SERVICES=()
 ACTION="start"
 
@@ -217,14 +286,17 @@ for arg in "$@"; do
     stop)    ACTION="stop" ;;
     status)  ACTION="status" ;;
     -h|--help)
-      echo "用法: $0 [fs|asr|tts|flow|stop|status]"
-      echo "  无参数   启动全部 (fs asr tts flow)"
-      echo "  fs       仅启动 FreeSWITCH"
-      echo "  asr      仅启动 ASR"
-      echo "  tts      仅启动 TTS"
-      echo "  flow     仅启动 agent-flow"
-      echo "  stop     停止全部"
-      echo "  status   查看状态"
+      echo "用法: $0 [stop] [fs|asr|tts|flow] ..."
+      echo "  (无参数)    启动全部 (fs asr tts flow)"
+      echo "  fs          仅启动 FreeSWITCH"
+      echo "  asr         仅启动 ASR"
+      echo "  tts         仅启动 TTS"
+      echo "  flow        仅启动 agent-flow"
+      echo "  stop        停止全部"
+      echo "  stop asr    仅停止 ASR"
+      echo "  stop flow   仅停止 agent-flow"
+      echo "  stop fs asr 停止 FreeSWITCH + ASR"
+      echo "  status      查看状态"
       exit 0 ;;
     *)       SERVICES+=("$arg") ;;
   esac
@@ -232,7 +304,15 @@ done
 
 # ── 执行 ──
 case "$ACTION" in
-  stop)   stop_all ;;
+  stop)
+    if [[ ${#SERVICES[@]} -eq 0 ]]; then
+      stop_all
+    else
+      for svc in "${SERVICES[@]}"; do
+        stop_svc "$svc"
+      done
+    fi
+    ;;
   status) show_status ;;
   start)
     info "══════════════════════════════════════"
