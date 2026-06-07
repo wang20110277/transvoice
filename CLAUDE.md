@@ -270,7 +270,7 @@ cd mcp-server/java-mcp-server && JAVA_HOME=/opt/homebrew/opt/openjdk ./mvnw spri
 
 ```
 SIP Caller → FreeSWITCH (mod_sofia, SIP/RTP)
-    ├─ Dialplan: set variables → answer → park
+    ├─ Dialplan: set variables → answer → playback silence_stream://-1 (无限静音保活)
     ├─ ESL CHANNEL_ANSWER → agent-flow uuid_audio_fork start → FS connects WebSocket to /media/{uuid}
     │   ├─ Node ①: agent-asr (:8080) 内置 GPU 推理 → 识别文本
     │   ├─ Node ②/③: MCP client → java-mcp-server (:9090) 用户中心
@@ -282,7 +282,7 @@ SIP Caller → FreeSWITCH (mod_sofia, SIP/RTP)
 Data flow per turn (event-driven, dynamic uuid_audio_fork):
 ```
 [事件驱动流程]
-来电: FreeSWITCH 拨号计划 answer → park → 触发 CHANNEL_ANSWER 事件
+来电: FreeSWITCH 拨号计划 answer → playback silence_stream://-1 → 触发 CHANNEL_ANSWER 事件
 注册: ESL handler 提取 uuid/biz_type/user_key → ActiveCallRegistry.register()
 启动: esl.audio_fork_start() → FS 连接 WebSocket /media/{uuid}
 音频: JitterBuffer → Denoiser降噪 → WebRTC VAD → ASR → 识别文本
@@ -299,7 +299,7 @@ Data flow per turn (event-driven, dynamic uuid_audio_fork):
 
 **agent-tts** — FastAPI + gRPC + WebSocket service with pluggable TTS engines and built-in GPU inference. Loads CosyVoice3 model directly in-process, no separate inference server needed. Receives text from orchestrator, synthesizes audio, uploads to MinIO. Disk cache keyed by voice+text hash, biz_type voice profiles. HTTP endpoints: `POST /tts/synthesize-binary` (binary audio response), `POST /tts/synthesize-json` (JSON with base64 audio + minio_key), `GET /healthz`. gRPC endpoint: `TTSService.Synthesize` (unary, port 50052). WebSocket endpoint: streaming text-to-speech via `ws_server.py`.
 
-**agent-flow** — FastAPI WebSocket service (uvloop event loop). **Event-driven audio fork**: ESL subscribes to `CHANNEL_ANSWER` + `CHANNEL_HANGUP`. On CHANNEL_ANSWER: registers call in `ActiveCallRegistry`, calls `esl.audio_fork_start()` → FreeSWITCH connects WebSocket to `/media/{uuid}` for bidirectional 16kHz audio. On CHANNEL_HANGUP: calls `esl.audio_fork_stop()` + `cancel_call()` for cleanup. Streaming mode: LLM tokens streamed via `IncrementalJSONParser`, split into sentences by `SentenceSplitter`, each sentence synthesized by TTS in parallel (gRPC, HTTP, or WebSocket), resampled from 22050→16000 via `_resample_pcm()`, PCM audio paced through `TTSOutputBuffer` at steady 30ms frames (960B @ 16kHz). Barge-in: concurrent audio receive during AI speech with WebRTC VAD detection, ESL `uuid_break` to stop FreeSWITCH playback. Input audio smoothed through `JitterBuffer`, pre-VAD denoising via configurable denoiser (highpass/noisereduce/rnnoise). Endpoints: `GET /healthz`, `WS /media/{uuid}`. ASR/TTS gRPC streaming optional via feature flags (`CALLBOT_ASR_USE_GRPC`, `CALLBOT_TTS_USE_GRPC`). WebSocket streaming as third transport via `asr_ws_client.py` and `tts_ws_client.py`.
+**agent-flow** — FastAPI WebSocket service (uvloop event loop). **Event-driven audio fork**: ESL subscribes to `CHANNEL_ANSWER` + `CHANNEL_HANGUP`. On CHANNEL_ANSWER: registers call in `ActiveCallRegistry`, calls `esl.audio_fork_start()` → FreeSWITCH connects WebSocket to `/media/{uuid}` for bidirectional 16kHz audio. On CHANNEL_HANGUP: calls `esl.audio_fork_stop()` + `cancel_call()` for cleanup. Streaming mode: LLM tokens streamed via `IncrementalJSONParser`, split into sentences by `SentenceSplitter`, each sentence synthesized by TTS in parallel (gRPC, HTTP, or WebSocket), resampled from 22050→16000 via `_resample_pcm()`, PCM audio paced through `TTSOutputBuffer` at steady 30ms frames (960B @ 16kHz). TTSOutputBuffer 无 TTS 数据时自动填充静音帧保活（silence_timeout=120s），与拨号计划 `silence_stream://-1` 双重保活。Barge-in: concurrent audio receive during AI speech with WebRTC VAD detection, ESL `uuid_break` to stop FreeSWITCH playback. Input audio smoothed through `JitterBuffer`, pre-VAD denoising via configurable denoiser (highpass/noisereduce/rnnoise). Endpoints: `GET /healthz`, `WS /media/{uuid}`. ASR/TTS gRPC streaming optional via feature flags (`CALLBOT_ASR_USE_GRPC`, `CALLBOT_TTS_USE_GRPC`). WebSocket streaming as third transport via `asr_ws_client.py` and `tts_ws_client.py`.
 
 **java-mcp-server** — Spring Boot 3.5 + Spring AI 1.1.6 stateless MCP server (WebMVC transport). Serves as the user center backend for orchestrator nodes ② and ③. Exposes two MCP tools: `user_identity_query` (phone + biz_type → user_id, phone_masked, id_card_last_four) and `user_credit_query` (user_id → credit_qualified, risk_level). Endpoint: `POST /mcp` on port 9090.
 
@@ -479,7 +479,7 @@ aiphone/
 │   ├── autoload_configs/    # modules.conf.xml (XML modules config)
 │   ├── sip_profiles/        # internal.xml (SIP profile)
 │   ├── event_socket.conf.xml  # ESL listener config
-│   ├── dialplan/public.xml    # Call routing: answer → park (event-driven audio_fork via ESL)
+│   ├── dialplan/public.xml    # Call routing: answer → playback silence_stream://-1 (无限静音保活, ESL 事件驱动 audio_fork)
 │   └── mrcp-plugin/          # UniMRCP 1.5.0 (MRCP/ASR fallback)
 ├── scripts/             # Startup scripts
 │   ├── local.sh         # Local dev (conda): asr/tts/flow, stop, status

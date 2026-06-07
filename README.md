@@ -3,7 +3,7 @@
 
 1. **接入层**：SIP User发起外呼通话，通话媒体流、通话唯一标识CallID、主叫/被叫用户手机号同步上行传输
 2. **语音交换层**：通话接入FreeSWITCH软交换，负责媒体流转发、通话事件调度、上下行语音流中转，全程携带CallID+手机号
-3. **WebSocket音频流层（事件驱动）**：FreeSWITCH拨号计划 `answer → park` 触发 CHANNEL_ANSWER 事件 → agent-flow ESL handler 调用 `uuid_audio_fork start` → FreeSWITCH建立与agent-flow的WebSocket双向音频流，**上行传输用户语音PCM流，下行接收TTS合成音频**，全程携带CallID与用户手机号。agent-flow运行在**uvloop事件循环**上（libuv C实现），减少高并发下GC停顿
+3. **WebSocket音频流层（事件驱动）**：FreeSWITCH拨号计划 `answer → playback silence_stream://-1`（无限静音保活）触发 CHANNEL_ANSWER 事件 → agent-flow ESL handler 调用 `uuid_audio_fork start` → FreeSWITCH建立与agent-flow的WebSocket双向音频流，**上行传输用户语音PCM流，下行接收TTS合成音频**，全程携带CallID与用户手机号。agent-flow运行在**uvloop事件循环**上（libuv C实现），减少高并发下GC停顿
 4. **语音识别层**：agent-flow首节点调用agent-asr（内置GPU推理引擎），完成语音转文字，生成**同时携带CallID与用户手机号**的ASR识别文本。支持**三种传输协议**：HTTP（默认）、gRPC client-streaming（`CALLBOT_ASR_USE_GRPC`开关）、WebSocket streaming（`asr_ws_client.py`），边收边传减少传输延迟
 5. **LangGraph第一业务节点（用户身份核验）**
 编排引擎内置MCP Client，通过HTTP Streamable传输协议调用java-mcp-server用户中心MCP服务，**传入用户手机号**调用`user_identity_query`工具；查询获取用户ID、脱敏手机号、身份证后四位，流程全程保留State内ASR文本、CallID、手机号
@@ -92,7 +92,7 @@ aiphone/
 │   ├── autoload_configs/   # modules.conf.xml (XML 模块配置)
 │   ├── sip_profiles/       # internal.xml (SIP profile)
 │   ├── event_socket.conf.xml  # ESL 监听配置
-│   ├── dialplan/public.xml    # 拨号计划 (answer + park, ESL 事件驱动)
+│   ├── dialplan/public.xml    # 拨号计划 (answer + playback silence_stream://-1, ESL 事件驱动)
 │   └── mrcp-plugin/          # UniMRCP 1.5.0 (MRCP/ASR 备选)
 ├── scripts/                # 启动脚本
 │   ├── local.sh            # 本地开发 (conda): asr/tts/flow, stop, status
@@ -139,7 +139,7 @@ aiphone/
 │  FreeSWITCH                                                                 │
 │  dialplan/public.xml                                                        │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │ 来电 → set biz_type → set user_key(cond) → answer → park           │   │
+│  │ 来电 → set biz_type → set user_key(cond) → answer → playback silence_stream://-1 │   │
 │  │          ↓ CHANNEL_ANSWER 事件                                       │   │
 │  └──────────────────────────────────────────────────────────────────────┘   │
 │       │ ESL Event Socket (:8021)                                            │
@@ -384,7 +384,7 @@ aiphone/
 
 ### 4.2 WebSocket 连接配置
 - vars.xml 中设置 `agent_flow_ws_url=ws://10.0.0.20:8000/media/{uuid}`
-- dialplan 中 `answer` + `park`，由 agent-flow ESL 事件驱动 `uuid_audio_fork` 动态控制
+- dialplan 中 `answer` + `playback silence_stream://-1`（无限静音保活），由 agent-flow ESL 事件驱动 `uuid_audio_fork` 动态控制
 
 监控要求：
 - WebSocket 连接状态探测
@@ -408,7 +408,7 @@ aiphone/
 2) 开启录音（分轨/混音），路径按 biz_type 强隔离
 3) 设置 channel variables（贯穿 Orchestrator / 录音 / 审计）：
    - `biz_type, task_id, call_id, core_user_id, phone_hash_salted, user_key`
-4) `answer` + `park` 保持通话，agent-flow 通过 ESL `uuid_audio_fork` 动态控制音频分流：
+4) `answer` + `playback silence_stream://-1` 保持通话（无限静音保活），agent-flow 通过 ESL `uuid_audio_fork` 动态控制音频分流：
    - CHANNEL_ANSWER 事件 → agent-flow 注册通话 → `uuid_audio_fork start ws://...mono 16000`
    - CHANNEL_HANGUP 事件 → `uuid_audio_fork stop` → 清理资源
 
@@ -942,7 +942,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 
 3. **dialplan/public.xml** - 业务路由
    - 业务变量设置 (biz_type, user_key)
-   - answer + park 保持通话，由 agent-flow ESL 事件驱动 uuid_audio_fork
+   - answer + playback silence_stream://-1 保持通话，由 agent-flow ESL 事件驱动 uuid_audio_fork
    - 转人工：loopback/1001
 
 ### 阶段 3: 应用服务
@@ -972,7 +972,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 ```
 用户来电
     │
-    └─→ FreeSWITCH (mod_sofia) → dialplan(set变量 → answer → park) → CHANNEL_ANSWER 事件
+    └─→ FreeSWITCH (mod_sofia) → dialplan(set变量 → answer → playback silence_stream://-1) → CHANNEL_ANSWER 事件
             │
             ├─→ ESL Event Socket (:8021) ←── agent-flow
             │       │
@@ -997,7 +997,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
                     └─→ TTS 音频 ──→ TTSOutputBuffer ──→ WebSocket 回传 FreeSWITCH ──→ 播放给用户
 ```
 
-FreeSWITCH 拨号计划 `answer` + `park` 后，agent-flow 通过 ESL 订阅 CHANNEL_ANSWER 事件，动态调用 `uuid_audio_fork` 启动 WebSocket 双向音频流。agent-flow 统一调度 ASR → 流式决策 → 句级 TTS 全链路。ESL Event Socket 实现接通/挂断/打断/转接全生命周期控制。
+FreeSWITCH 拨号计划 `answer` + `playback silence_stream://-1`（无限静音保活）后，agent-flow 通过 ESL 订阅 CHANNEL_ANSWER 事件，动态调用 `uuid_audio_fork` 启动 WebSocket 双向音频流。agent-flow 统一调度 ASR → 流式决策 → 句级 TTS 全链路。ESL Event Socket 实现接通/挂断/打断/转接全生命周期控制。
 
 ## 验收要点
 
