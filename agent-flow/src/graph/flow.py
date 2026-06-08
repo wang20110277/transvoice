@@ -12,7 +12,6 @@
         └── run_streaming_pipeline()  ← Phase 2: LLM 流式 → SentenceSplitter → 句级 TTS
 """
 import asyncio
-import base64
 import logging
 import os
 import time
@@ -24,13 +23,12 @@ import numpy as np
 
 from langchain_core.messages import BaseMessage
 
-from llm.service import LLMAction, FALLBACK_ACTION_TEXT, get_llm_service
+from llm.service import LLMAction, get_llm_service
 from llm.sentence_splitter import Sentence
 from config import settings
 from rag.retriever import retrieve_scripts, build_rag_block, should_retrieve, grade_documents, rewrite_query
 from graph.prompt import build_messages
 from memory.assembler import MemoryAssembler
-from memory.chat_history import get_chat_history, save_turn
 from clients.mcp import MCPClient
 from clients.tts import TTSClient
 from clients.asr import ASRClient
@@ -92,16 +90,10 @@ class CallGraphState(TypedDict, total=False):
     user_key: str
     user_input: str
     audio_bytes: bytes | None
-    asr_minio_key: str | None
     identity: dict | None
     credit_result: dict | None
     memory_block: str
     rag_block: str
-    rag_retry_count: int
-    rag_query: str
-    llm_action: LLMAction | None
-    tts_minio_key: str | None
-    tts_audio: str | None
     chat_history: list[BaseMessage]
 
 
@@ -194,12 +186,11 @@ async def _asr_node(state: CallGraphState) -> dict:
             user_input = ""
     else:
         user_input = state.get("user_input", "")
-        asr_minio_key = state.get("asr_minio_key")
 
     # TODO: re-enable after fixing RedisSearch (FT._LIST)
     chat_history: list = []
 
-    return {"user_input": user_input, "asr_minio_key": asr_minio_key, "chat_history": chat_history}
+    return {"user_input": user_input, "chat_history": chat_history}
 
 
 async def _mcp_identity_node(state: CallGraphState) -> dict:
@@ -317,14 +308,10 @@ async def run_pre_llm_phase(
         "user_key": user_key,
         "user_input": "",
         "audio_bytes": audio_bytes,
-        "asr_minio_key": None,
         "identity": None,
         "credit_result": None,
         "memory_block": "",
         "rag_block": "",
-        "llm_action": None,
-        "tts_minio_key": None,
-        "tts_audio": None,
         "chat_history": [],
     }
 

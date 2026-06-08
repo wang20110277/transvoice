@@ -3,11 +3,13 @@ import asyncio
 import json
 import logging
 import time
-import numpy as np
 from typing import TYPE_CHECKING
+
+import numpy as np
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from config import settings as _settings
 from ws.vad import BaseVAD, SimpleVAD
 from ws.jitter_buffer import JitterBuffer, TTSOutputBuffer
 from ws.registry import ActiveCallRegistry
@@ -122,7 +124,6 @@ class StreamingCallHandler:
         # Streaming ASR partial text tracking
         asr_partial_text = ""
         # Audio gain (amplify quiet SIP audio before ASR)
-        from config import settings as _settings
         _gain = _settings.audio_gain
 
         try:
@@ -206,16 +207,6 @@ class StreamingCallHandler:
 
                 if "bytes" in data and data["bytes"]:
                     frame = data["bytes"]
-                    # Debug: raw frame amplitude (first 10 frames only)
-                    if not hasattr(self, '_raw_frame_count'):
-                        self._raw_frame_count = 0
-                    if self._raw_frame_count < 10 and len(frame) >= 2:
-                        import numpy as _np2
-                        _s = _np2.frombuffer(frame, dtype=_np2.int16).astype(_np2.float32)
-                        logger.info("[%s] raw WS frame #%d: %d bytes, min=%.0f max=%.0f rms=%.1f",
-                                    call_id, self._raw_frame_count, len(frame),
-                                    _s.min(), _s.max(), _np2.sqrt(_np2.mean(_s**2)))
-                        self._raw_frame_count += 1
                     jitter.insert(frame)
 
                     # Drain jitter buffer into VAD
