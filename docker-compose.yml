@@ -65,20 +65,6 @@ services:
       timeout: 5s
       retries: 5
 
-  # ──────────────────────────────────────────────
-  # MCP Server (Spring Boot, 用户中心)
-  # jar 由 dev.sh 构建后挂载进容器
-  # ──────────────────────────────────────────────
-  mcp:
-    image: eclipse-temurin:25-jre
-    container_name: callbot-mcp
-    restart: unless-stopped
-    ports:
-      - "${MCP_PORT:-9090}:9090"
-    volumes:
-      - ./mcp-server/java-mcp-server/target/mcp-server-0.0.1-SNAPSHOT.jar:/app/app.jar:ro
-    command: ["java", "-jar", "/app/app.jar"]
-
 volumes:
   pgdata:
   redisdata:

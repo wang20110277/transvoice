@@ -32,3 +32,13 @@ services:
       CALLBOT_LLM_MODEL: ${VLLM_SERVED_NAME:-qwen3.5:9b}
       CALLBOT_LLM_DEVICE: gpu
       CALLBOT_MCP_SERVER_URL: ${CALLBOT_MCP_SERVER_URL:-http://mcp-server:9090/mcp/}
+  
+  agent-mcp:
+    image: eclipse-temurin:21-jre
+    container_name: callbot-mcp
+    restart: unless-stopped
+    ports:
+      - "${MCP_PORT:-9090}:9090"
+    volumes:
+      - ./mcp-server/java-mcp-server/target/mcp-server-0.0.1-SNAPSHOT.jar:/app/app.jar:ro
+    command: ["java", "-jar", "/app/app.jar"]
