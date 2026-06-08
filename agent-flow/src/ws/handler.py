@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from ws.vad import SimpleVAD
+from ws.vad import BaseVAD, SimpleVAD
 from ws.jitter_buffer import JitterBuffer, TTSOutputBuffer
 from ws.registry import ActiveCallRegistry
 from ws.denoise import BaseDenoiser, PassThroughDenoiser
@@ -31,26 +31,18 @@ class CallWebSocketHandler:
         turn_fn,
         esl: "ESLClient | None" = None,
         handoff_extension: str = "1001",
-        vad_aggressiveness: int = 3,
-        vad_silence_frames: int = 15,
-        vad_min_audio_bytes: int = 3200,
+        vad_factory: "callable | None" = None,
     ) -> None:
         self._turn_fn = turn_fn
         self._esl = esl
         self._handoff_extension = handoff_extension
-        self._vad_aggressiveness = vad_aggressiveness
-        self._vad_silence_frames = vad_silence_frames
-        self._vad_min_audio_bytes = vad_min_audio_bytes
+        self._vad_factory = vad_factory
 
     async def handle(self, websocket: WebSocket, call_id: str, biz_type: str, user_key: str) -> None:
         await websocket.accept()
         logger.info("[%s] WS call connected biz_type=%s user_key=%s", call_id, biz_type, user_key)
 
-        vad = SimpleVAD(
-            aggressiveness=self._vad_aggressiveness,
-            silence_frames=self._vad_silence_frames,
-            min_audio_bytes=self._vad_min_audio_bytes,
-        )
+        vad = self._vad_factory() if self._vad_factory else SimpleVAD()
         audio_buffer = bytearray()
         turn_count = 0
 
@@ -166,9 +158,7 @@ class StreamingCallHandler:
         esl: "ESLClient | None" = None,
         handoff_extension: str = "1001",
         registry: ActiveCallRegistry | None = None,
-        vad_aggressiveness: int = 3,
-        vad_silence_frames: int = 15,
-        vad_min_audio_bytes: int = 3200,
+        vad_factory: "callable | None" = None,
         barge_in_min_audio_bytes: int = 1600,
         jitter_target_depth: int = 3,
         jitter_max_depth: int = 10,
@@ -185,9 +175,7 @@ class StreamingCallHandler:
         self._esl = esl
         self._handoff_extension = handoff_extension
         self._registry = registry
-        self._vad_aggressiveness = vad_aggressiveness
-        self._vad_silence_frames = vad_silence_frames
-        self._vad_min_audio_bytes = vad_min_audio_bytes
+        self._vad_factory = vad_factory
         self._barge_in_min_audio_bytes = barge_in_min_audio_bytes
         self._jitter_target_depth = jitter_target_depth
         self._jitter_max_depth = jitter_max_depth
@@ -221,11 +209,7 @@ class StreamingCallHandler:
             if not active_call:
                 active_call = self._registry.register(call_id, biz_type, user_key)
 
-        vad = SimpleVAD(
-            aggressiveness=self._vad_aggressiveness,
-            silence_frames=self._vad_silence_frames,
-            min_audio_bytes=self._vad_min_audio_bytes,
-        )
+        vad = self._vad_factory() if self._vad_factory else SimpleVAD()
         jitter = JitterBuffer(
             target_depth=self._jitter_target_depth,
             max_depth=self._jitter_max_depth,
@@ -491,7 +475,7 @@ class StreamingCallHandler:
         self,
         websocket: WebSocket,
         call_id: str,
-        vad: SimpleVAD,
+        vad: BaseVAD,
         jitter: JitterBuffer,
         audio_buffer: bytearray,
         streaming_task: asyncio.Task,
@@ -584,7 +568,7 @@ class StreamingCallHandler:
 
         return False
 
-    def _is_speech_frame(self, frame: bytes, vad: SimpleVAD) -> bool:
+    def _is_speech_frame(self, frame: bytes, vad: BaseVAD) -> bool:
         """Quick check if a frame contains speech. Used for barge-in detection."""
         return vad.is_speech(frame) if len(frame) >= 320 else False
 

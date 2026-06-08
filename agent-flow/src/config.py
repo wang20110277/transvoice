@@ -63,9 +63,18 @@ class Settings(BaseSettings):
     # Audio temp
     temp_dir: str = "/tmp/aiphone_tts"
 
-    # VAD (WebRTC)
+    # VAD engine: "webrtc" (default) or "silero" (neural network, higher accuracy)
+    vad_type: str = "webrtc"
+
+    # VAD — WebRTC params
     vad_aggressiveness: int = 3
     vad_silence_frames: int = 15
+
+    # VAD — Silero params
+    vad_silero_threshold: float = 0.5
+    vad_silero_min_silence_ms: int = 200
+
+    # VAD — common
     vad_min_audio_bytes: int = 3200
 
     # Barge-in

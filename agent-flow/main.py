@@ -21,6 +21,7 @@ from src.clients.asr import ASRClient
 from src.clients.esl import ESLClient
 from src.ws.registry import ActiveCallRegistry
 from src.ws.denoise import create_denoiser
+from src.ws.vad import create_vad
 from src.clients.asr_grpc_client import ASRGrpcClient
 from src.clients.tts_grpc_client import TTSGrpcClient
 from src.clients.asr_ws_client import ASRWebSocketClient
@@ -147,15 +148,15 @@ async def lifespan(app: FastAPI):
 
     from src.ws.handler import StreamingCallHandler
     denoiser = create_denoiser()
+    vad_factory = lambda: create_vad(settings)
+    logger.info("VAD engine: %s", settings.vad_type)
     _streaming_handler = StreamingCallHandler(
         pre_llm_fn=run_pre_llm_phase,
         streaming_fn=run_streaming_pipeline,
         esl=esl,
         handoff_extension=settings.handoff_extension,
         registry=_call_registry,
-        vad_aggressiveness=settings.vad_aggressiveness,
-        vad_silence_frames=settings.vad_silence_frames,
-        vad_min_audio_bytes=settings.vad_min_audio_bytes,
+        vad_factory=vad_factory,
         barge_in_min_audio_bytes=settings.barge_in_min_audio_bytes,
         jitter_target_depth=settings.jitter_target_depth,
         jitter_max_depth=settings.jitter_max_depth,

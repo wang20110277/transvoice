@@ -37,6 +37,7 @@ websockets>=12.0
 
 # VAD
 webrtcvad>=2.0.10
+silero-vad>=5.1.0
 scipy>=1.12.0
 
 # Denoise
