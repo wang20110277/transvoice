@@ -12,7 +12,7 @@
 7. **LangGraph第三业务节点（LLM智能应答 + TTS语音合成）**
 **从LangGraph全局State中提取完整ASR用户识别文本、CallID、用户手机号、用户ID**，统一送入LLM大模型；LLM解析用户语音文本语义，结合用户手机号绑定的历史用户数据，自主判定是否调取RAG知识库匹配业务标准话术，最终生成标准化外呼应答话术文本；**流式模式下LLM逐token输出，通过IncrementalJSONParser解析、SentenceSplitter切分为完整句子，每句并行调用agent-tts（内置GPU推理引擎，支持gRPC unary和WebSocket streaming调用）合成语音音频，PCM音频经TTSOutputBuffer以稳态30ms帧率通过WebSocket回传FreeSWITCH**，归档至MinIO；依托LangChain Memory记忆体系做分层数据存储：Redis存储短期会话记忆、PostgreSQL(PG)存储长期业务会话数据，同步记录实时对话内容、语音文件存储路径、绑定手机号与CallID关联关系，支持客户二次呼入时通过**用户ID/手机号/CallID**双维度调取全量历史会话数据，结合历史对话信息生成连贯应答话术
 8. **终端播放层**：agent-flow通过WebSocket将TTS音频回传FreeSWITCH，FreeSWITCH下行推送至SIP User通话终端，完成整通智能外呼语音交互闭环
-9. **打断与挂断控制层**：用户在AI说话过程中开口时，WebRTC VAD实时检测语音，ESL uuid_break停止FreeSWITCH当前播放，取消流式任务，开启新一轮对话；ESL订阅CHANNEL_ANSWER（自动触发uuid_audio_fork start开启音频流）和CHANNEL_HANGUP事件（uuid_audio_fork stop关闭音频流，通过ActiveCallRegistry取消活跃通话并清理资源）
+9. **打断与挂断控制层**：用户在AI说话过程中开口时，可插拔 VAD（WebRTC/Silero）实时检测语音，ESL uuid_break停止FreeSWITCH当前播放，取消流式任务，开启新一轮对话；ESL订阅CHANNEL_ANSWER（自动触发uuid_audio_fork start开启音频流）和CHANNEL_HANGUP事件（uuid_audio_fork stop关闭音频流，通过ActiveCallRegistry取消活跃通话并清理资源）
 
 ## 统一绘图强制规范
 1. 整体布局：数据流从左至右分层排布，层级从上至下划分清晰
@@ -43,7 +43,7 @@ aiphone/
 │   └── tests/              # test_base, test_main, test_storage, engines/*/
 ├── agent-tts/              # TTS 服务 (FastAPI + gRPC + WebSocket, 内置 GPU 推理)
 │   ├── ttsadapter/         # 服务核心: main.py, base.py, config.py, requirements.txt
-│   │   ├── engines/        # cosyvoice/ (CosyVoice3 GPU), vibevoice/ (远程 HTTP)
+│   │   ├── engines/        # cosyvoice/ (CosyVoice3 GPU), edgetts/ (Edge 在线, 无需 GPU), vibevoice/ (远程 HTTP)
 │   │   ├── grpc_server.py  # gRPC TTS 服务 (unary, :50052)
 │   │   ├── ws_server.py    # WebSocket TTS 服务 (流式合成)
 │   │   └── proto/          # tts.proto + 生成代码 (tts_pb2, tts_pb2_grpc)
@@ -60,7 +60,7 @@ aiphone/
 │   │   ├── clients/        # mcp.py (用户中心), tts.py (TTS), asr.py (ASR), esl.py (Event Socket, 自动重连+心跳)
 │   │   │                    # tts_grpc_client.py, asr_grpc_client.py, asr_grpc/, tts_grpc/ (gRPC proto)
 │   │   │                    # tts_ws_client.py, asr_ws_client.py (WebSocket 第三传输)
-│   │   ├── ws/             # handler.py (同步+流式), vad.py (WebRTC VAD), jitter_buffer.py,
+│   │   ├── ws/             # handler.py (同步+流式), vad.py (可插拔 VAD: WebRTC/Silero), jitter_buffer.py,
 │   │   │                    # registry.py (ActiveCallRegistry), denoise.py (前置降噪)
 │   │   ├── graph/          # flow.py (7 节点 StateGraph + 流式管道), prompt.py, prompts/{biz_type}.yaml
 │   │   ├── llm/            # service.py, json_stream.py (增量JSON), sentence_splitter.py (句级切分)
@@ -75,7 +75,7 @@ aiphone/
 │   ├── Dockerfile          # 应用镜像 (含 alembic 自动迁移)
 │   ├── README.md           # 组件文档
 │   └── tests/              # test suite + memory/ (含 test_jitter_buffer, test_config, test_mcp_client 等)
-├── mcp-server/             # MCP 服务器 (用户中心后端)
+├── agent-mcp/               # MCP 服务器 (用户中心后端)
 │   └── java-mcp-server/    # Spring Boot 4.0 + Spring AI 2.0 stateless MCP server
 │       ├── src/main/java/com/trans/mcp/
 │       │   ├── McpApplication.java     # 入口 (annotation-scanner 自动注册工具)
@@ -92,7 +92,7 @@ aiphone/
 │   ├── autoload_configs/   # modules.conf.xml (XML 模块配置)
 │   ├── sip_profiles/       # internal.xml (SIP profile)
 │   ├── event_socket.conf.xml  # ESL 监听配置
-│   ├── dialplan/public.xml    # 拨号计划 (answer + playback silence_stream://-1, ESL 事件驱动)
+│   ├── dialplan/public/       # 拨号计划: 00_biz_type.xml (answer + playback silence_stream://-1, ESL 事件驱动)
 │   └── mrcp-plugin/          # UniMRCP 1.5.0 (MRCP/ASR 备选)
 ├── scripts/                # 启动脚本
 │   ├── local.sh            # 本地开发 (conda): asr/tts/flow, stop, status
@@ -113,7 +113,7 @@ aiphone/
 3. `config.yaml` 按名称选择活跃引擎
 4. `config.py` 通过 `importlib.import_module` 动态加载
 
-当前引擎: SenseVoice (ASR, 内置 FunASR GPU 推理), Streaming (ASR, WebSocket 流式), VibeVoice (ASR, 远程 HTTP), CosyVoice (TTS, 内置 CosyVoice3 GPU 推理), VibeVoice (TTS, 远程 HTTP)
+当前引擎: SenseVoice (ASR, 内置 FunASM GPU 推理), Streaming (ASR, WebSocket 流式), VibeVoice (ASR, 远程 HTTP), CosyVoice (TTS, 内置 CosyVoice3 GPU 推理), EdgeTTS (TTS, 微软 Edge 在线, 无需 GPU), VibeVoice (TTS, 远程 HTTP)
 
 ### LangGraph 7 节点流水线
 
@@ -129,7 +129,7 @@ aiphone/
 
 **并行扇出**: ② mcp_identity、④ recall_memory、⑤ rag_retrieve 在 ① receive_asr 之后并发执行。
 
-**流式模式** (WebSocket 生产路径): `run_pre_llm_phase()` 执行 ① + 并行扇出，`run_streaming_pipeline()` 流式输出 LLM token → `IncrementalJSONParser` → `SentenceSplitter` → 每句并行 TTS → `TTSOutputBuffer` 稳态30ms帧回传 FreeSWITCH。支持 **Barge-in 打断**：用户说话时 WebRTC VAD 检测 → ESL uuid_break 停止播放 → 取消流式任务。
+**流式模式** (WebSocket 生产路径): `run_pre_llm_phase()` 执行 ① + 并行扇出，`run_streaming_pipeline()` 流式输出 LLM token → `IncrementalJSONParser` → `SentenceSplitter` → 每句并行 TTS → `TTSOutputBuffer` 稳态30ms帧回传 FreeSWITCH。支持 **Barge-in 打断**：用户说话时 VAD（WebRTC/Silero）检测 → ESL uuid_break 停止播放 → 取消流式任务。
 
 
 ## 全链路数据流（事件驱动 uuid_audio_fork）
@@ -137,7 +137,7 @@ aiphone/
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │  FreeSWITCH                                                                 │
-│  dialplan/public.xml                                                        │
+│  dialplan/public/00_biz_type.xml                                            │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
 │  │ 来电 → set biz_type → set user_key(cond) → answer → playback silence_stream://-1 │   │
 │  │          ↓ CHANNEL_ANSWER 事件                                       │   │
@@ -169,7 +169,7 @@ aiphone/
 │  │       ↓                                                                │ │
 │  │  audio_buffer.extend(denoised)                                         │ │
 │  │       ↓                                                                │ │
-│  │  SimpleVAD.is_end_of_speech()  ← WebRTC VAD 端点检测                  │ │
+│  │  VAD.is_end_of_speech()  ← 可插拔 VAD 端点检测 (WebRTC/Silero)       │ │
 │  │       ↓ (静音 N帧 → 判定说完, 默认15帧=450ms, 生产建议40帧=1200ms)    │ │
 │  │  ┌──────────────────────────────────────────┐                          │ │
 │  │  │ ASR 识别 (三种传输，优先级: WS > gRPC > HTTP)                      │ │
@@ -255,7 +255,7 @@ aiphone/
 **媒体流（WebSocket 双向音频）**
 - 被叫用户 ⇄ FreeSWITCH（SIP/RTP）
 - FreeSWITCH（`mod_audio_fork`）⇄ agent-flow（WebSocket :8000, uvloop）
-  - 上行：用户语音 PCM → JitterBuffer → Denoiser降噪 → WebRTC VAD → agent-asr(:8080/gRPC:50051) 内置 GPU 推理
+  - 上行：用户语音 PCM → JitterBuffer → Denoiser降噪 → VAD(WebRTC/Silero) → agent-asr(:8080/gRPC:50051) 内置 GPU 推理
   - 下行：agent-tts(:8081/gRPC:50052) 内置 GPU 推理 → TTSOutputBuffer 稳态30ms帧 → FreeSWITCH → 用户
 
 **控制流（agent-flow 统一调度）**
@@ -356,12 +356,20 @@ aiphone/
 - agent-flow → agent-asr: 识别链路端到端通
 
 ### 3.3 TTS 服务部署 (GPU1)
-当前支持引擎: **CosyVoice** (默认, 内置GPU推理), **VibeVoice** (远程HTTP)
+当前支持引擎: **CosyVoice** (默认, 内置GPU推理), **EdgeTTS** (微软 Edge 在线, 无需 GPU), **VibeVoice** (远程HTTP)
 
 **CosyVoice TTS** (内置 CosyVoice3 GPU 推理):
 - 单服务部署: `agent-tts/` (Dockerfile 内置 PyTorch + CosyVoice 运行时 + 模型下载)
 - 模型下载: `modelscope download --model iic/CosyVoice3-0.5B`
 - 切换引擎: 修改 `ttsadapter/config.yaml` 中 `engine: cosyvoice`
+
+**EdgeTTS** (微软 Edge 在线 TTS, 无需 GPU):
+- 利用微软 Edge 在线 TTS 服务，无需本地 GPU
+- 三业务 Profile 隔离（音色/语速/音量按 biz_type 配置）
+- 磁盘缓存按 voice+text hash，按 biz_type 目录隔离
+- 输出 22050Hz mono 16-bit WAV，与 CosyVoice 一致，下游统一重采样
+- 切换引擎: 修改 `ttsadapter/config.yaml` 中 `engine: edgetts`
+- 依赖: `edge-tts==7.2.8`, `pydub>=0.25.1`
 
 **VibeVoice TTS** (远程 HTTP):
 - 需独立部署 VibeVoice TTS 推理服务
@@ -453,7 +461,7 @@ aiphone/
 - `llm/json_stream.py`：IncrementalJSONParser 从 LLM token 流增量解析结构化字段
 - `llm/sentence_splitter.py`：SentenceSplitter 将流式 token 切分为 TTS 就绪句子
 - `ws/handler.py`：WebSocket 处理器（CallWebSocketHandler 同步 + StreamingCallHandler 流式+打断）
-- `ws/vad.py`：WebRTC VAD 语音端点检测 + 打断语音检测
+- `ws/vad.py`：可插拔 VAD 语音端点检测 + 打断语音检测（WebRTC / Silero，工厂函数 `create_vad()`）
 - `ws/denoise.py`：VAD 前置降噪（highpass/noisereduce/rnnoise），工厂函数读取 `CALLBOT_DENOISE_ENABLED`
 - `ws/jitter_buffer.py`：JitterBuffer 输入平滑 + TTSOutputBuffer 稳态30ms帧输出
 - `ws/registry.py`：ActiveCallRegistry 活跃通话注册（CHANNEL_HANGUP 取消）
@@ -467,12 +475,12 @@ aiphone/
 
 **流式模式** (WebSocket /media/{uuid}，生产路径，事件驱动)：
 - FreeSWITCH 通过 mod_audio_fork WebSocket 将用户音频流传至 agent-flow：
-  1) JitterBuffer 平滑输入音频 → Denoiser 降噪 → WebRTC VAD 检测到用户说完 → 调用 agent-asr 识别（gRPC 流式或 HTTP）
+  1) JitterBuffer 平滑输入音频 → Denoiser 降噪 → VAD（WebRTC/Silero）检测到用户说完 → 调用 agent-asr 识别（gRPC 流式或 HTTP）
   2) 落库 user turn（含置信度）
   3) 并行扇出：MCP 身份查询 ‖ 记忆召回 ‖ RAG 检索
   4) Qwen3.5-9B 流式输出 → IncrementalJSONParser → SentenceSplitter → 句级文本
   5) 每句并行调用 agent-tts 合成语音（gRPC/HTTP/WebSocket 三传输） → WAV→PCM → TTSOutputBuffer 稳态30ms帧 → WebSocket 回传 FreeSWITCH
-  6) Barge-in：用户说话时 WebRTC VAD 检测 → ESL uuid_break 停止播放 → 取消流式任务 → 新一轮
+  6) Barge-in：用户说话时 VAD（WebRTC/Silero）检测 → ESL uuid_break 停止播放 → 取消流式任务 → 新一轮
   7) CHANNEL_HANGUP：ESL 事件订阅 → ActiveCallRegistry 取消 → 清理资源
 - FreeSWITCH 播放 TTS 音频，完成一轮交互
 
@@ -871,10 +879,10 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 - 检索必须加条件：`biz_type, user_key, ts >= now()-interval '180 days'`，并限制 topK
 
 ### 12.3 WebSocket 双向音频链路 + 流式管道
-- ASR 识别文本为空：检查 WebRTC VAD 参数、音频格式、agent-asr 健康状态
+- ASR 识别文本为空：检查 VAD 参数（WebRTC/Silero）、音频格式、agent-asr 健康状态
 - orchestrator 超时：检查 LLM 响应时间、MCP Server 连通性、TTS 合成延迟
 - WebSocket 断连：检查 agent-flow 进程状态、FreeSWITCH mod_audio_fork 日志
-- Barge-in 失效：检查 ESL 连接、WebRTC VAD 灵敏度（CALLBOT_BARGE_IN_MIN_AUDIO_BYTES）
+- Barge-in 失效：检查 ESL 连接、VAD 灵敏度（CALLBOT_BARGE_IN_MIN_AUDIO_BYTES）
 - TTS 音频断续：检查 JitterBuffer 深度配置（CALLBOT_JITTER_TARGET_DEPTH）、TTSOutputBuffer 帧率
 - CHANNEL_HANGUP 未触发：检查 ESL Event Socket 连接、event_socket.conf.xml 配置
 
@@ -896,7 +904,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 │   ├── vars.xml                   # 全局变量
 │   ├── event_socket.conf.xml      # ESL 监听配置
 │   ├── dialplan/
-│   │   └── public.xml              # 拨号计划
+│   │   └── public/00_biz_type.xml  # 拨号计划
 │   └── mrcp-plugin/              # UniMRCP 1.5.0 (MRCP/ASR 备选)
 
 应用服务组件/
@@ -914,7 +922,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 │   ├── llm/           # LLM 推理引擎 (Qwen3.5-9B, vLLM)
 │   ├── alembic/       # 数据库迁移
 │   └── Dockerfile
-├── mcp-server/
+├── agent-mcp/
 │   └── java-mcp-server/  # 用户中心 MCP Server (Spring Boot 4.0 + Spring AI 2.0, port 9090)
 ├── scripts/               # 启动脚本
 │   ├── local.sh           # 本地开发 (conda)
@@ -940,7 +948,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 
 ### 阶段 2: 拨号计划
 
-3. **dialplan/public.xml** - 业务路由
+3. **dialplan/public/00_biz_type.xml** - 业务路由
    - 业务变量设置 (biz_type, user_key)
    - answer + playback silence_stream://-1 保持通话，由 agent-flow ESL 事件驱动 uuid_audio_fork
    - 转人工：loopback/1001
@@ -983,7 +991,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
             │
             └─→ uuid_audio_fork ──→ agent-flow (:8000, uvloop) WebSocket /media/{uuid} 双向音频
                     │
-                    ├─→ JitterBuffer → Denoiser → WebRTC VAD → agent-asr (:8080 / gRPC:50051 / WS) ──→ SenseVoice GPU0
+                    ├─→ JitterBuffer → Denoiser → VAD(WebRTC/Silero) → agent-asr (:8080 / gRPC:50051 / WS) ──→ SenseVoice GPU0
                     │                                                       └─→ 返回识别文本
                     │
                     ├─→ 决策 ──→ agent-flow LangGraph 7 节点 (流式管道)
@@ -1049,7 +1057,8 @@ FreeSWITCH 拨号计划 `answer` + `playback silence_stream://-1`（无限静音
 | LLM | 推理地址 | :8083 (GPU2) |
 | Orchestrator | 服务地址 | :8000 |
 | Orchestrator | ESL 地址 | CALLBOT_ESL_HOST:CALLBOT_ESL_PORT |
-| Orchestrator | VAD 灵敏度 | CALLBOT_VAD_AGGRESSIVENESS=3 |
+| Orchestrator | VAD 引擎 | CALLBOT_VAD_TYPE=webrtc (webrtc/silero) |
+| Orchestrator | VAD 灵敏度 | CALLBOT_VAD_AGGRESSIVENESS=3 (WebRTC), CALLBOT_VAD_SILERO_THRESHOLD=0.5 (Silero) |
 | Orchestrator | Jitter Buffer | CALLBOT_JITTER_TARGET_DEPTH=3 |
 | Orchestrator | 降噪模式 | CALLBOT_DENOISE_ENABLED="" (highpass/noisereduce/rnnoise) |
 | Orchestrator | ASR gRPC | CALLBOT_ASR_USE_GRPC=false, CALLBOT_ASR_GRPC_TARGET=:50051 |
@@ -1082,7 +1091,7 @@ FreeSWITCH 拨号计划 `answer` + `playback silence_stream://-1`（无限静音
 - 检查 agent-asr 服务状态（:8080）
 - 检查 GPU 可用性
 - 检查模型是否加载（MODEL_DIR 路径）
-- 检查 WebRTC VAD 参数配置（CALLBOT_VAD_AGGRESSIVENESS, CALLBOT_VAD_SILENCE_FRAMES）
+- 检查 VAD 参数配置（CALLBOT_VAD_TYPE, CALLBOT_VAD_AGGRESSIVENESS, CALLBOT_VAD_SILENCE_FRAMES, CALLBOT_VAD_SILERO_THRESHOLD）
 
 ### 3. TTS 播放无声
 - 检查 agent-tts 服务状态（:8081）
@@ -1112,7 +1121,7 @@ FreeSWITCH 拨号计划 `answer` + `playback silence_stream://-1`（无限静音
 |------|------|----------|
 | modules.conf | 2.0 | 2026-05-16 |
 | vars.xml | 2.0 | 2026-05-16 |
-| dialplan/public.xml | 2.0 | 2026-05-16 |
+| dialplan/public/00_biz_type.xml | 2.0 | 2026-05-16 |
 | agent-asr Dockerfile | 2.1 | 2026-05-22 |
 | agent-tts Dockerfile | 2.1 | 2026-05-22 |
 | agent-flow Dockerfile | 2.1 | 2026-05-22 |
