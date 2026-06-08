@@ -34,4 +34,6 @@ htmlcov/
 models
 .codegraph
 .code-review-graph
+.cursor
+.openflow
 
