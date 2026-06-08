@@ -23,6 +23,10 @@ from memory.chat_history import get_chat_history, save_turn
 from clients.mcp import MCPClient
 from clients.tts import TTSClient
 from clients.asr import ASRClient
+from clients.tts_grpc_client import TTSGrpcClient
+from clients.asr_grpc_client import ASRGrpcClient
+from clients.tts_ws_client import TTSWebSocketClient
+from clients.asr_ws_client import ASRWebSocketClient
 from storage import minio_storage
 
 logger = logging.getLogger(__name__)
@@ -32,10 +36,10 @@ _assembler: MemoryAssembler | None = None
 _mcp_client: MCPClient | None = None
 _tts_client: TTSClient | None = None
 _asr_client: ASRClient | None = None
-_tts_grpc_client: "TTSGrpcClient | None" = None
-_asr_grpc_client: "ASRGrpcClient | None" = None
-_tts_ws_client: "TTSWebSocketClient | None" = None
-_asr_ws_client: "ASRWebSocketClient | None" = None
+_tts_grpc_client: TTSGrpcClient | None = None
+_asr_grpc_client: ASRGrpcClient | None = None
+_tts_ws_client: TTSWebSocketClient | None = None
+_asr_ws_client: ASRWebSocketClient | None = None
 
 
 def set_services(
@@ -43,10 +47,10 @@ def set_services(
     mcp: MCPClient,
     tts: TTSClient,
     asr: ASRClient | None = None,
-    tts_grpc: "TTSGrpcClient | None" = None,
-    asr_grpc: "ASRGrpcClient | None" = None,
-    tts_ws: "TTSWebSocketClient | None" = None,
-    asr_ws: "ASRWebSocketClient | None" = None,
+    tts_grpc: TTSGrpcClient | None = None,
+    asr_grpc: ASRGrpcClient | None = None,
+    tts_ws: TTSWebSocketClient | None = None,
+    asr_ws: ASRWebSocketClient | None = None,
 ) -> None:
     global _assembler, _mcp_client, _tts_client, _asr_client
     global _tts_grpc_client, _asr_grpc_client, _tts_ws_client, _asr_ws_client
