@@ -125,7 +125,7 @@ start_mcp() {
   docker ps --format '{{.Names}}' | grep -q '^callbot-mcp$' && { info "MCP 已在运行"; return 0; }
 
   info "构建 MCP Server 镜像 ..."
-  docker build -t callbot-mcp:latest ./mcp-server/java-mcp-server
+  docker build -t callbot-mcp:latest ./agent-mcp/java-mcp-server
 
   info "启动 MCP Server ..."
   docker rm -f callbot-mcp 2>/dev/null || true

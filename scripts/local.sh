@@ -3,10 +3,11 @@
 # 本地启动脚本 — FreeSWITCH / ASR / TTS / Flow 逐个启动
 #
 # 用法:
-#   ./scripts/local.sh              # 启动全部 (fs asr tts flow)
+#   ./scripts/local.sh              # 启动全部 (fs asr tts mcp flow)
 #   ./scripts/local.sh fs           # 仅启动 FreeSWITCH
 #   ./scripts/local.sh asr          # 仅启动 ASR
 #   ./scripts/local.sh tts          # 仅启动 TTS
+#   ./scripts/local.sh mcp          # 仅启动 MCP Server
 #   ./scripts/local.sh flow         # 仅启动 Flow
 #   ./scripts/local.sh fs asr tts   # 启动 FreeSWITCH + ASR + TTS
 #   ./scripts/local.sh stop         # 停止全部
@@ -34,6 +35,7 @@ FS_BIN="$HOME/freeswitch/bin/freeswitch"
 FS_ESL_PORT=8021
 ASR_PORT=8080
 TTS_PORT=8081
+MCP_PORT=9090
 FLOW_PORT=8000
 
 ASR_MODEL_DIR="$PROJECT_DIR/agent-asr/models/SenseVoiceSmall"
@@ -144,8 +146,18 @@ stop_svc() {
       fi
       rm -f "$PID_DIR/flow.pid"
       ;;
+    mcp)
+      if is_running "$MCP_PORT"; then
+        info "停止 MCP Server ..."
+        kill_by_port "$MCP_PORT"
+        info "MCP Server 已停止"
+      else
+        info "MCP Server 未在运行"
+      fi
+      rm -f "$PID_DIR/mcp.pid"
+      ;;
     *)
-      error "未知服务: $svc (可选: fs, asr, tts, flow)"
+      error "未知服务: $svc (可选: fs, asr, tts, mcp, flow)"
       ;;
   esac
 }
@@ -153,6 +165,7 @@ stop_svc() {
 stop_all() {
   info "停止所有服务 ..."
   stop_svc flow
+  stop_svc mcp
   stop_svc tts
   stop_svc asr
   stop_svc fs
@@ -254,6 +267,31 @@ start_flow() {
   wait_http "agent-flow" "$FLOW_PORT" 30
 }
 
+start_mcp() {
+  if is_running "$MCP_PORT"; then
+    info "MCP Server 已在运行 (port $MCP_PORT)"
+    return 0
+  fi
+
+  local mcp_dir="$PROJECT_DIR/agent-mcp/java-mcp-server"
+  if [[ ! -f "$mcp_dir/pom.xml" ]]; then
+    error "MCP Server 未找到: $mcp_dir"
+    return 1
+  fi
+
+  info "启动 MCP Server (port $MCP_PORT) ..."
+  # 优先使用已构建的 jar，否则 mvnw spring-boot:run
+  local jar_path="$mcp_dir/target/mcp-server-0.0.1-SNAPSHOT.jar"
+  if [[ -f "$jar_path" ]]; then
+    java -jar "$jar_path" >> "$LOG_DIR/mcp.log" 2>&1 &
+  else
+    info "jar 未找到，使用 mvnw spring-boot:run ..."
+    (cd "$mcp_dir" && JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}" ./mvnw spring-boot:run >> "$LOG_DIR/mcp.log" 2>&1) &
+  fi
+  echo $! > "$PID_DIR/mcp.pid"
+  wait_http "MCP Server" "$MCP_PORT" 60
+}
+
 show_status() {
   echo ""
   printf "${CYAN}%-16s %-10s %-8s %-8s %s${NC}\n" "服务" "引擎" "端口" "状态" "PID"
@@ -262,6 +300,7 @@ show_status() {
   for row in "FreeSWITCH|SIP/RTP|5060/8021|fs" \
              "ASR|SenseVoice|$ASR_PORT|asr" \
              "TTS|CosyVoice|$TTS_PORT|tts" \
+             "MCP Server|Spring Boot|$MCP_PORT|mcp" \
              "agent-flow|LangGraph|$FLOW_PORT|flow"; do
     IFS='|' read -r name engine port svc <<< "$row"
     local s="stopped" pid
@@ -287,10 +326,11 @@ for arg in "$@"; do
     status)  ACTION="status" ;;
     -h|--help)
       echo "用法: $0 [stop] [fs|asr|tts|flow] ..."
-      echo "  (无参数)    启动全部 (fs asr tts flow)"
+      echo "  (无参数)    启动全部 (fs asr tts mcp flow)"
       echo "  fs          仅启动 FreeSWITCH"
       echo "  asr         仅启动 ASR"
       echo "  tts         仅启动 TTS"
+      echo "  mcp         仅启动 MCP Server"
       echo "  flow        仅启动 agent-flow"
       echo "  stop        停止全部"
       echo "  stop asr    仅停止 ASR"
@@ -320,15 +360,16 @@ case "$ACTION" in
     info "══════════════════════════════════════"
 
     # 默认全部
-    [[ ${#SERVICES[@]} -eq 0 ]] && SERVICES=(fs asr tts flow)
+    [[ ${#SERVICES[@]} -eq 0 ]] && SERVICES=(fs asr tts mcp flow)
 
     for svc in "${SERVICES[@]}"; do
       case "$svc" in
         fs)   start_fs ;;
         asr)  start_asr ;;
         tts)  start_tts ;;
+        mcp)  start_mcp ;;
         flow) start_flow ;;
-        *)    error "未知服务: $svc (可选: fs, asr, tts, flow)" ;;
+        *)    error "未知服务: $svc (可选: fs, asr, tts, mcp, flow)" ;;
       esac
     done
 
@@ -338,6 +379,7 @@ case "$ACTION" in
     info "  tail -f $LOG_DIR/fs.log"
     info "  tail -f $LOG_DIR/asr.log"
     info "  tail -f $LOG_DIR/tts.log"
+    info "  tail -f $LOG_DIR/mcp.log"
     info "  tail -f $LOG_DIR/flow.log"
     ;;
 esac
