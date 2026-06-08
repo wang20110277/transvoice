@@ -1,4 +1,16 @@
-"""LangGraph 1.2 通话状态图 - 7 节点管线 + 流式管线"""
+"""通话编排管线 — Pre-LLM 阶段 + 流式 LLM/TTS 管线。
+
+对外暴露两个函数，由 handler.py 通过函数注入调用：
+  - run_pre_llm_phase()   — ASR 识别 + 并行扇出（MCP/记忆/RAG）
+  - run_streaming_pipeline() — LLM 流式输出 → 句级 TTS → 音频回调
+
+调用链路：
+  main.py::lifespan()
+    → StreamingCallHandler(pre_llm_fn=run_pre_llm_phase, streaming_fn=run_streaming_pipeline)
+    → handler._process_streaming_turn()
+        ├── run_pre_llm_phase()       ← Phase 1: ASR + MCP/Memory/RAG 并行
+        └── run_streaming_pipeline()  ← Phase 2: LLM 流式 → SentenceSplitter → 句级 TTS
+"""
 import asyncio
 import base64
 import logging
@@ -10,7 +22,6 @@ from typing import TypedDict
 
 import numpy as np
 
-from langgraph.graph import StateGraph, END
 from langchain_core.messages import BaseMessage
 
 from llm.service import LLMAction, FALLBACK_ACTION_TEXT, get_llm_service
@@ -31,7 +42,10 @@ from storage import minio_storage
 
 logger = logging.getLogger(__name__)
 
-# Module-level service instances — set by main.py lifespan
+# ═══════════════════════════════════════════════════════════════════
+# 服务单例 — 由 main.py lifespan 通过 set_services() 注入
+# ═══════════════════════════════════════════════════════════════════
+
 _assembler: MemoryAssembler | None = None
 _mcp_client: MCPClient | None = None
 _tts_client: TTSClient | None = None
@@ -62,7 +76,15 @@ def set_services(
     _asr_grpc_client = asr_grpc
     _tts_ws_client = tts_ws
     _asr_ws_client = asr_ws
+    logger.info("flow services injected: mcp=%s tts=%s asr=%s tts_grpc=%s asr_grpc=%s tts_ws=%s asr_ws=%s",
+                mcp is not None, tts is not None, asr is not None,
+                tts_grpc is not None, asr_grpc is not None,
+                tts_ws is not None, asr_ws is not None)
 
+
+# ═══════════════════════════════════════════════════════════════════
+# State 定义
+# ═══════════════════════════════════════════════════════════════════
 
 class CallGraphState(TypedDict, total=False):
     call_id: str
@@ -83,329 +105,41 @@ class CallGraphState(TypedDict, total=False):
     chat_history: list[BaseMessage]
 
 
-# ── Node ①: receive_asr ──
+# ═══════════════════════════════════════════════════════════════════
+# 内部工具函数
+# ═══════════════════════════════════════════════════════════════════
 
-async def receive_asr_node(state: CallGraphState) -> dict:
-    call_id = state.get("call_id", "?")
-
-    audio_bytes = state.get("audio_bytes")
-    if audio_bytes:
-        # Upload ASR input audio to MinIO (fire-and-forget)
-        asr_minio_key = minio_storage.build_object_key(prefix="asr", call_id=call_id)
-        if asr_minio_key:
-            asyncio.create_task(minio_storage.upload_audio_async(audio_bytes, asr_minio_key))
-        try:
-            if _asr_grpc_client is not None:
-                asr_result = await _asr_grpc_client.recognize(audio_bytes, call_id)
-                logger.info("[%s] ASR via gRPC: %s", call_id, asr_result.get("text", "")[:50] if asr_result else "None")
-            elif _asr_ws_client is not None:
-                asr_result = await _asr_ws_client.recognize(audio_bytes, call_id)
-                logger.info("[%s] ASR via WS: %s", call_id, asr_result.get("text", "")[:50] if asr_result else "None")
-            elif _asr_client is not None:
-                asr_result = await _asr_client.recognize(audio_bytes, call_id)
-                logger.info("[%s] ASR via HTTP: %s", call_id, asr_result.get("text", "")[:50] if asr_result else "None")
-            else:
-                asr_result = None
-            if asr_result:
-                user_input = asr_result.get("text", "")
-            else:
-                user_input = ""
-        except Exception as e:
-            logger.error("[%s] ASR 调用失败: %s", call_id, e)
-            user_input = ""
-    else:
-        user_input = state.get("user_input", "")
-        asr_minio_key = state.get("asr_minio_key")
-
-    try:
-        # TODO: re-enable after fixing RedisSearch (FT._LIST)
-        # history = get_chat_history(state["call_id"], state["biz_type"])
-        # chat_history = list(await history.aget_messages())
-        chat_history = []
-    except Exception as e:
-        logger.warning("[%s] 对话历史加载失败: %s", call_id, e)
-        chat_history = []
-
-    return {
-        "user_input": user_input,
-        "asr_minio_key": asr_minio_key,
-        "chat_history": chat_history,
-    }
-
-
-# ── Node ②: mcp_identity ──
-
-async def mcp_identity_node(state: CallGraphState) -> dict:
-    if _mcp_client is None:
-        return {"identity": None}
-    try:
-        result = await _mcp_client.query_user_identity(state["user_key"], state["biz_type"])
-        return {"identity": {
-            "user_id": result.user_id,
-            "phone_masked": result.phone_masked,
-            "id_card_last_four": result.id_card_last_four,
-        }}
-    except Exception as e:
-        logger.error(f"[{state.get('call_id', '?')}] MCP 身份查询失败: {e}")
-        return {"identity": None}
-
-
-# ── Node ③: credit_query (conditional) ──
-
-async def credit_query_node(state: CallGraphState) -> dict:
-    if _mcp_client is None:
-        return {"credit_result": None}
-    try:
-        user_id = state.get("identity", {}).get("user_id", "") if state.get("identity") else ""
-        result = await _mcp_client.query_credit_profile(user_id)
-        return {"credit_result": {
-            "user_id": result.user_id,
-            "credit_qualified": result.credit_qualified,
-            "risk_level": result.risk_level,
-            "details": result.details,
-        }}
-    except Exception as e:
-        logger.error(f"[{state.get('call_id', '?')}] 征信查询失败: {e}")
-        return {"credit_result": None}
-
-
-# ── Node ④: recall_memory ──
-
-async def recall_memory_node(state: CallGraphState) -> dict:
-    if _assembler is None:
-        return {"memory_block": ""}
-    try:
-        memory_block = await _assembler.assemble(
-            biz_type=state["biz_type"],
-            user_key=state["user_key"],
-            user_input=state["user_input"],
-        )
-        return {"memory_block": memory_block}
-    except Exception as e:
-        logger.error(f"[{state.get('call_id', '?')}] 记忆召回失败: {e}")
-        return {"memory_block": ""}
-
-
-# ── Node ⑤: rag_retrieve ──
-
-async def rag_retrieve_node(state: CallGraphState) -> dict:
-    try:
-        rag_query = state["user_input"]
-
-        need_retrieve = await should_retrieve(rag_query, state["biz_type"])
-        if not need_retrieve:
-            return {"rag_block": ""}
-
-        for attempt in range(settings.rag_max_retries + 1):
-            scripts = await retrieve_scripts(state["biz_type"], rag_query)
-
-            if scripts:
-                relevant = await grade_documents(rag_query, scripts)
-                if relevant:
-                    return {"rag_block": build_rag_block(relevant)}
-
-            if attempt < settings.rag_max_retries:
-                rag_query = await rewrite_query(rag_query, scripts or [])
-
-        return {"rag_block": ""}
-    except Exception as e:
-        logger.error(f"[{state.get('call_id', '?')}] RAG 检索失败: %s", e)
-        return {"rag_block": ""}
-
-
-# ── Node ⑥: llm_decide ──
-
-async def llm_decide_node(state: CallGraphState) -> dict:
-    llm = get_llm_service()
-    biz_type = state["biz_type"]
-
+def _load_system_prompt(biz_type: str) -> str:
+    """按 biz_type 加载 prompts/{biz_type}.yaml 中的 system_prompt。"""
     prompt_path = os.path.join(os.path.dirname(__file__), "prompts", f"{biz_type}.yaml")
-    system_prompt = ""
-    if os.path.exists(prompt_path):
-        with open(prompt_path) as f:
-            data = yaml.safe_load(f)
-            system_prompt = data.get("system_prompt", data.get("template", ""))
-
-    messages = build_messages(
-        biz_type=biz_type,
-        system_prompt=system_prompt,
-        user_input=state["user_input"],
-        memory_block=state.get("memory_block", ""),
-        rag_block=state.get("rag_block", ""),
-        chat_history=state.get("chat_history", []),
-    )
-
-    try:
-        action = await llm.chat_for_action([m.model_dump() for m in messages])
-    except Exception as e:
-        logger.error(f"[{state.get('call_id', '?')}] LLM 调用失败: {e}")
-        action = LLMAction(action="say", text=FALLBACK_ACTION_TEXT)
-
-    return {"llm_action": action}
+    if not os.path.exists(prompt_path):
+        return ""
+    with open(prompt_path) as f:
+        data = yaml.safe_load(f)
+    return data.get("system_prompt", data.get("template", ""))
 
 
-# ── Node ⑦: tts_synthesize ──
-
-async def tts_synthesize_node(state: CallGraphState) -> dict:
-    action = state.get("llm_action")
-    if not action:
-        return {}
-
-    if settings.tts_skip:
-        logger.info("[%s] TTS skipped (tts_skip=true), LLM reply: %s", state.get("call_id", "?"), action.text[:80])
-        return {"tts_audio": None, "tts_minio_key": None}
-
-    tts_result = None
-    try:
-        if action.text:
-            if _tts_ws_client is not None:
-                tts_result = await _tts_ws_client.synthesize(action.text, state["call_id"], state["biz_type"])
-                logger.info("[%s] TTS via WS: %d bytes", state.get("call_id", "?"), len(tts_result.get("audio", "")) if tts_result else 0)
-            elif _tts_grpc_client is not None:
-                tts_result = await _tts_grpc_client.synthesize(action.text, state["call_id"], state["biz_type"])
-                logger.info("[%s] TTS via gRPC: %d bytes", state.get("call_id", "?"), len(tts_result.get("audio", "")) if tts_result else 0)
-            elif _tts_client is not None:
-                tts_result = await _tts_client.synthesize(action.text, state["call_id"], state["biz_type"])
-                logger.info("[%s] TTS via HTTP: %d bytes", state.get("call_id", "?"), len(tts_result.get("audio", "")) if tts_result else 0)
-    except Exception as e:
-        logger.error(f"[{state.get('call_id', '?')}] TTS 合成异常: {e}")
-        tts_result = None
-
-    # Upload TTS output audio to MinIO (fire-and-forget)
-    tts_minio_key = None
-    if tts_result and tts_result.get("audio"):
-        try:
-            audio_data = base64.b64decode(tts_result["audio"])
-            tts_minio_key = minio_storage.build_object_key(prefix="tts", call_id=state["call_id"])
-            if tts_minio_key:
-                asyncio.create_task(minio_storage.upload_audio_async(audio_data, tts_minio_key))
-        except Exception as e:
-            logger.warning("[%s] TTS MinIO upload failed: %s", state.get("call_id", "?"), e)
-
-    try:
-        history = get_chat_history(state["call_id"], state["biz_type"])
-        await save_turn(history, state["user_input"], action.text)
-    except Exception as e:
-        logger.warning(f"[{state.get('call_id', '?')}] 对话历史保存失败: {e}")
-
-    return {
-        "tts_audio": tts_result.get("audio") if tts_result else None,
-        "tts_minio_key": tts_minio_key,
-    }
+def _get_asr_client() -> tuple[str, object]:
+    """返回 (传输方式, 客户端实例)，优先级: gRPC > WS > HTTP。"""
+    if _asr_grpc_client is not None:
+        return "gRPC", _asr_grpc_client
+    if _asr_ws_client is not None:
+        return "WS", _asr_ws_client
+    if _asr_client is not None:
+        return "HTTP", _asr_client
+    return "none", None
 
 
-# ── Conditional routing ──
+def _get_tts_client() -> tuple[str, object]:
+    """返回 (传输方式, 客户端实例)，优先级: WS > gRPC > HTTP。"""
+    if _tts_ws_client is not None:
+        return "WS", _tts_ws_client
+    if _tts_grpc_client is not None:
+        return "gRPC", _tts_grpc_client
+    if _tts_client is not None:
+        return "HTTP", _tts_client
+    return "none", None
 
-def should_query_credit(state: CallGraphState) -> str:
-    if state.get("biz_type") == "marketing":
-        return "credit_query"
-    return "llm_decide"
-
-
-# ── Graph builder (HTTP sync path — parallel fan-out) ──
-
-def create_call_graph():
-    graph = StateGraph(CallGraphState)
-
-    graph.add_node("receive_asr", receive_asr_node)
-    graph.add_node("mcp_identity", mcp_identity_node)
-    graph.add_node("credit_query", credit_query_node)
-    graph.add_node("recall_memory", recall_memory_node)
-    graph.add_node("rag_retrieve", rag_retrieve_node)
-    graph.add_node("llm_decide", llm_decide_node)
-    graph.add_node("tts_synthesize", tts_synthesize_node)
-
-    graph.set_entry_point("receive_asr")
-
-    # Fan-out: receive_asr 后三个节点并行
-    graph.add_edge("receive_asr", "mcp_identity")
-    graph.add_edge("receive_asr", "recall_memory")
-    graph.add_edge("receive_asr", "rag_retrieve")
-
-    # mcp_identity → credit_query (仅 marketing) 或直接到 llm_decide
-    graph.add_conditional_edges("mcp_identity", should_query_credit, {
-        "credit_query": "credit_query",
-        "llm_decide": "llm_decide",
-    })
-    graph.add_edge("credit_query", "llm_decide")
-
-    # recall_memory 和 rag_retrieve 直接汇入 llm_decide
-    graph.add_edge("recall_memory", "llm_decide")
-    graph.add_edge("rag_retrieve", "llm_decide")
-
-    graph.add_edge("llm_decide", "tts_synthesize")
-    graph.add_edge("tts_synthesize", END)
-
-    return graph.compile()
-
-
-# ── Pre-LLM phase (for streaming path) ──
-
-async def run_pre_llm_phase(
-    call_id: str, biz_type: str, user_key: str, audio_bytes: bytes,
-    precomputed_asr_result: dict | None = None,
-) -> CallGraphState:
-    """运行 ASR + 并行 fan-out（MCP + Memory + RAG），返回组装好的 state。
-
-    precomputed_asr_result: 如果已通过 gRPC 流式获取了 ASR 结果，直接使用，跳过 HTTP ASR 调用。
-    """
-    t0 = time.monotonic()
-
-    # Node 1: ASR
-    state: CallGraphState = {
-        "call_id": call_id,
-        "biz_type": biz_type,
-        "user_key": user_key,
-        "user_input": "",
-        "audio_bytes": audio_bytes,
-        "asr_minio_key": None,
-        "identity": None,
-        "credit_result": None,
-        "memory_block": "",
-        "rag_block": "",
-        "llm_action": None,
-        "tts_minio_key": None,
-        "tts_audio": None,
-        "chat_history": [],
-    }
-
-    if precomputed_asr_result:
-        # Use gRPC/WS-streamed ASR result — 但空文本时保留 audio_bytes 走 HTTP ASR 回退
-        precomputed_text = precomputed_asr_result.get("text", "")
-        if precomputed_text:
-            # 流式 ASR 有结果，跳过 HTTP ASR
-            state["user_input"] = precomputed_text
-            state["audio_bytes"] = None
-        # else: 流式 ASR 返回空，保留 audio_bytes 走 HTTP ASR 回退
-        asr_result = await receive_asr_node(state)
-        state.update(asr_result)
-        if precomputed_text:
-            state["user_input"] = precomputed_text
-    else:
-        asr_result = await receive_asr_node(state)
-        state.update(asr_result)
-
-    # Parallel fan-out: mcp_identity + recall_memory + rag_retrieve
-    # TODO: re-enable after fixing MCP phone format + RedisSearch + Ollama structured_output
-    # identity_coro = mcp_identity_node(state)
-    # memory_coro = recall_memory_node(state)
-    # rag_coro = rag_retrieve_node(state)
-    # identity, memory, rag = await asyncio.gather(identity_coro, memory_coro, rag_coro)
-    # state.update(identity)
-    # state.update(memory)
-    # state.update(rag)
-    # if biz_type == "marketing" and _mcp_client:
-    #     credit = await credit_query_node(state)
-    #     state.update(credit)
-
-    elapsed = (time.monotonic() - t0) * 1000
-    logger.info("[%s] pre-llm phase done in %.0fms, user_input=%s",
-                call_id, elapsed, state.get("user_input", "")[:50])
-
-    return state
-
-
-# ── Streaming LLM+TTS pipeline ──
 
 WAV_HEADER_SIZE = 44
 
@@ -433,15 +167,214 @@ def _resample_pcm(pcm: bytes, orig_rate: int, target_rate: int) -> bytes:
     return resampled.astype(np.int16).tobytes()
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Node 函数 — 被 run_pre_llm_phase 调用
+# ═══════════════════════════════════════════════════════════════════
+
+async def _asr_node(state: CallGraphState) -> dict:
+    """Node ①: ASR 语音识别。优先 gRPC/WS，回退 HTTP。"""
+    call_id = state.get("call_id", "?")
+    audio_bytes = state.get("audio_bytes")
+
+    if audio_bytes:
+        asr_minio_key = minio_storage.build_object_key(prefix="asr", call_id=call_id)
+        if asr_minio_key:
+            asyncio.create_task(minio_storage.upload_audio_async(audio_bytes, asr_minio_key))
+        try:
+            transport, client = _get_asr_client()
+            if client is not None:
+                asr_result = await client.recognize(audio_bytes, call_id)
+                user_input = asr_result.get("text", "") if asr_result else ""
+                logger.info("[%s] ASR via %s: %s", call_id, transport, user_input[:50])
+            else:
+                logger.warning("[%s] no ASR client available", call_id)
+                user_input = ""
+        except Exception as e:
+            logger.error("[%s] ASR failed: %s", call_id, e)
+            user_input = ""
+    else:
+        user_input = state.get("user_input", "")
+        asr_minio_key = state.get("asr_minio_key")
+
+    # TODO: re-enable after fixing RedisSearch (FT._LIST)
+    chat_history: list = []
+
+    return {"user_input": user_input, "asr_minio_key": asr_minio_key, "chat_history": chat_history}
+
+
+async def _mcp_identity_node(state: CallGraphState) -> dict:
+    """Node ②: MCP 用户身份查询。"""
+    if _mcp_client is None:
+        return {"identity": None}
+    call_id = state.get("call_id", "?")
+    try:
+        result = await _mcp_client.query_user_identity(state["user_key"], state["biz_type"])
+        logger.info("[%s] MCP identity: user_id=%s phone=%s", call_id, result.user_id, result.phone_masked)
+        return {"identity": {
+            "user_id": result.user_id,
+            "phone_masked": result.phone_masked,
+            "id_card_last_four": result.id_card_last_four,
+        }}
+    except Exception as e:
+        logger.error("[%s] MCP identity failed: %s", call_id, e)
+        return {"identity": None}
+
+
+async def _credit_query_node(state: CallGraphState) -> dict:
+    """Node ③: 征信查询（仅 marketing）。"""
+    if _mcp_client is None:
+        return {"credit_result": None}
+    call_id = state.get("call_id", "?")
+    try:
+        user_id = state.get("identity", {}).get("user_id", "") if state.get("identity") else ""
+        result = await _mcp_client.query_credit_profile(user_id)
+        logger.info("[%s] credit: qualified=%s risk=%s", call_id, result.credit_qualified, result.risk_level)
+        return {"credit_result": {
+            "user_id": result.user_id,
+            "credit_qualified": result.credit_qualified,
+            "risk_level": result.risk_level,
+            "details": result.details,
+        }}
+    except Exception as e:
+        logger.error("[%s] credit query failed: %s", call_id, e)
+        return {"credit_result": None}
+
+
+async def _recall_memory_node(state: CallGraphState) -> dict:
+    """Node ④: 记忆召回（Redis 热 + PG 长期）。"""
+    if _assembler is None:
+        return {"memory_block": ""}
+    call_id = state.get("call_id", "?")
+    try:
+        memory_block = await _assembler.assemble(
+            biz_type=state["biz_type"],
+            user_key=state["user_key"],
+            user_input=state["user_input"],
+        )
+        logger.info("[%s] memory assembled: %d chars", call_id, len(memory_block))
+        return {"memory_block": memory_block}
+    except Exception as e:
+        logger.error("[%s] memory recall failed: %s", call_id, e)
+        return {"memory_block": ""}
+
+
+async def _rag_retrieve_node(state: CallGraphState) -> dict:
+    """Node ⑤: Agentic RAG（自适应检索 + 文档评分 + 查询改写）。"""
+    call_id = state.get("call_id", "?")
+    try:
+        rag_query = state["user_input"]
+
+        need_retrieve = await should_retrieve(rag_query, state["biz_type"])
+        if not need_retrieve:
+            logger.info("[%s] RAG skipped (greeting/closing)", call_id)
+            return {"rag_block": ""}
+
+        for attempt in range(settings.rag_max_retries + 1):
+            scripts = await retrieve_scripts(state["biz_type"], rag_query)
+            if scripts:
+                relevant = await grade_documents(rag_query, scripts)
+                if relevant:
+                    logger.info("[%s] RAG: %d relevant scripts found (attempt %d)", call_id, len(relevant), attempt + 1)
+                    return {"rag_block": build_rag_block(relevant)}
+
+            if attempt < settings.rag_max_retries:
+                rag_query = await rewrite_query(rag_query, scripts or [])
+                logger.info("[%s] RAG query rewritten (attempt %d): %s", call_id, attempt + 1, rag_query[:50])
+
+        logger.info("[%s] RAG: no relevant scripts after %d attempts", call_id, settings.rag_max_retries + 1)
+        return {"rag_block": ""}
+    except Exception as e:
+        logger.error("[%s] RAG failed: %s", call_id, e)
+        return {"rag_block": ""}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 1: Pre-LLM — ASR + 并行扇出
+# ═══════════════════════════════════════════════════════════════════
+
+async def run_pre_llm_phase(
+    call_id: str, biz_type: str, user_key: str, audio_bytes: bytes,
+    precomputed_asr_result: dict | None = None,
+) -> CallGraphState:
+    """Phase 1: ASR 识别 + 并行扇出（MCP 身份 + 记忆召回 + RAG 检索）。
+
+    Args:
+        call_id: 通话唯一标识
+        biz_type: 业务类型 (customer_service/collection/marketing)
+        user_key: 用户标识
+        audio_bytes: 用户音频 PCM
+        precomputed_asr_result: 已通过 gRPC/WS 流式获取的 ASR 结果（跳过 HTTP ASR）
+
+    Returns:
+        组装好的 CallGraphState，供 run_streaming_pipeline 使用
+    """
+    t0 = time.monotonic()
+
+    # ── ASR ──
+    state: CallGraphState = {
+        "call_id": call_id,
+        "biz_type": biz_type,
+        "user_key": user_key,
+        "user_input": "",
+        "audio_bytes": audio_bytes,
+        "asr_minio_key": None,
+        "identity": None,
+        "credit_result": None,
+        "memory_block": "",
+        "rag_block": "",
+        "llm_action": None,
+        "tts_minio_key": None,
+        "tts_audio": None,
+        "chat_history": [],
+    }
+
+    if precomputed_asr_result:
+        precomputed_text = precomputed_asr_result.get("text", "")
+        if precomputed_text:
+            state["user_input"] = precomputed_text
+            state["audio_bytes"] = None
+        asr_result = await _asr_node(state)
+        state.update(asr_result)
+        if precomputed_text:
+            state["user_input"] = precomputed_text
+    else:
+        asr_result = await _asr_node(state)
+        state.update(asr_result)
+
+    logger.info("[%s] ASR done: user_input=%s", call_id, state.get("user_input", "")[:50])
+
+    # ── 并行扇出: MCP 身份 + 记忆召回 + RAG ──
+    # TODO: re-enable after fixing MCP phone format + RedisSearch + Ollama structured_output
+    # identity, memory, rag = await asyncio.gather(
+    #     _mcp_identity_node(state),
+    #     _recall_memory_node(state),
+    #     _rag_retrieve_node(state),
+    # )
+    # state.update(identity)
+    # state.update(memory)
+    # state.update(rag)
+    # if biz_type == "marketing" and _mcp_client:
+    #     state.update(await _credit_query_node(state))
+
+    elapsed = (time.monotonic() - t0) * 1000
+    logger.info("[%s] pre-llm phase done in %.0fms", call_id, elapsed)
+
+    return state
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 2: 流式 LLM + TTS 管线
+# ═══════════════════════════════════════════════════════════════════
+
 async def run_streaming_pipeline(
     state: CallGraphState,
     audio_callback: Callable[[bytes, int], Awaitable[None]],
     action_callback: Callable[[str], Awaitable[None]] | None = None,
 ) -> LLMAction:
-    """流式 LLM+TTS 管线。LLM 流式输出 → 句子拆分 → 并行 TTS → 音频回调。
+    """Phase 2: LLM 流式输出 → SentenceSplitter 句级切分 → 并行 TTS → 音频回调。
 
     Args:
-        state: 包含 memory_block, rag_block 等预计算结果的 state
+        state: run_pre_llm_phase 返回的 state（含 memory_block, rag_block 等）
         audio_callback: (pcm_bytes, sentence_index) 每句 TTS 音频就绪时调用
         action_callback: action 类型确定时调用
     """
@@ -452,14 +385,8 @@ async def run_streaming_pipeline(
     biz_type = state["biz_type"]
     t0 = time.monotonic()
 
-    # Build prompt
-    prompt_path = os.path.join(os.path.dirname(__file__), "prompts", f"{biz_type}.yaml")
-    system_prompt = ""
-    if os.path.exists(prompt_path):
-        with open(prompt_path) as f:
-            data = yaml.safe_load(f)
-            system_prompt = data.get("system_prompt", data.get("template", ""))
-
+    # ── 构建 Prompt ──
+    system_prompt = _load_system_prompt(biz_type)
     messages = build_messages(
         biz_type=biz_type,
         system_prompt=system_prompt,
@@ -469,21 +396,23 @@ async def run_streaming_pipeline(
         chat_history=state.get("chat_history", []),
     )
 
+    # ── TTS 句级合成 ──
     splitter = SentenceSplitter(
         min_length=settings.splitter_min_length,
         flush_timeout=settings.splitter_flush_timeout,
         eager_first=settings.splitter_eager_first,
     )
     action_sent = False
+    detected_action: str = "say"
     full_text = ""
     tts_tasks: list[asyncio.Task] = []
 
     async def _tts_sentence(sentence: Sentence) -> None:
-        """TTS 合成单句并通过回调发送。"""
+        """TTS 合成单句 → 重采样 → 回调发送。"""
         if not sentence.text:
             return
 
-        # Streaming TTS path: WS streaming yields raw PCM chunks — 逐块发送
+        # Streaming TTS: WS 逐块返回原始 PCM
         if settings.tts_streaming_enabled and _tts_ws_client:
             try:
                 async for chunk in _tts_ws_client.synthesize_streaming_raw(
@@ -497,9 +426,10 @@ async def run_streaming_pipeline(
                 logger.error("[%s] streaming TTS sentence %d failed: %s", call_id, sentence.index, e)
                 return
 
-        # Batch TTS path: WS > gRPC > HTTP
-        client = _tts_ws_client or _tts_grpc_client or _tts_client
+        # Batch TTS: WS > gRPC > HTTP
+        transport, client = _get_tts_client()
         if client is None:
+            logger.warning("[%s] no TTS client for sentence %d", call_id, sentence.index)
             return
         try:
             wav = await client.synthesize_raw(sentence.text, call_id, biz_type)
@@ -507,43 +437,37 @@ async def run_streaming_pipeline(
                 pcm = _strip_wav_header(wav)
                 pcm = _resample_pcm(pcm, 22050, settings.media_sample_rate)
                 await audio_callback(pcm, sentence.index)
+                logger.debug("[%s] TTS sentence %d via %s: %d bytes", call_id, sentence.index, transport, len(pcm))
         except Exception as e:
-            logger.error("[%s] streaming TTS sentence %d failed: %s", call_id, sentence.index, e)
+            logger.error("[%s] TTS sentence %d via %s failed: %s", call_id, sentence.index, transport, e)
 
-    # Stream LLM tokens
+    # ── 流式 LLM ──
     try:
         async for event in llm.astream_action([m.model_dump() for m in messages]):
-            # Extract action type early
             if event.action and not action_sent:
                 action_sent = True
+                detected_action = event.action
                 if action_callback:
                     await action_callback(event.action)
 
-            # Feed text deltas to sentence splitter
             if event.text_delta:
                 full_text += event.text_delta
-                sentences = splitter.feed(event.text_delta)
-                for s in sentences:
+                for s in splitter.feed(event.text_delta):
                     tts_tasks.append(asyncio.create_task(_tts_sentence(s)))
 
-            # Check timeout flush
             for s in splitter.check_timeout():
                 tts_tasks.append(asyncio.create_task(_tts_sentence(s)))
 
-            # Final event
             if event.is_complete:
-                logger.info("[%s] LLM full text: %s", call_id, full_text)
-                # Flush remaining buffer
+                logger.info("[%s] LLM complete: action=%s text=%s", call_id, detected_action, full_text[:80])
                 final_sent = splitter.flush()
                 if final_sent:
                     tts_tasks.append(asyncio.create_task(_tts_sentence(final_sent)))
-
                 if not full_text and event.parsed:
                     full_text = event.parsed.get("text", "")
 
     except asyncio.CancelledError:
-        logger.info("[%s] streaming pipeline cancelled", call_id)
-        # Cancel all pending TTS tasks immediately
+        logger.info("[%s] streaming pipeline cancelled, cancelling %d TTS tasks", call_id, len(tts_tasks))
         for t in tts_tasks:
             if not t.done():
                 t.cancel()
@@ -553,30 +477,23 @@ async def run_streaming_pipeline(
     except Exception as e:
         logger.error("[%s] streaming LLM failed: %s", call_id, e)
 
-    # Ensure action was sent
+    # 兜底: 确保 action 已发送
     if not action_sent and action_callback:
         await action_callback("say")
 
-    # Wait for all TTS tasks
+    # 等待所有 TTS 任务完成
     if tts_tasks:
         await asyncio.gather(*tts_tasks, return_exceptions=True)
 
-    # Save chat history
-    try:
-        # TODO: re-enable after fixing RedisSearch (FT._LIST)
-        # history = get_chat_history(call_id, biz_type)
-        # await save_turn(history, state.get("user_input", ""), full_text)
-        pass
-    except Exception as e:
-        logger.warning("[%s] streaming save history failed: %s", call_id, e)
+    # TODO: re-enable chat history save after fixing RedisSearch
+    # try:
+    #     history = get_chat_history(call_id, biz_type)
+    #     await save_turn(history, state.get("user_input", ""), full_text)
+    # except Exception as e:
+    #     logger.warning("[%s] save history failed: %s", call_id, e)
 
     elapsed = (time.monotonic() - t0) * 1000
-    logger.info("[%s] streaming pipeline done in %.0fms, text=%s",
-                call_id, elapsed, full_text[:50])
+    logger.info("[%s] streaming pipeline done in %.0fms, %d sentences TTS'd",
+                call_id, elapsed, len(tts_tasks))
 
-    # Build final LLMAction
-    action_type = "say"
-    if action_sent:
-        # Try to get from final parsed event
-        pass
-    return LLMAction(action=action_type, text=full_text)
+    return LLMAction(action=detected_action, text=full_text)
