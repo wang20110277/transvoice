@@ -42,6 +42,7 @@ aiphone/
 │   ├── README.md           # 组件文档
 │   └── tests/              # test_base, test_main, test_storage, engines/*/
 ├── agent-tts/              # TTS 服务 (FastAPI + gRPC + WebSocket, 内置 GPU 推理)
+│   ├── CosyVoice/          # CosyVoice 源码 (推理运行时)
 │   ├── ttsadapter/         # 服务核心: main.py, base.py, config.py, requirements.txt
 │   │   ├── engines/        # cosyvoice/ (CosyVoice3 GPU), edgetts/ (Edge 在线, 无需 GPU), vibevoice/ (远程 HTTP)
 │   │   ├── grpc_server.py  # gRPC TTS 服务 (unary, :50052)
@@ -60,13 +61,13 @@ aiphone/
 │   │   ├── clients/        # mcp.py (用户中心), tts.py (TTS), asr.py (ASR), esl.py (Event Socket, 自动重连+心跳)
 │   │   │                    # tts_grpc_client.py, asr_grpc_client.py, asr_grpc/, tts_grpc/ (gRPC proto)
 │   │   │                    # tts_ws_client.py, asr_ws_client.py (WebSocket 第三传输)
-│   │   ├── ws/             # handler.py (同步+流式), vad.py (可插拔 VAD: WebRTC/Silero), jitter_buffer.py,
+│   │   ├── ws/             # handler.py (StreamingCallHandler 流式+打断), vad.py (可插拔 VAD: WebRTC/Silero), jitter_buffer.py,
 │   │   │                    # registry.py (ActiveCallRegistry), denoise.py (前置降噪)
 │   │   ├── graph/          # flow.py (7 节点 StateGraph + 流式管道), prompt.py, prompts/{biz_type}.yaml
 │   │   ├── llm/            # service.py, json_stream.py (增量JSON), sentence_splitter.py (句级切分)
 │   │   ├── memory/         # assembler.py, chat_history.py, redis_memory.py, store.py
 │   │   ├── rag/            # retriever.py (Agentic RAG: 自适应检索+文档评分+查询改写)
-│   │   ├── db/             # models.py (SQLAlchemy ORM, callbot schema, 9 表)
+│   │   ├── db/             # models.py (SQLAlchemy ORM, callbot schema, 8 表: call_session, call_turn, call_event, call_artifact, config_snapshot, user_memory_fact, user_memory_vector, script_library)
 │   │   └── storage/        # repository.py (异步仓储层), minio_storage.py (MinIO 对象存储)
 │   ├── llm/                # Qwen LLM 推理引擎 Dockerfile (vLLM)
 │   ├── alembic/            # 数据库迁移 (versions/0001_initial_schema.py)
@@ -103,7 +104,7 @@ aiphone/
 ├── openspec/               # 变更提案 (OpenSpec)
 ├── docker-compose.yml      # 基础 Docker Compose (基础设施 + 服务)
 ├── docker-compose.prod.yml # 生产覆盖 (GPU固定, 健康检查)
-└── env.example             # 环境变量模板
+└── .env                     # 环境变量 (CALLBOT_ 前缀, 不提交)
 ```
 
 ### 引擎插件模式 (ASR & TTS)
@@ -318,7 +319,7 @@ aiphone/
 - ASR（GPU0）：GPU×1、CPU 16C、内存 64GB（agent-asr 内置推理）
 - modelscope download --model iic/SenseVoiceSmall
 - TTS（GPU1）：GPU×1、CPU 16C、内存 64GB（agent-tts 内置推理）
-- modelscope download --model iic/CosyVoice3-0.5B
+- modelscope download --model FunAudioLLM/Fun-CosyVoice3-0.5B-2512
 - Qwen3.5-9B（GPU2）：GPU×1、CPU 32C、内存 128GB
 - modelscope download --model Qwen/Qwen3.5-9B
 - 推理引擎: `agent-flow/llm/Dockerfile`
@@ -360,7 +361,7 @@ aiphone/
 
 **CosyVoice TTS** (内置 CosyVoice3 GPU 推理):
 - 单服务部署: `agent-tts/` (Dockerfile 内置 PyTorch + CosyVoice 运行时 + 模型下载)
-- 模型下载: `modelscope download --model iic/CosyVoice3-0.5B`
+- 模型下载: `modelscope download --model FunAudioLLM/Fun-CosyVoice3-0.5B-2512`
 - 切换引擎: 修改 `ttsadapter/config.yaml` 中 `engine: cosyvoice`
 
 **EdgeTTS** (微软 Edge 在线 TTS, 无需 GPU):
@@ -460,7 +461,7 @@ aiphone/
 - `llm/service.py`：Qwen3.5-9B 调用 + JSON schema 校验 + 流式输出 + 超时重试 + 降级
 - `llm/json_stream.py`：IncrementalJSONParser 从 LLM token 流增量解析结构化字段
 - `llm/sentence_splitter.py`：SentenceSplitter 将流式 token 切分为 TTS 就绪句子
-- `ws/handler.py`：WebSocket 处理器（CallWebSocketHandler 同步 + StreamingCallHandler 流式+打断）
+- `ws/handler.py`：WebSocket 处理器（StreamingCallHandler 流式+打断）
 - `ws/vad.py`：可插拔 VAD 语音端点检测 + 打断语音检测（WebRTC / Silero，工厂函数 `create_vad()`）
 - `ws/denoise.py`：VAD 前置降噪（highpass/noisereduce/rnnoise），工厂函数读取 `CALLBOT_DENOISE_ENABLED`
 - `ws/jitter_buffer.py`：JitterBuffer 输入平滑 + TTSOutputBuffer 稳态30ms帧输出
@@ -913,6 +914,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 │   ├── models/        # SenseVoiceSmall/ 本地模型权重
 │   └── Dockerfile     # PyTorch GPU 镜像
 ├── agent-tts/
+│   ├── CosyVoice/     # CosyVoice 源码 (推理运行时)
 │   ├── ttsadapter/    # TTS 服务 (FastAPI + gRPC + WebSocket, 内置 GPU 推理, HTTP:8081, gRPC:50052)
 │   ├── models/        # CosyVoice3-0.5B/ 本地模型权重
 │   └── Dockerfile     # PyTorch GPU 镜像
@@ -929,7 +931,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 │   └── prod.sh            # 生产部署 (Docker Compose)
 ├── docker-compose.yml     # 基础编排
 ├── docker-compose.prod.yml # 生产覆盖
-└── env.example            # 环境变量模板
+└── .env                   # 环境变量 (CALLBOT_ 前缀, 不提交)
 ```
 
 ## 部署顺序
@@ -1130,7 +1132,6 @@ FreeSWITCH 拨号计划 `answer` + `playback silence_stream://-1`（无限静音
 | docker-compose.prod.yml | 1.0 | 2026-05-25 |
 | scripts/local.sh | 1.0 | 2026-05-25 |
 | scripts/prod.sh | 1.0 | 2026-05-25 |
-| env.example | 1.0 | 2026-05-25 |
 
 ## 联系方式
 
