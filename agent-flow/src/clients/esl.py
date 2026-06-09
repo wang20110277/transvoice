@@ -41,6 +41,7 @@ class ESLClient:
         self._event_task: Optional[asyncio.Task] = None
         self._reconnect_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._reconnecting = False
         self._reconnect_delay = self.RECONNECT_BASE_DELAY
         self._io_lock = asyncio.Lock()
 
@@ -192,11 +193,10 @@ class ESLClient:
         self._reconnect_delay = self.RECONNECT_BASE_DELAY
 
     async def _reconnect(self) -> None:
-        """断线后自动重连 (指数退避)。"""
-        if self._closing:
+        """断线后自动重连 (指数退避)。防重入：同一时间只允许一个重连流程。"""
+        if self._closing or self._reconnecting:
             return
-        if self._reconnect_task and not self._reconnect_task.done():
-            return
+        self._reconnecting = True
         self._connected = False
         self._cleanup_connection()
         logger.warning("ESL connection lost, reconnecting to %s:%d ...", self._host, self._port)
@@ -211,8 +211,10 @@ class ESLClient:
                 self._event_task = asyncio.create_task(self._event_loop())
                 self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
                 logger.info("ESL reconnected to %s:%d", self._host, self._port)
+                self._reconnecting = False
                 return
             except asyncio.CancelledError:
+                self._reconnecting = False
                 return
             except Exception as e:
                 logger.error("ESL reconnect failed: %s, retry in %.1fs", e, self._reconnect_delay)

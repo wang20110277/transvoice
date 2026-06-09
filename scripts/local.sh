@@ -73,16 +73,16 @@ get_pid() {
   [[ -f "$pidfile" ]] && cat "$pidfile" || echo ""
 }
 
-# 按端口杀进程（解决 conda run 子进程不被 PID 杀死的问题）
+# 按端口杀监听进程（只杀 LISTEN 状态，避免误杀作为客户端连接到该端口的进程如 FreeSWITCH）
 kill_by_port() {
   local port=$1
   local pids
-  pids=$(lsof -i :"$port" -t 2>/dev/null) || true
+  pids=$(lsof -i :"$port" -sTCP:LISTEN -t 2>/dev/null) || true
   if [[ -n "$pids" ]]; then
     echo "$pids" | xargs kill 2>/dev/null || true
     # 等待进程退出
     for i in $(seq 1 10); do
-      pids=$(lsof -i :"$port" -t 2>/dev/null) || true
+      pids=$(lsof -i :"$port" -sTCP:LISTEN -t 2>/dev/null) || true
       [[ -z "$pids" ]] && return 0
       sleep 0.5
     done
@@ -120,30 +120,49 @@ stop_svc() {
       if is_running "$ASR_PORT"; then
         info "停止 ASR ..."
         kill_by_port "$ASR_PORT"
-        info "ASR 已停止"
-      else
-        info "ASR 未在运行"
       fi
+      local stale_asr
+      stale_asr=$(pgrep -f "uvicorn main:app.*--port $ASR_PORT" 2>/dev/null) || true
+      if [[ -n "$stale_asr" ]]; then
+        info "清理残留 ASR 进程: $stale_asr"
+        echo "$stale_asr" | xargs kill 2>/dev/null || true
+        sleep 1
+        echo "$stale_asr" | xargs kill -9 2>/dev/null || true
+      fi
+      info "ASR 已停止"
       rm -f "$PID_DIR/asr.pid"
       ;;
     tts)
       if is_running "$TTS_PORT"; then
         info "停止 TTS ..."
         kill_by_port "$TTS_PORT"
-        info "TTS 已停止"
-      else
-        info "TTS 未在运行"
       fi
+      local stale_tts
+      stale_tts=$(pgrep -f "uvicorn main:app.*--port $TTS_PORT" 2>/dev/null) || true
+      if [[ -n "$stale_tts" ]]; then
+        info "清理残留 TTS 进程: $stale_tts"
+        echo "$stale_tts" | xargs kill 2>/dev/null || true
+        sleep 1
+        echo "$stale_tts" | xargs kill -9 2>/dev/null || true
+      fi
+      info "TTS 已停止"
       rm -f "$PID_DIR/tts.pid"
       ;;
     flow)
       if is_running "$FLOW_PORT"; then
         info "停止 agent-flow ..."
         kill_by_port "$FLOW_PORT"
-        info "agent-flow 已停止"
-      else
-        info "agent-flow 未在运行"
       fi
+      # 杀所有残留的 uvicorn 进程（conda run 子进程可能脱离端口监听但 ESL 连接仍在）
+      local stale
+      stale=$(pgrep -f "uvicorn main:app.*--port $FLOW_PORT" 2>/dev/null) || true
+      if [[ -n "$stale" ]]; then
+        info "清理残留 agent-flow 进程: $stale"
+        echo "$stale" | xargs kill 2>/dev/null || true
+        sleep 1
+        echo "$stale" | xargs kill -9 2>/dev/null || true
+      fi
+      info "agent-flow 已停止"
       rm -f "$PID_DIR/flow.pid"
       ;;
     mcp)

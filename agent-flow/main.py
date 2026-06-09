@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 _initialized = False
 _streaming_handler = None
 _call_registry = ActiveCallRegistry()
+_audio_fork_started: set[str] = set()  # 防止 ESL 多连接重复触发 audio_fork_start
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -127,6 +128,7 @@ def _create_esl_event_handlers(esl: ESLClient) -> None:
         if not uuid:
             return
         logger.info("[%s] CHANNEL_HANGUP", uuid)
+        _audio_fork_started.discard(uuid)
         try:
             await esl.audio_fork_stop(uuid)
         except Exception:
@@ -137,6 +139,13 @@ def _create_esl_event_handlers(esl: ESLClient) -> None:
         uuid = event.headers.get("Unique-ID", "")
         if not uuid:
             return
+
+        # 防止 ESL 多连接重复触发（set.add 是同步原子操作）
+        if uuid in _audio_fork_started:
+            logger.info("[%s] CHANNEL_ANSWER duplicate, ignoring", uuid)
+            return
+        _audio_fork_started.add(uuid)
+
         biz_type = event.headers.get("variable_biz_type", "marketing")
         user_key = (
             event.headers.get("variable_user_key", "")

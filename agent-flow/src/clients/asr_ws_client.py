@@ -41,8 +41,13 @@ class ASRWebSocketClient:
                 response = await ws.recv()
                 result = json.loads(response)
                 if result.get("type") == "result":
+                    text = result.get("text", "")
+                    logger.info(
+                        "[WS-ASR] recognize call_id=%s text=%s confidence=%.2f",
+                        call_id, text, result.get("confidence", 0.0),
+                    )
                     return {
-                        "text": result.get("text", ""),
+                        "text": text,
                         "confidence": result.get("confidence", 0.0),
                         "is_final": result.get("is_final", True),
                         "minio_key": result.get("minio_key") or None,
@@ -139,6 +144,10 @@ class ASRWsStream:
                         "is_final": True,
                         "minio_key": msg.get("minio_key") or None,
                     }
+                    logger.info(
+                        "[WS-ASR] result call_id=%s text=%s confidence=%.2f",
+                        self._call_id, self._result["text"], self._result["confidence"],
+                    )
                     self._result_event.set()
                     break
 
@@ -175,12 +184,7 @@ class ASRWsStream:
             if self._receiver_task and not self._receiver_task.done():
                 self._receiver_task.cancel()
         else:
-            # 批量模式: 同步等待响应
-            if self._sender_task and not self._sender_task.done():
-                try:
-                    await self._sender_task
-                except Exception:
-                    pass
+            # 批量模式: 直接等待服务端响应（sender_loop 是无限循环，不能 await）
             if self._ws:
                 try:
                     response = await asyncio.wait_for(self._ws.recv(), timeout=15.0)
@@ -192,6 +196,12 @@ class ASRWsStream:
                             "is_final": True,
                             "minio_key": result.get("minio_key") or None,
                         }
+                        logger.info(
+                            "[WS-ASR] finish result call_id=%s text=%s",
+                            self._call_id, self._result["text"],
+                        )
+                except Exception as e:
+                    logger.error("[WS-ASR] finish failed call_id=%s: %s", self._call_id, e)
                 except Exception as e:
                     logger.error("[WS-ASR] finish failed call_id=%s: %s", self._call_id, e)
 
