@@ -22,8 +22,8 @@ modelscope>=1.20.0
 torch-complex>=0.4.4
 
 # gRPC
-grpcio==1.57.0
-grpcio-tools==1.57.0
+grpcio>=1.62.0
+grpcio-tools>=1.62.0
 protobuf>=5.0.0
 
 # WebSocket

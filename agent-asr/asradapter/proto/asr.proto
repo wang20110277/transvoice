@@ -7,11 +7,11 @@ package asr;
 // 默认端口: 50051
 service ASRService {
   // 流式语音识别 — 客户端流式发送音频帧，服务端在流结束时返回最终识别结果
-  rpc StreamingRecognize (stream StreamingRecognizeRequest) returns (StreamingRecognizeResponse);
+  rpc Recognize (stream RecognizeRequest) returns (RecognizeResponse);
 }
 
 // 请求消息 — 首条消息发送 config，后续逐帧发送 audio_chunk
-message StreamingRecognizeRequest {
+message RecognizeRequest {
   oneof request {
     // 音频数据帧（raw PCM 8kHz 16-bit mono）
     bytes audio_chunk = 1;
@@ -28,7 +28,7 @@ message RecognitionConfig {
 }
 
 // 识别响应
-message StreamingRecognizeResponse {
+message RecognizeResponse {
   string text = 1;        // 识别文本
   double confidence = 2;  // 置信度 [0, 1]
   bool is_final = 3;      // 是否为最终结果（当前实现始终为 true）

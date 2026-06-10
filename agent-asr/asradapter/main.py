@@ -1,9 +1,8 @@
 import os
-import json
 import yaml
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, Form, WebSocket
+from fastapi import FastAPI, WebSocket
 from asradapter.config import load_asr_engine
 from asradapter.grpc_server import serve_grpc
 from asradapter.ws_server import ASRWebSocketHandler
@@ -54,25 +53,6 @@ async def healthz():
     """
     healthy = await engine.health_check() if engine else False
     return {"status": "ok" if healthy else "degraded"}
-
-
-@app.post("/asr/recognize-speech")
-async def recognize_speech(audio: UploadFile, params: str = Form("{}")):
-    """语音识别 — 上传音频文件，返回识别文本。
-
-    Args (multipart/form-data):
-        audio: 音频文件（PCM / WAV，8kHz/16kHz 16-bit mono）
-        params: JSON 字符串，可选字段：
-            - call_id (str): 通话ID，用于 MinIO 音频归档
-            - language (str): 语言代码，默认 "zh"
-
-    Returns:
-        {"text": str, "confidence": float, "is_final": bool}
-    """
-    audio_bytes = await audio.read()
-    params_dict = json.loads(params)
-    result = await engine.recognize(audio_bytes, params_dict)
-    return {"text": result.text, "confidence": result.confidence, "is_final": result.is_final}
 
 
 # ── WebSocket 接口 ───────────────────────────────────────────

@@ -41,11 +41,11 @@ silero-vad>=5.1.0
 scipy>=1.12.0
 
 # Denoise
-pyrnnoise>=0.4.0
+# pyrnnoise>=0.4.0  # macOS 无预编译 wheel，按需启用
 
 # gRPC (ASR/TTS streaming)
-grpcio==1.57.0
-grpcio-tools==1.57.0
+grpcio>=1.62.0
+grpcio-tools>=1.62.0
 protobuf>=5.0.0
 
 # Monitoring

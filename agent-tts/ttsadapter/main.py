@@ -1,11 +1,8 @@
 import os
-import json
-import base64
 import yaml
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Form, WebSocket
-from fastapi.responses import Response, JSONResponse
+from fastapi import FastAPI, WebSocket
 from ttsadapter.config import load_tts_engine
 from ttsadapter.grpc_server import serve_grpc
 from ttsadapter.ws_server import TTSWebSocketHandler
@@ -56,50 +53,6 @@ async def healthz():
     """
     healthy = await engine.health_check() if engine else False
     return {"status": "ok" if healthy else "degraded"}
-
-
-@app.post("/tts/synthesize-binary")
-async def synthesize_binary(text: str = Form(...), params: str = Form("{}")):
-    """语音合成（二进制响应）— 文本转音频，直接返回音频二进制。
-
-    Args (application/x-www-form-urlencoded):
-        text: 待合成文本
-        params: JSON 字符串，可选字段：
-            - call_id (str): 通话ID，用于 MinIO 音频归档
-            - biz_type (str): 业务类型，决定音色/语速等参数
-            - voice_id (str): 指定音色ID
-
-    Returns:
-        二进制音频流（WAV/PCM），Content-Type 由引擎决定。
-        若启用 MinIO，响应头包含 X-Minio-Key。
-    """
-    params_dict = json.loads(params)
-    result = await engine.synthesize(text, params_dict)
-    return Response(content=result.audio, media_type=result.content_type)
-
-
-@app.post("/tts/synthesize-json")
-async def synthesize_json(text: str = Form(...), params: str = Form("{}")):
-    """语音合成（JSON 响应）— 文本转音频，返回 base64 编码的 JSON。
-
-    Args (application/x-www-form-urlencoded):
-        text: 待合成文本
-        params: JSON 字符串，可选字段：
-            - call_id (str): 通话ID，用于 MinIO 音频归档
-            - biz_type (str): 业务类型，决定音色/语速等参数
-            - voice_id (str): 指定音色ID
-
-    Returns:
-        {"audio": str(base64), "content_type": str, "duration_ms": int}
-    """
-    params_dict = json.loads(params)
-    result = await engine.synthesize(text, params_dict)
-    audio_b64 = base64.b64encode(result.audio).decode("ascii") if result.audio else ""
-    return JSONResponse(content={
-        "audio": audio_b64,
-        "content_type": result.content_type,
-        "duration_ms": result.duration_ms,
-    })
 
 
 # ── WebSocket 接口 ───────────────────────────────────────────

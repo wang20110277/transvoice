@@ -24,7 +24,7 @@ class ASRGrpcServicer(asr_pb2_grpc.ASRServiceServicer):
     def __init__(self, engine: ASREngine):
         self._engine = engine
 
-    async def StreamingRecognize(self, request_iterator, context):
+    async def Recognize(self, request_iterator, context):
         """接收流式音频帧，累积后批量识别。流关闭时返回最终结果，并异步上传 MinIO。"""
         call_id = ""
         language = "zh"
@@ -38,9 +38,9 @@ class ASRGrpcServicer(asr_pb2_grpc.ASRServiceServicer):
                 audio_chunks.append(request.audio_chunk)
 
         audio_bytes = b"".join(audio_chunks)
-        logger.info("[gRPC] StreamingRecognize call_id=%s size=%d bytes", call_id, len(audio_bytes))
+        logger.info("[gRPC] Recognize call_id=%s size=%d bytes", call_id, len(audio_bytes))
         if not audio_bytes:
-            return asr_pb2.StreamingRecognizeResponse(
+            return asr_pb2.RecognizeResponse(
                 text="", confidence=0.0, is_final=True,
             )
 
@@ -49,11 +49,11 @@ class ASRGrpcServicer(asr_pb2_grpc.ASRServiceServicer):
             result = await self._engine.recognize(audio_bytes, params)
         except Exception as e:
             logger.error("gRPC ASR recognize error call_id=%s: %s", call_id, e)
-            return asr_pb2.StreamingRecognizeResponse(
+            return asr_pb2.RecognizeResponse(
                 text="", confidence=0.0, is_final=True,
             )
 
-        return asr_pb2.StreamingRecognizeResponse(
+        return asr_pb2.RecognizeResponse(
             text=result.text,
             confidence=result.confidence,
             is_final=True,

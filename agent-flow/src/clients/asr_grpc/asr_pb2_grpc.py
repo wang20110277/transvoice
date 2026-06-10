@@ -5,7 +5,7 @@ import warnings
 
 from clients.asr_grpc import asr_pb2 as asr__pb2
 
-GRPC_GENERATED_VERSION = '1.80.0'
+GRPC_GENERATED_VERSION = '1.81.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -25,7 +25,7 @@ if _version_not_supported:
     )
 
 
-class ASRServiceStub(object):
+class ASRServiceStub:
     """── ASR 语音识别服务（客户端流式）────────────────────────────
     客户端逐帧发送音频，流结束后服务端返回识别结果。
     默认端口: 50051
@@ -37,20 +37,20 @@ class ASRServiceStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.StreamingRecognize = channel.stream_unary(
-                '/asr.ASRService/StreamingRecognize',
-                request_serializer=asr__pb2.StreamingRecognizeRequest.SerializeToString,
-                response_deserializer=asr__pb2.StreamingRecognizeResponse.FromString,
+        self.Recognize = channel.stream_unary(
+                '/asr.ASRService/Recognize',
+                request_serializer=asr__pb2.RecognizeRequest.SerializeToString,
+                response_deserializer=asr__pb2.RecognizeResponse.FromString,
                 _registered_method=True)
 
 
-class ASRServiceServicer(object):
+class ASRServiceServicer:
     """── ASR 语音识别服务（客户端流式）────────────────────────────
     客户端逐帧发送音频，流结束后服务端返回识别结果。
     默认端口: 50051
     """
 
-    def StreamingRecognize(self, request_iterator, context):
+    def Recognize(self, request_iterator, context):
         """流式语音识别 — 客户端流式发送音频帧，服务端在流结束时返回最终识别结果
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -60,10 +60,10 @@ class ASRServiceServicer(object):
 
 def add_ASRServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'StreamingRecognize': grpc.stream_unary_rpc_method_handler(
-                    servicer.StreamingRecognize,
-                    request_deserializer=asr__pb2.StreamingRecognizeRequest.FromString,
-                    response_serializer=asr__pb2.StreamingRecognizeResponse.SerializeToString,
+            'Recognize': grpc.stream_unary_rpc_method_handler(
+                    servicer.Recognize,
+                    request_deserializer=asr__pb2.RecognizeRequest.FromString,
+                    response_serializer=asr__pb2.RecognizeResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -73,14 +73,14 @@ def add_ASRServiceServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class ASRService(object):
+class ASRService:
     """── ASR 语音识别服务（客户端流式）────────────────────────────
     客户端逐帧发送音频，流结束后服务端返回识别结果。
     默认端口: 50051
     """
 
     @staticmethod
-    def StreamingRecognize(request_iterator,
+    def Recognize(request_iterator,
             target,
             options=(),
             channel_credentials=None,
@@ -93,9 +93,9 @@ class ASRService(object):
         return grpc.experimental.stream_unary(
             request_iterator,
             target,
-            '/asr.ASRService/StreamingRecognize',
-            asr__pb2.StreamingRecognizeRequest.SerializeToString,
-            asr__pb2.StreamingRecognizeResponse.FromString,
+            '/asr.ASRService/Recognize',
+            asr__pb2.RecognizeRequest.SerializeToString,
+            asr__pb2.RecognizeResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -33,12 +33,12 @@ class ASRGrpcClient:
             stub = asr_pb2_grpc.ASRServiceStub(self._channel)
 
             async def _request_iterator():
-                yield asr_pb2.StreamingRecognizeRequest(
+                yield asr_pb2.RecognizeRequest(
                     config=asr_pb2.RecognitionConfig(call_id=call_id)
                 )
-                yield asr_pb2.StreamingRecognizeRequest(audio_chunk=audio_bytes)
+                yield asr_pb2.RecognizeRequest(audio_chunk=audio_bytes)
 
-            response = await stub.StreamingRecognize(_request_iterator(), timeout=self._timeout)
+            response = await stub.Recognize(_request_iterator(), timeout=self._timeout)
             return {
                 "text": response.text,
                 "confidence": response.confidence,
@@ -77,7 +77,7 @@ class ASRStream:
 
     async def start(self) -> None:
         self._queue = asyncio.Queue()
-        self._rpc = self._stub.StreamingRecognize(
+        self._rpc = self._stub.Recognize(
             self._request_iterator(), timeout=self._timeout,
         )
 
@@ -98,10 +98,10 @@ class ASRStream:
             return
         if not self._config_sent:
             self._config_sent = True
-            self._queue.put_nowait(asr_pb2.StreamingRecognizeRequest(
+            self._queue.put_nowait(asr_pb2.RecognizeRequest(
                 config=asr_pb2.RecognitionConfig(call_id=self._call_id),
             ))
-        self._queue.put_nowait(asr_pb2.StreamingRecognizeRequest(audio_chunk=chunk))
+        self._queue.put_nowait(asr_pb2.RecognizeRequest(audio_chunk=chunk))
 
     async def finish(self) -> dict | None:
         """Signal end-of-stream and wait for the final ASR result."""

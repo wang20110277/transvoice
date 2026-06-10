@@ -1,6 +1,6 @@
 # ══════════════════════════════════════════════════
-# 本地开发 — Docker 服务 (基础设施 + MCP)
-# ASR/TTS/agent-flow/Ollama 均本地 conda 运行
+# 本地开发 — Docker 服务 (基础设施)
+# ASR/TTS/MCP/FLOW/Ollama 均本地 conda 运行
 # 启动: ./scripts/dev.sh
 # ══════════════════════════════════════════════════
 

@@ -25,13 +25,6 @@ services:
             - driver: nvidia
               device_ids: ["${TTS_GPU_ID:-1}"]
               capabilities: [gpu]
-
-  agent-flow:
-    environment:
-      CALLBOT_LLM_BASE_URL: ${CALLBOT_LLM_BASE_URL:-http://vllm:8083/v1}
-      CALLBOT_LLM_MODEL: ${VLLM_SERVED_NAME:-qwen3.5:9b}
-      CALLBOT_LLM_DEVICE: gpu
-      CALLBOT_MCP_SERVER_URL: ${CALLBOT_MCP_SERVER_URL:-http://agent-mcp:9090/mcp/}
   
   agent-mcp:
     image: eclipse-temurin:21-jre
@@ -42,3 +35,11 @@ services:
     volumes:
       - ./agent-mcp/java-mcp-server/target/mcp-server-0.0.1-SNAPSHOT.jar:/app/app.jar:ro
     command: ["java", "-jar", "/app/app.jar"]
+
+  agent-flow:
+    environment:
+      CALLBOT_LLM_BASE_URL: ${CALLBOT_LLM_BASE_URL:-http://vllm:8083/v1}
+      CALLBOT_LLM_MODEL: ${VLLM_SERVED_NAME:-qwen3.5:4b}
+      CALLBOT_LLM_DEVICE: gpu
+      CALLBOT_MCP_SERVER_URL: ${CALLBOT_MCP_SERVER_URL:-http://agent-mcp:9090/mcp/}
+
