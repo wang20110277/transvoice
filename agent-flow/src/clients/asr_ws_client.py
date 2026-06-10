@@ -206,6 +206,18 @@ class ASRWsStream:
                     logger.error("[WS-ASR] finish failed call_id=%s: %s", self._call_id, e)
 
         await self._close_ws()
+        # _sender_loop 在 queue.get() 上阻塞，发送哨兵或取消 task 避免泄漏
+        if self._sender_task and not self._sender_task.done():
+            if self._queue is not None:
+                self._queue.put_nowait(None)
+            try:
+                await asyncio.wait_for(self._sender_task, timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._sender_task.cancel()
+                try:
+                    await self._sender_task
+                except asyncio.CancelledError:
+                    pass
         return self._result
 
     async def cancel(self) -> None:
