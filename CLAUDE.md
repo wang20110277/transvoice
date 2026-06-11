@@ -289,7 +289,7 @@ Data flow per turn (event-driven, dynamic uuid_audio_fork):
 并行: MCP身份查询 ‖ 记忆召回 ‖ RAG检索 (fan-out 并发)
 决策: LLM 流式输出 → IncrementalJSONParser → SentenceSplitter → 句级文本
 合成: 每句并行 TTS(gRPC/HTTP/WS) → WAV→PCM → _resample_pcm(22050→16000) → TTSOutputBuffer 稳态30ms帧(960B) → WebSocket → FreeSWITCH
-打断: 用户说话检测 → ESL uuid_break → 取消流式任务 → 新一轮对话
+打断: 用户说话检测 → TTS buffer 清空（不调用 uuid_break，避免终止 dialplan playback）→ 冷却期防误触发 → 新一轮对话
 挂断: ESL CHANNEL_HANGUP → audio_fork_stop → ActiveCallRegistry 取消 → 清理资源
 ```
 
@@ -299,7 +299,7 @@ Data flow per turn (event-driven, dynamic uuid_audio_fork):
 
 **agent-tts** — FastAPI + gRPC + WebSocket service with pluggable TTS engines and built-in GPU inference. Loads CosyVoice3 model directly in-process, no separate inference server needed. Receives text from orchestrator, synthesizes audio, uploads to MinIO. Disk cache keyed by voice+text hash, biz_type voice profiles. HTTP endpoints: `POST /tts/synthesize-binary` (binary audio response), `POST /tts/synthesize-json` (JSON with base64 audio + minio_key), `GET /healthz`. gRPC endpoint: `TTSService.Synthesize` (unary, port 50052). WebSocket endpoint: streaming text-to-speech via `ws_server.py`.
 
-**agent-flow** — FastAPI WebSocket service (uvloop event loop). **Event-driven audio fork**: ESL subscribes to `CHANNEL_ANSWER` + `CHANNEL_HANGUP`. On CHANNEL_ANSWER: registers call in `ActiveCallRegistry`, calls `esl.audio_fork_start()` → FreeSWITCH connects WebSocket to `/media/{uuid}` for bidirectional 16kHz audio. On CHANNEL_HANGUP: calls `esl.audio_fork_stop()` + `cancel_call()` for cleanup. Streaming mode: LLM tokens streamed via `IncrementalJSONParser`, split into sentences by `SentenceSplitter`, each sentence synthesized by TTS in parallel (gRPC, HTTP, or WebSocket), resampled from 22050→16000 via `_resample_pcm()`, PCM audio paced through `TTSOutputBuffer` at steady 30ms frames (960B @ 16kHz). TTSOutputBuffer 无 TTS 数据时自动填充静音帧保活（silence_timeout=120s），与拨号计划 `silence_stream://-1` 双重保活。Barge-in: concurrent audio receive during AI speech with pluggable VAD detection (WebRTC or Silero), ESL `uuid_break` to stop FreeSWITCH playback. Input audio smoothed through `JitterBuffer`, pre-VAD denoising via configurable denoiser (highpass/noisereduce/rnnoise). Endpoints: `GET /healthz`, `WS /media/{uuid}`. ASR/TTS gRPC streaming optional via feature flags (`CALLBOT_ASR_USE_GRPC`, `CALLBOT_TTS_USE_GRPC`). WebSocket streaming as third transport via `asr_ws_client.py` and `tts_ws_client.py`.
+**agent-flow** — FastAPI WebSocket service (uvloop event loop). **Event-driven audio fork**: ESL subscribes to `CHANNEL_ANSWER` + `CHANNEL_HANGUP`. On CHANNEL_ANSWER: registers call in `ActiveCallRegistry`, calls `esl.audio_fork_start()` → FreeSWITCH connects WebSocket to `/media/{uuid}` for bidirectional 16kHz audio. On CHANNEL_HANGUP: calls `esl.audio_fork_stop()` + `cancel_call()` for cleanup. **Prompt loading**: Redis cache (5min TTL) → PostgreSQL `callbot.prompt_config` two-level fallback via `prompt_config.py`; prompt content logged per turn. Streaming mode: LLM tokens streamed via `IncrementalJSONParser`, split into sentences by `SentenceSplitter`, each sentence synthesized by TTS in parallel (gRPC, HTTP, or WebSocket), resampled from 22050→16000 via `_resample_pcm()`, PCM audio paced through `TTSOutputBuffer` at steady 30ms frames (960B @ 16kHz). TTSOutputBuffer 无 TTS 数据时自动填充静音帧保活（silence_timeout=120s），与拨号计划 `silence_stream://-1` 双重保活。Barge-in: concurrent audio receive during AI speech with pluggable VAD detection (WebRTC/Silero + RMS energy gating), clears `TTSOutputBuffer` (not `uuid_break`) to avoid terminating dialplan playback, followed by cooldown period to prevent residual noise false positives. Input audio smoothed through `JitterBuffer`, pre-VAD denoising via configurable denoiser (highpass/noisereduce/rnnoise). Endpoints: `GET /healthz`, `WS /media/{uuid}`. ASR/TTS gRPC streaming optional via feature flags (`CALLBOT_ASR_USE_GRPC`, `CALLBOT_TTS_USE_GRPC`). WebSocket streaming as third transport via `asr_ws_client.py` and `tts_ws_client.py`.
 
 **java-mcp-server** — Spring Boot 4.0 + Spring AI 2.0 stateless MCP server (WebMVC transport). Serves as the user center backend for orchestrator nodes ② and ③. Uses `@McpTool`/`@McpToolParam` annotations (from `spring-ai-mcp-annotations`) with `annotation-scanner` auto-detection, no manual `ToolCallbackProvider` bean needed. Exposes two MCP tools: `user_identity_query` (phone + biz_type → user_id, phone_masked, id_card_last_four) and `user_credit_query` (user_id → credit_qualified, risk_level). Endpoint: `POST /mcp` on port 9090.
 
@@ -336,7 +336,7 @@ Three biz_types: `customer_service`, `collection`, `marketing`. Isolated at:
 - TTS: voice profiles per engine (`BIZ_TYPE_PROFILES` dict with voice_id/speed/volume/pitch)
 - Redis: key prefix `cb:{biz_type}:...`
 - PostgreSQL: `biz_type` column on all tables; sharding strategy: 单表起步，后期 Citus/pgcat 水平扩展，分布键 `user_id`（非 biz_type）
-- Prompts: `prompts/{biz_type}.yaml`
+- Prompts: `callbot.prompt_config` table (Redis 缓存 → DB 两级降级, `prompt_config.py`)
 - Credit query: only marketing biz_type
 
 ### Agentic RAG (node ⑤)
@@ -359,8 +359,10 @@ Full adaptive + corrective RAG inside `rag_retrieve_node`:
 - **ESL**: `CALLBOT_ESL_HOST`, `CALLBOT_ESL_PORT` (default 8021), `CALLBOT_ESL_PASSWORD`, `CALLBOT_HANDOFF_EXT` (default 1001)
 - **VAD engine**: `CALLBOT_VAD_TYPE` (default `webrtc`, optional `silero` — neural network, higher accuracy)
 - **VAD — WebRTC params**: `CALLBOT_VAD_AGGRESSIVENESS` (0-3), `CALLBOT_VAD_SILENCE_FRAMES` (default 15)
-- **VAD — Silero params**: `CALLBOT_VAD_SILERO_THRESHOLD` (default 0.5), `CALLBOT_VAD_SILERO_MIN_SILENCE_MS` (default 200)
+- **VAD — Silero params**: `CALLBOT_VAD_SILERO_THRESHOLD` (default 0.3), `CALLBOT_VAD_SILERO_MIN_SILENCE_MS` (default 300)
 - **VAD — common**: `CALLBOT_VAD_MIN_AUDIO_BYTES` (default 3200)
+- **VAD — RMS threshold**: `CALLBOT_VAD_RMS_THRESHOLD` (default 300.0, frame energy below this treated as silence, filters SIP line noise)
+- **VAD — cooldown**: `CALLBOT_VAD_COOLDOWN_AFTER_BARGEIN` (default 0.5s, discard residual audio after barge-in to prevent false positives)
 - **Barge-in**: `CALLBOT_BARGE_IN_MIN_AUDIO_BYTES` (default 1600, lower than VAD for faster reaction)
 - **Media**: `CALLBOT_MEDIA_SAMPLE_RATE` (default 16000), 全链路 16kHz，帧大小 960B (30ms @ 16kHz 16-bit)，TTS 输出 22050Hz 经 `_resample_pcm()` 降采样到 16kHz，FreeSWITCH 内部下采样到 G.711 8kHz
 - **Jitter Buffer**: `CALLBOT_JITTER_TARGET_DEPTH` (default 3), `CALLBOT_JITTER_MAX_DEPTH` (default 10)
@@ -388,6 +390,7 @@ Full adaptive + corrective RAG inside `rag_retrieve_node`:
 | `src/database.py` | SQLAlchemy 2.0 async engine + session factory |
 | `src/graph/flow.py` | LangGraph 7-node StateGraph pipeline + `run_pre_llm_phase` / `run_streaming_pipeline` for streaming mode |
 | `src/graph/prompt.py` | System prompt + RAG + memory + chat history assembly |
+| `src/graph/prompt_config.py` | Prompt loading — Redis cache (5min TTL) → DB `prompt_config` table two-level fallback |
 | `src/clients/mcp.py` | MCP client → java-mcp-server (identity/credit query via langchain-mcp-adapters) |
 | `src/clients/esl.py` | Async ESL client → FreeSWITCH Event Socket (auto-reconnect, heartbeat, hangup, transfer, break_media, event subscription) |
 | `src/clients/tts.py` | TTS adapter HTTP client (full + raw WAV for streaming) |
@@ -411,7 +414,7 @@ Full adaptive + corrective RAG inside `rag_retrieve_node`:
 | `src/memory/redis_memory.py` | Per-user hot fact storage (Redis hash) |
 | `src/memory/store.py` | PG fact + vector data access |
 | `src/rag/retriever.py` | Agentic RAG: adaptive retrieval + document grading + query rewriting |
-| `src/db/models.py` | SQLAlchemy 2.0 ORM models (callbot schema, 8 tables: call_session, call_turn, call_event, call_artifact, config_snapshot, user_memory_fact, user_memory_vector, script_library) |
+| `src/db/models.py` | SQLAlchemy 2.0 ORM models (callbot schema, 9 tables: call_session, call_turn, call_event, call_artifact, config_snapshot, user_memory_fact, user_memory_vector, script_library, prompt_config) |
 | `src/storage/repository.py` | Async repository for sessions/turns/events/artifacts |
 | `src/storage/minio_storage.py` | MinIO object storage client — audio file upload/download by biz_type |
 
@@ -453,14 +456,14 @@ aiphone/
 │   │   │                # asr_grpc/ (proto stubs), tts_grpc/ (proto stubs)
 │   │   ├── ws/          # handler.py (StreamingCallHandler, streaming+barge-in), vad.py (pluggable VAD: WebRTC/Silero),
 │   │   │                # jitter_buffer.py, registry.py (ActiveCallRegistry), denoise.py
-│   │   ├── graph/       # flow.py, prompt.py, prompts/{biz_type}.yaml
+│   │   ├── graph/       # flow.py, prompt.py, prompt_config.py (Redis→DB prompt loading)
 │   │   ├── llm/         # service.py, json_stream.py, sentence_splitter.py
 │   │   ├── memory/      # assembler.py, chat_history.py, redis_memory.py, store.py
 │   │   ├── rag/         # retriever.py (Agentic RAG)
 │   │   ├── db/          # models.py (ORM)
 │   │   └── storage/     # repository.py, minio_storage.py
 │   ├── llm/             # Qwen LLM 推理引擎 Dockerfile (vLLM)
-│   ├── alembic/         # DB migrations (versions/0001_initial_schema.py)
+│   ├── alembic/         # DB migrations (versions/0001_initial_schema.py, 0002_prompt_config.py)
 │   ├── alembic.ini      # Alembic config
 │   ├── requirements.txt # Python dependencies
 │   ├── Dockerfile       # Application image (auto alembic upgrade head)
@@ -499,8 +502,8 @@ aiphone/
 
 ### Infrastructure
 
-- **PostgreSQL 17** with pgvector extension, schema `callbot`, 8 tables
-- **Redis** for hot memory, conversation history (langchain-redis), session state
+- **PostgreSQL 17** with pgvector extension, schema `callbot`, 9 tables
+- **Redis** for hot memory, conversation history (langchain-redis), session state, prompt cache (5min TTL)
 - **MinIO** for audio archiving (optional, disabled when `MINIO_ENDPOINT` empty)
 - **FreeSWITCH 1.11.0** compiled from source with mod_audio_fork + mod_event_socket (ESL)
 - **Java MCP Server** Spring Boot 4.0 + Spring AI 2.0, Java 21, Maven build, `@McpTool` annotation-driven tool registration
@@ -508,5 +511,5 @@ aiphone/
 - **uvloop**: libuv C-based event loop replacing std asyncio in agent-flow (via `--loop uvloop`), reduces GC pauses under high concurrency
 - **gRPC**: ASR client-streaming (:50051), TTS unary (:50052), both optional feature-flagged alongside HTTP fallback
 - **WebSocket**: Third transport for ASR/TTS streaming (`ws_server.py` in agent-asr/agent-tts, `asr_ws_client.py`/`tts_ws_client.py` in agent-flow)
-- **ESL**: Auto-reconnect with heartbeat detection, subscribes to CHANNEL_ANSWER + CHANNEL_HANGUP; dynamic `uuid_audio_fork` start/stop per call lifecycle
+- **ESL**: Auto-reconnect with heartbeat detection (read error triggers reconnect), subscribes to CHANNEL_ANSWER + CHANNEL_HANGUP; dynamic `uuid_audio_fork` start/stop per call lifecycle; `break_media` uses fire-and-forget (bypasses lock contention)
 - **Docker Compose**: `docker-compose.yml` (base) + `docker-compose.prod.yml` (production overrides with MCP server), GPU pinning, health checks, ordered startup
