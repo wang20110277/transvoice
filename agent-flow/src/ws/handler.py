@@ -45,8 +45,10 @@ class StreamingCallHandler:
     - AI 未开口前不允许 barge-in（用户不可能打断沉默）
     """
 
-    # 连续语音帧阈值 — 20 × 30ms = 600ms，过滤附和音（嗯/好/对），保留真正打断
-    _BARGE_IN_SPEECH_FRAMES = 20
+    # 语音帧阈值 — 5 × 30ms = 150ms，过滤极短附和音（嗯/啊），保留正常打断（你是谁/停/等一下）
+    _BARGE_IN_SPEECH_FRAMES = 5
+    # 允许的非语音帧数 — 音节间隙（"你~是~谁"之间的短暂停顿）不重置计数器
+    _BARGE_IN_TOLERANCE_FRAMES = 3
     # RMS 阈值 — 低于此值的帧视为静音/噪声，不参与 barge-in 判定
     _BARGE_IN_RMS_THRESHOLD = 300
 
@@ -120,9 +122,12 @@ class StreamingCallHandler:
         barge_in_event = asyncio.Event()
         ai_has_spoken = asyncio.Event()
         ai_spoken_buffer_cleared = False
+        # barge-in 后 VAD 冷却截止时间：此时间内丢弃音频，防止残余噪声误触发 VAD
+        vad_cooldown_until: float = 0.0
         # list 包装允许内部方法修改外部变量
         barge_grace_until: list[float] = [0.0]
         barge_speech_counter: list[int] = [0]
+        barge_tolerance_counter: list[int] = [0]
 
         try:
             while True:
@@ -140,28 +145,30 @@ class StreamingCallHandler:
                         ai_spoken_buffer_cleared = True
                         barge_grace_until[0] = time.monotonic() + 1.0
                         barge_speech_counter[0] = 0
+                        barge_tolerance_counter[0] = 0
                         logger.info("[%s] AI first audio — cleared buffer, grace 1.0s", call_id)
 
                     barge_detected = await self._receive_during_streaming(
                         websocket, call_id, vad, jitter, audio_buffer,
                         streaming_task, barge_in_event, active_call,
                         barge_grace_until, ai_has_spoken, barge_speech_counter,
+                        barge_tolerance_counter,
                     )
 
                     if barge_detected:
-                        # 取消 ASR 流
+                        # 清空 TTS 缓冲，丢弃未播放的旧音频，自动切换为静音帧
+                        # 不调用 uuid_break — 它会终止 dialplan 的 playback silence_stream://-1 导致挂断
+                        tts_buffer.clear()
+                        logger.info("[%s] barge-in: TTS buffer cleared", call_id)
+                        # 不对 barge-in 音频做 ASR — 音频缓冲混入 AI 回声，ASR 无法识别
+                        # 直接重置，让正常 VAD/ASR 路径处理用户下一轮语音
                         asr_stream, speech_started = await self._cancel_asr_stream(asr_stream, speech_started)
-                        # 处理打断音频
-                        turn_count += 1
-                        barge_audio = self._apply_gain(bytes(audio_buffer), audio_gain)
-                        logger.info("[%s] barge-in → turn %d (%d bytes)", call_id, turn_count, len(barge_audio))
-                        await self._process_streaming_turn(
-                            websocket, call_id, biz_type, user_key,
-                            barge_audio, turn_count, active_call,
-                            ai_spoken_event=ai_has_spoken, tts_buffer=tts_buffer,
-                        )
                         self._reset_audio_state(audio_buffer, vad, jitter)
+                        # 冷却期：丢弃残余音频，防止 VAD 误触发
+                        vad_cooldown_until = time.monotonic() + _settings.vad_cooldown_after_bargein
                         barge_in_event.clear()
+                        ai_has_spoken.clear()
+                        ai_spoken_buffer_cleared = False
                         streaming_task = None
                         continue
                     elif streaming_task.done():
@@ -175,11 +182,19 @@ class StreamingCallHandler:
                         self._reset_audio_state(audio_buffer, vad, jitter)
                         barge_in_event.clear()
                         continue
+                    else:
+                        # streaming task 仍在运行（LLM 处理或 TTS 播放中）
+                        # 不能落到正常接收分支，否则 VAD/ASR 会在等待期间误触发
+                        continue
 
                 # ── AI 未说话：正常接收用户音频 ──
                 data = await websocket.receive()
 
                 if "bytes" in data and data["bytes"]:
+                    # barge-in 冷却期：丢弃残余音频，防止 VAD 误触发
+                    if time.monotonic() < vad_cooldown_until:
+                        continue
+
                     frame = data["bytes"]
                     jitter.insert(frame)
 
@@ -188,6 +203,13 @@ class StreamingCallHandler:
                         if not smooth_frame:
                             break
                         denoised_frame = self._denoiser.process(smooth_frame)
+
+                        # VAD 门控：确认语音后才缓冲音频、创建 ASR 流
+                        if not vad.speech_detected:
+                            # 仅更新 VAD 状态机，不缓冲、不喂 ASR
+                            vad.is_end_of_speech(denoised_frame, 0)
+                            continue
+
                         audio_buffer.extend(denoised_frame)
 
                         # 流式 ASR：实时发送 PCM
@@ -356,6 +378,10 @@ class StreamingCallHandler:
         if not asr_text:
             logger.info("[%s] ASR empty, skipping turn %d (VAD false positive)", call_id, turn)
             return b"", precomputed_asr_result, asr_stream, speech_started, asr_partial_text
+        # 单字噪音过滤 — "啊"/"嗯"/"哦" 等附和音不应触发完整对话轮次
+        if len(asr_text) < 2:
+            logger.info("[%s] ASR too short ('%s'), skipping turn %d", call_id, asr_text, turn)
+            return b"", precomputed_asr_result, asr_stream, speech_started, asr_partial_text
 
         return raw_audio, precomputed_asr_result, asr_stream, speech_started, asr_partial_text
 
@@ -386,16 +412,18 @@ class StreamingCallHandler:
         grace_until: list[float],
         ai_spoken_event: asyncio.Event,
         speech_counter: list[int],
+        tolerance_counter: list[int],
     ) -> bool:
         """AI 说话时并发接收用户音频，检测 barge-in。
 
-        条件：不在 grace period + AI 已开口 + 累积音频足够 + 连续 N 帧语音。
+        条件：不在 grace period + AI 已开口 + 累积音频足够 + N 帧语音（允许短暂间隙）。
         """
         try:
             data = await asyncio.wait_for(websocket.receive(), timeout=0.1)
         except asyncio.TimeoutError:
-            # 无数据 → 重置持续语音计数
+            # 无数据 → 重置语音计数
             speech_counter[0] = 0
+            tolerance_counter[0] = 0
             return False
         except (WebSocketDisconnect, RuntimeError):
             streaming_task.cancel()
@@ -426,8 +454,9 @@ class StreamingCallHandler:
 
                     if is_speech:
                         speech_counter[0] += 1
+                        tolerance_counter[0] = 0
                         if speech_counter[0] >= self._BARGE_IN_SPEECH_FRAMES:
-                            logger.info("[%s] barge-in: %d consecutive speech frames, %d bytes, rms=%.0f",
+                            logger.info("[%s] barge-in: %d speech frames, %d bytes, rms=%.0f",
                                         call_id, speech_counter[0], len(audio_buffer), frame_rms)
                             streaming_task.cancel()
                             barge_in_event.set()
@@ -436,7 +465,11 @@ class StreamingCallHandler:
                                 audio_buffer.extend(remaining)
                             return True
                     elif speech_counter[0] > 0:
-                        speech_counter[0] = 0
+                        tolerance_counter[0] += 1
+                        if tolerance_counter[0] > self._BARGE_IN_TOLERANCE_FRAMES:
+                            # 连续非语音帧超过容差，重置
+                            speech_counter[0] = 0
+                            tolerance_counter[0] = 0
 
         elif "text" in data and data["text"]:
             msg = json.loads(data["text"])
@@ -479,6 +512,11 @@ class StreamingCallHandler:
 
             if barge_in_event and barge_in_event.is_set():
                 logger.info("[%s] barge-in during pre-llm, aborting", call_id)
+                return
+
+            # ASR 空文本 — 跳过本轮（barge-in 音频可能包含 AI 回声导致 ASR 无法识别）
+            if not state.get("user_input", "").strip():
+                logger.info("[%s] turn %d ASR empty, skipping", call_id, turn)
                 return
 
             # Phase 2: Streaming LLM+TTS

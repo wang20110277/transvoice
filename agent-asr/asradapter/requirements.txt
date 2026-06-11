@@ -27,4 +27,4 @@ grpcio-tools>=1.81.0
 protobuf>=5.0.0
 
 # WebSocket
-websockets>=12.0
+websockets>=12.0,<14.0

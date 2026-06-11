@@ -217,6 +217,11 @@ class TTSOutputBuffer:
             self._prebuffer_done.set()
         self._data_ready.set()
 
+    def clear(self) -> None:
+        """清空缓冲区，丢弃所有待发送的音频帧。_send_loop 继续运行，后续会自动填充静音帧。"""
+        self._buffer.clear()
+        self._partial.clear()
+
     def finish(self) -> None:
         """标记写入完成（残余数据入队，发送任务将在排空后自动停止）。"""
         if self._partial:

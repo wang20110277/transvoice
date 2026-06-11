@@ -30,6 +30,7 @@ class ASRWebSocketClient:
         """Batch 模式: 建立临时连接，发送完整音频，返回识别结果。"""
         if not self._started:
             return None
+        result_data: dict | None = None
         try:
             async with websockets.connect(self._base_url) as ws:
                 await ws.send(json.dumps({
@@ -46,16 +47,18 @@ class ASRWebSocketClient:
                         "[WS-ASR] recognize call_id=%s text=%s confidence=%.2f",
                         call_id, text, result.get("confidence", 0.0),
                     )
-                    return {
+                    result_data = {
                         "text": text,
                         "confidence": result.get("confidence", 0.0),
                         "is_final": result.get("is_final", True),
                         "minio_key": result.get("minio_key") or None,
                     }
-                return None
         except Exception as e:
-            logger.error("ASR WS recognize failed call_id=%s: %s", call_id, e)
-            return None
+            if result_data is None:
+                logger.error("ASR WS recognize failed call_id=%s: %s", call_id, e)
+            else:
+                logger.debug("ASR WS close error (result preserved) call_id=%s: %s", call_id, e)
+        return result_data
 
     def create_stream(self, call_id: str, streaming: bool = False, on_partial=None) -> "ASRWsStream | None":
         """创建流式会话 — 返回与 gRPC ASRStream 接口一致的对象。"""

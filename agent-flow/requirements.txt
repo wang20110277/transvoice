@@ -33,11 +33,12 @@ httpx>=0.27.0
 minio>=7.2.0
 
 # WebSocket
-websockets>=12.0
+websockets>=12.0,<14.0
 
 # VAD
 webrtcvad>=2.0.10
 silero-vad>=5.1.0
+numpy>=1.24.0,<2.0.0
 scipy>=1.12.0
 
 # Denoise

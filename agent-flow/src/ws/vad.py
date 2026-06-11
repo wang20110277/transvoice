@@ -19,6 +19,11 @@ FRAME_BYTES = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000) * 2  # 960 bytes
 class BaseVAD(ABC):
     """VAD 引擎抽象基类。"""
 
+    @property
+    @abstractmethod
+    def speech_detected(self) -> bool:
+        """VAD 是否已确认检测到语音（连续 N 帧语音后置 True，reset 后置 False）。"""
+
     @abstractmethod
     def is_speech(self, frame: bytes) -> bool:
         """判断单个完整帧是否为语音。"""
@@ -45,23 +50,36 @@ class WebRTCVAD(BaseVAD):
     - 连续 silent_frames 帧非语音时判定为静音结束
     """
 
+    # 最少连续语音帧 — 过滤 < 90ms 的短噪声（呼吸声、环境音）
+    _MIN_SPEECH_FRAMES = 3
+
     def __init__(
         self,
         aggressiveness: int = 3,
         silence_frames: int = 15,
         min_audio_bytes: int = 3200,
+        rms_threshold: float = 0.0,
     ) -> None:
         import webrtcvad
 
         self._vad = webrtcvad.Vad(aggressiveness)
         self._silence_frames = silence_frames
         self._min_audio_bytes = min_audio_bytes
+        # RMS 能量门限：低于此值的帧视为静音/噪声，不参与语音判定
+        # 与 barge-in 的 _BARGE_IN_RMS_THRESHOLD 类似，过滤 SIP 线路噪声
+        self._rms_threshold = rms_threshold
         self._silent_count = 0
+        self._speech_count = 0
         self._speech_detected = False
         self._frame_buffer = bytearray()
 
+    @property
+    def speech_detected(self) -> bool:
+        return self._speech_detected
+
     def reset(self) -> None:
         self._silent_count = 0
+        self._speech_count = 0
         self._speech_detected = False
         self._frame_buffer.clear()
 
@@ -73,6 +91,13 @@ class WebRTCVAD(BaseVAD):
         except Exception:
             return False
 
+    def _has_speech_energy(self, frame: bytes) -> bool:
+        """RMS 能量检查 — 过滤低能量噪声（SIP 线路底噪、呼吸声）。"""
+        if self._rms_threshold <= 0:
+            return True
+        _f32 = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
+        return float(np.sqrt(np.mean(_f32**2))) > self._rms_threshold
+
     def is_end_of_speech(self, chunk: bytes, buffer_len: int) -> bool:
         self._frame_buffer.extend(chunk)
 
@@ -80,11 +105,15 @@ class WebRTCVAD(BaseVAD):
             frame = bytes(self._frame_buffer[:FRAME_BYTES])
             self._frame_buffer = self._frame_buffer[FRAME_BYTES:]
 
-            if self.is_speech(frame):
+            if self.is_speech(frame) and self._has_speech_energy(frame):
                 self._silent_count = 0
-                self._speech_detected = True
+                self._speech_count += 1
+                if self._speech_count >= self._MIN_SPEECH_FRAMES:
+                    self._speech_detected = True
             else:
                 self._silent_count += 1
+                if self._speech_count < self._MIN_SPEECH_FRAMES:
+                    self._speech_count = 0
 
         return (
             self._speech_detected
@@ -100,6 +129,10 @@ class SileroVAD(BaseVAD):
     - speech 事件 → 标记检测到语音
     - silence 事件 → 超过 min_silence_duration_ms 静音后触发，判定终点
     """
+
+    # Silero VAD 要求最小 512 samples (32ms @ 16kHz)，大于标准帧 480 samples (30ms)
+    _SILERO_MIN_SAMPLES = 512
+    _SILERO_MIN_BYTES = _SILERO_MIN_SAMPLES * 2  # 1024 bytes
 
     def __init__(
         self,
@@ -123,17 +156,24 @@ class SileroVAD(BaseVAD):
         self._frame_buffer = bytearray()
         logger.info("SileroVAD initialized: threshold=%.2f silence_ms=%d", threshold, min_silence_duration_ms)
 
+    @property
+    def speech_detected(self) -> bool:
+        return self._speech_detected
+
     @staticmethod
     def _int2float(data: bytes) -> np.ndarray:
         return np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
 
     def is_speech(self, frame: bytes) -> bool:
         """逐帧语音检测 — 直接调用模型获取概率，不经过 VADIterator。"""
-        if len(frame) != FRAME_BYTES:
+        if len(frame) < FRAME_BYTES:
             return False
         try:
             import torch
-            audio_float32 = self._int2float(frame)
+            # 取前 _SILERO_MIN_SAMPLES 个采样点（>= 512），不足则补零
+            audio_float32 = self._int2float(frame[:self._SILERO_MIN_BYTES])
+            if len(audio_float32) < self._SILERO_MIN_SAMPLES:
+                audio_float32 = np.pad(audio_float32, (0, self._SILERO_MIN_SAMPLES - len(audio_float32)))
             prob = self._model(torch.from_numpy(audio_float32), SAMPLE_RATE).item()
             return prob >= self._threshold
         except Exception:
@@ -145,19 +185,29 @@ class SileroVAD(BaseVAD):
 
         self._frame_buffer.extend(chunk)
 
-        while len(self._frame_buffer) >= FRAME_BYTES:
-            frame = bytes(self._frame_buffer[:FRAME_BYTES])
-            self._frame_buffer = self._frame_buffer[FRAME_BYTES:]
+        while len(self._frame_buffer) >= self._SILERO_MIN_BYTES:
+            frame = bytes(self._frame_buffer[:self._SILERO_MIN_BYTES])
+            self._frame_buffer = self._frame_buffer[self._SILERO_MIN_BYTES:]
 
             audio_float32 = self._int2float(frame)
-            result = self._vad_iterator(torch.from_numpy(audio_float32))
+            x = torch.from_numpy(audio_float32)
+            # 调试：输出原始概率
+            prob = self._model(x, SAMPLE_RATE).item()
+            self._prob_count = getattr(self, '_prob_count', 0) + 1
+            if self._prob_count <= 5 or (self._prob_count % 50 == 0):
+                rms = float(np.sqrt(np.mean(np.frombuffer(frame, dtype=np.int16).astype(np.float32)**2)))
+                logger.info("SileroVAD debug: prob=%.3f rms=%.0f chunk=%d (#%d)", prob, rms, len(frame), self._prob_count)
+            result = self._vad_iterator(x)
 
             if result is not None:
+                logger.debug("SileroVAD event: %s", result)
                 if "speech" in result:
                     self._speech_detected = True
                     self._silence_detected = False
+                    logger.info("SileroVAD: speech detected")
                 elif "silence" in result:
                     self._silence_detected = True
+                    logger.info("SileroVAD: silence detected (end of speech)")
 
         return (
             self._speech_detected
@@ -195,6 +245,7 @@ def create_vad(settings: "Settings") -> BaseVAD:
             aggressiveness=settings.vad_aggressiveness,
             silence_frames=settings.vad_silence_frames,
             min_audio_bytes=settings.vad_min_audio_bytes,
+            rms_threshold=settings.vad_rms_threshold,
         )
 
     logger.warning("Unknown VAD type '%s', falling back to webrtc", vad_type)
@@ -202,4 +253,5 @@ def create_vad(settings: "Settings") -> BaseVAD:
         aggressiveness=settings.vad_aggressiveness,
         silence_frames=settings.vad_silence_frames,
         min_audio_bytes=settings.vad_min_audio_bytes,
+        rms_threshold=settings.vad_rms_threshold,
     )

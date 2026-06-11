@@ -63,7 +63,7 @@ class Settings(BaseSettings):
     # Audio temp
     temp_dir: str = "/tmp/aiphone_tts"
 
-    # VAD engine: "webrtc" (default) or "silero" (neural network, higher accuracy)
+    # VAD engine: "webrtc" (default, lightweight + RMS gating) or "silero" (neural network, needs louder audio)
     vad_type: str = "webrtc"
 
     # VAD — WebRTC params
@@ -71,14 +71,20 @@ class Settings(BaseSettings):
     vad_silence_frames: int = 15
 
     # VAD — Silero params
-    vad_silero_threshold: float = 0.5
-    vad_silero_min_silence_ms: int = 200
+    vad_silero_threshold: float = 0.3
+    vad_silero_min_silence_ms: int = 300
 
     # VAD — common
     vad_min_audio_bytes: int = 3200
+    # VAD RMS threshold: frame energy below this is treated as silence (filters SIP line noise)
+    # 0 = disabled (WebRTC VAD only), 300 = match barge-in threshold
+    vad_rms_threshold: float = 300.0
 
     # Barge-in
     barge_in_min_audio_bytes: int = 1600
+
+    # VAD cooldown after barge-in (seconds): discard residual audio to prevent false positives
+    vad_cooldown_after_bargein: float = 0.5
 
     # Jitter Buffer
     jitter_target_depth: int = 3

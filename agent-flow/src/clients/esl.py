@@ -87,8 +87,28 @@ class ESLClient:
         return await self.api(f"uuid_transfer {uuid} {dest} {dialplan} {context}")
 
     async def break_media(self, uuid: str) -> str:
-        """中断当前媒体播放。"""
-        return await self.api(f"uuid_break {uuid}")
+        """中断当前媒体播放（紧急命令，跳过锁等待直接写入，不等待响应）。"""
+        if not self._connected or self._writer is None:
+            return "-ERR not connected"
+        cmd = f"api uuid_break {uuid}\n\n"
+        try:
+            # 尝试快速获取锁（50ms），成功则走正常通道
+            acquired = self._io_lock.locked()
+            if not acquired:
+                async with asyncio.timeout(0.05):
+                    async with self._io_lock:
+                        self._writer.write(cmd.encode())
+                        await self._writer.drain()
+                        return "-OK fire-and-forget"
+            # 锁被占（_event_loop 在读事件），直接写 socket
+            # uuid_break 是完整独立命令，不依赖响应，fire-and-forget 安全
+            self._writer.write(cmd.encode())
+            await self._writer.drain()
+            logger.debug("break_media: lock contended, direct write for uuid=%s", uuid)
+            return "-OK fire-and-forget"
+        except Exception as e:
+            logger.warning("break_media error: %s", e)
+            return f"-ERR {e}"
 
     async def broadcast(self, uuid: str, path: str, leg: str = "both") -> str:
         """向通话广播音频。"""
@@ -292,6 +312,7 @@ class ESLClient:
         except Exception as e:
             logger.error("ESL read error: %s", e)
             self._connected = False
+            await self._reconnect()
             return None
 
     async def _event_loop(self) -> None:
