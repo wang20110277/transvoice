@@ -247,3 +247,27 @@ class ScriptLibrary(Base):
     create_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
     update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     update_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
+
+
+class PromptConfig(Base):
+    """提示词配置表 — 按业务系统 + 业务类型维度管理系统提示词"""
+    __tablename__ = "prompt_config"
+    __table_args__ = (
+        UniqueConstraint("biz_system", "biz_type", name="uq_prompt_config_system_type"),
+        Index("ix_prompt_config_biz_type", "biz_type"),
+        {"schema": "callbot"},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    biz_system: Mapped[str] = mapped_column(Text, nullable=False, default="default")
+    biz_type: Mapped[str] = mapped_column(Text, nullable=False)
+    system_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    max_reply_length: Mapped[int] = mapped_column(Integer, nullable=False, default=80)
+    extra: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    description: Mapped[str | None] = mapped_column(Text)
+    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    create_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
+    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    update_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")

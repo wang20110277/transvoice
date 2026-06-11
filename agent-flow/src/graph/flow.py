@@ -13,9 +13,7 @@
 """
 import asyncio
 import logging
-import os
 import time
-import yaml
 from collections.abc import Awaitable, Callable
 from typing import TypedDict
 
@@ -100,16 +98,6 @@ class CallGraphState(TypedDict, total=False):
 # ═══════════════════════════════════════════════════════════════════
 # 内部工具函数
 # ═══════════════════════════════════════════════════════════════════
-
-def _load_system_prompt(biz_type: str) -> str:
-    """按 biz_type 加载 prompts/{biz_type}.yaml 中的 system_prompt。"""
-    prompt_path = os.path.join(os.path.dirname(__file__), "prompts", f"{biz_type}.yaml")
-    if not os.path.exists(prompt_path):
-        return ""
-    with open(prompt_path) as f:
-        data = yaml.safe_load(f)
-    return data.get("system_prompt", data.get("template", ""))
-
 
 def _get_asr_client() -> tuple[str, object]:
     """返回 (传输方式, 客户端实例)，优先级: gRPC > WS > HTTP。"""
@@ -300,6 +288,7 @@ async def run_pre_llm_phase(
         组装好的 CallGraphState，供 run_streaming_pipeline 使用
     """
     t0 = time.monotonic()
+    logger.info("[%s] biz_type=%s user_key=%s", call_id, biz_type, user_key)
 
     # ── ASR ──
     state: CallGraphState = {
@@ -373,7 +362,10 @@ async def run_streaming_pipeline(
     t0 = time.monotonic()
 
     # ── 构建 Prompt ──
-    system_prompt = _load_system_prompt(biz_type)
+    from graph.prompt_config import get_system_prompt
+    system_prompt = await get_system_prompt(biz_type)
+    logger.info("[%s] biz_type=%s prompt loaded: %d chars", call_id, biz_type, len(system_prompt))
+    logger.info("[%s] system_prompt content:\n%s", call_id, system_prompt)
     messages = build_messages(
         biz_type=biz_type,
         system_prompt=system_prompt,
@@ -446,7 +438,7 @@ async def run_streaming_pipeline(
                 tts_tasks.append(asyncio.create_task(_tts_sentence(s)))
 
             if event.is_complete:
-                logger.info("[%s] LLM complete: action=%s text=%s", call_id, detected_action, full_text[:80])
+                logger.info("[%s] LLM complete: action=%s text=%s", call_id, detected_action, full_text)
                 final_sent = splitter.flush()
                 if final_sent:
                     tts_tasks.append(asyncio.create_task(_tts_sentence(final_sent)))
