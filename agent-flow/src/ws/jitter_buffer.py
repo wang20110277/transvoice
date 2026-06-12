@@ -196,6 +196,8 @@ class TTSOutputBuffer:
         self._data_ready = asyncio.Event()
         self._finished = False
         self._last_write_time: float = 0.0
+        # AEC 远端参考：镜像最近发往 FreeSWITCH 的帧（TTS 帧或静音帧）
+        self.recent_reverse: bytes = SILENCE_FRAME
 
     @property
     def is_running(self) -> bool:
@@ -304,6 +306,7 @@ class TTSOutputBuffer:
                             type(e).__name__, e, frames_sent, e,
                         )
                         return
+                    self.recent_reverse = frame  # AEC 远端参考 = 此刻发往线路的 TTS 帧
                     frames_sent += 1
                     await asyncio.sleep(self._frame_interval)
                 elif self._finished:
@@ -335,6 +338,7 @@ class TTSOutputBuffer:
                             except Exception as e:
                                 logger.error("TTSOutputBuffer silence send error: %s", e)
                                 return
+                            self.recent_reverse = SILENCE_FRAME  # AI 沉默 → AEC 参考归零
                             silence_sent += 1
                     else:
                         # 回合间：无 TTS 数据超过超时阈值，停止静音填充
