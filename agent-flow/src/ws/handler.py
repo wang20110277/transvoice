@@ -25,6 +25,7 @@ from ws.vad import BaseVAD, SimpleVAD
 from ws.jitter_buffer import JitterBuffer, TTSOutputBuffer
 from ws.registry import ActiveCallRegistry
 from ws.denoise import BaseDenoiser, PassThroughDenoiser
+from ws.audio_processing import WebRTCAPM
 from storage import minio_storage
 
 if TYPE_CHECKING:
@@ -64,6 +65,7 @@ class StreamingCallHandler:
         jitter_target_depth: int = 3,
         jitter_max_depth: int = 10,
         denoiser: BaseDenoiser | None = None,
+        apm: "WebRTCAPM | None" = None,
         asr_grpc_client: "ASRGrpcClient | None" = None,
         use_grpc_streaming: bool = False,
         asr_ws_client: "ASRWebSocketClient | None" = None,
@@ -81,6 +83,7 @@ class StreamingCallHandler:
         self._jitter_target_depth = jitter_target_depth
         self._jitter_max_depth = jitter_max_depth
         self._denoiser = denoiser or PassThroughDenoiser()
+        self._apm = apm
         self._asr_grpc_client = asr_grpc_client
         self._use_grpc_streaming = use_grpc_streaming
         self._asr_ws_client = asr_ws_client
@@ -152,7 +155,7 @@ class StreamingCallHandler:
                         websocket, call_id, vad, jitter, audio_buffer,
                         streaming_task, barge_in_event, active_call,
                         barge_grace_until, ai_has_spoken, barge_speech_counter,
-                        barge_tolerance_counter,
+                        barge_tolerance_counter, tts_buffer,
                     )
 
                     if barge_detected:
@@ -202,7 +205,7 @@ class StreamingCallHandler:
                         smooth_frame = jitter.drain()
                         if not smooth_frame:
                             break
-                        denoised_frame = self._denoiser.process(smooth_frame)
+                        denoised_frame = self._process_near_frame(smooth_frame, tts_buffer)
 
                         # VAD 门控：确认语音后才缓冲音频、创建 ASR 流
                         if not vad.speech_detected:
@@ -295,6 +298,12 @@ class StreamingCallHandler:
         samples *= gain
         return np.clip(samples, -32768, 32767).astype(np.int16).tobytes()
 
+    def _process_near_frame(self, smooth_frame: bytes, tts_buffer: "TTSOutputBuffer") -> bytes:
+        """near 端帧处理：AEC 开启时走 WebRTCAPM（near + reverse），否则走原 denoiser。"""
+        if self._apm is not None:
+            return self._apm.process(smooth_frame, tts_buffer.recent_reverse)
+        return self._denoiser.process(smooth_frame)
+
     def _reset_audio_state(self, audio_buffer: bytearray, vad: BaseVAD, jitter: JitterBuffer) -> None:
         """重置所有音频处理状态，准备下一轮。"""
         audio_buffer.clear()
@@ -353,7 +362,11 @@ class StreamingCallHandler:
 
         Returns: (raw_audio, precomputed_asr_result, asr_stream, speech_started, asr_partial_text)
         """
-        raw_audio = self._apply_gain(bytes(audio_buffer), audio_gain)
+        # AEC 开启时 AGC 已由 WebRTCAPM 逐帧处理，不再叠加固定增益
+        if self._apm is not None:
+            raw_audio = bytes(audio_buffer)
+        else:
+            raw_audio = self._apply_gain(bytes(audio_buffer), audio_gain)
         if audio_gain != 1.0:
             logger.debug("[%s] audio gain %.1fx applied", call_id, audio_gain)
 
@@ -413,6 +426,7 @@ class StreamingCallHandler:
         ai_spoken_event: asyncio.Event,
         speech_counter: list[int],
         tolerance_counter: list[int],
+        tts_buffer: "TTSOutputBuffer",
     ) -> bool:
         """AI 说话时并发接收用户音频，检测 barge-in。
 
@@ -439,7 +453,7 @@ class StreamingCallHandler:
                 smooth_frame = jitter.drain()
                 if not smooth_frame:
                     break
-                denoised_frame = self._denoiser.process(smooth_frame)
+                denoised_frame = self._process_near_frame(smooth_frame, tts_buffer)
                 audio_buffer.extend(denoised_frame)
 
                 # Barge-in 判定
