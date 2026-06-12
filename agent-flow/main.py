@@ -35,6 +35,7 @@ from src.clients.asr import ASRClient
 from src.clients.esl import ESLClient
 from src.ws.registry import ActiveCallRegistry
 from src.ws.denoise import create_denoiser
+from src.ws.audio_processing import create_audio_processing
 from src.ws.vad import create_vad
 from src.clients.asr_grpc_client import ASRGrpcClient
 from src.clients.tts_grpc_client import TTSGrpcClient
@@ -210,6 +211,7 @@ async def lifespan(app: FastAPI):
     from src.ws.handler import StreamingCallHandler
 
     denoiser = create_denoiser()
+    apm = create_audio_processing(settings)
     vad_factory = lambda: create_vad(settings)
 
     _streaming_handler = StreamingCallHandler(
@@ -223,6 +225,7 @@ async def lifespan(app: FastAPI):
         jitter_target_depth=settings.jitter_target_depth,
         jitter_max_depth=settings.jitter_max_depth,
         denoiser=denoiser,
+        apm=apm,
         asr_grpc_client=asr_grpc,
         use_grpc_streaming=settings.asr_use_grpc,
         asr_ws_client=asr_ws,
@@ -246,6 +249,9 @@ def _log_startup_summary() -> None:
     logger.info("──────────────────────────────────────")
     logger.info("  VAD: %s", settings.vad_type)
     logger.info("  Denoise: %s", settings.denoise_enabled or "disabled")
+    logger.info("  AEC/APM: enabled=%s type=%d ns=%d agc=%d delay=%dms",
+                settings.aec_enabled, settings.aec_type,
+                settings.aec_ns_level, settings.aec_agc_type, settings.aec_system_delay_ms)
     logger.info("  ASR transport: grpc=%s ws=%s streaming=%s",
                 settings.asr_use_grpc, settings.asr_use_ws, settings.asr_streaming_enabled)
     logger.info("  TTS transport: grpc=%s ws=%s streaming=%s",

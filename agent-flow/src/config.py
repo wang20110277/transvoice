@@ -82,6 +82,8 @@ class Settings(BaseSettings):
 
     # Barge-in
     barge_in_min_audio_bytes: int = 1600
+    # Barge-in RMS 阈值：AEC 场景调高（过滤残留回声尖峰），默认 300
+    barge_in_rms_threshold: int = 300
 
     # VAD cooldown after barge-in (seconds): discard residual audio to prevent false positives
     vad_cooldown_after_bargein: float = 0.5
@@ -96,6 +98,13 @@ class Settings(BaseSettings):
 
     # Audio gain (pre-ASR amplification for quiet SIP audio)
     audio_gain: float = 1.0
+
+    # WebRTC AEC + NS + AGC (audio_processing.py) — 替换 denoise + 固定增益
+    aec_enabled: bool = False
+    aec_type: int = 2  # 1=AECM(移动端), 2=老AEC (AEC3 源码注释不可用)
+    aec_ns_level: int = 2  # NS 抑制等级 0-3
+    aec_agc_type: int = 1  # 0=关, 1=AdaptiveDigital, 2=AdaptiveAnalog
+    aec_system_delay_ms: int = 80  # 回声延迟先验(毫秒)，has_echo 监控后标定
 
     # TTS skip (local testing without GPU)
     tts_skip: bool = False
