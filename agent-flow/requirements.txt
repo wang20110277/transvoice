@@ -44,6 +44,9 @@ scipy>=1.12.0
 # Denoise
 # pyrnnoise>=0.4.0  # macOS 无预编译 wheel，按需启用
 
+# AEC + NS + AGC (可选，需源码编译)
+# webrtc-audio-processing>=0.1.3  # 需 swig+autotools+git submodule 编译，pip 名 webrtc-audio-processing，import 名 webrtc_audio_processing；AEC 用，按需启用
+
 # gRPC (ASR/TTS streaming)
 grpcio>=1.81.0
 grpcio-tools>=1.81.0
