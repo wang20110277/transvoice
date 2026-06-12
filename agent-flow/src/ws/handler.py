@@ -80,6 +80,8 @@ class StreamingCallHandler:
         self._registry = registry
         self._vad_factory = vad_factory
         self._barge_in_min_audio_bytes = barge_in_min_audio_bytes
+        # AEC 场景可调高 barge-in RMS 阈值，过滤 AEC 残留回声尖峰（实例属性覆盖类常量）
+        self._BARGE_IN_RMS_THRESHOLD = _settings.barge_in_rms_threshold
         self._jitter_target_depth = jitter_target_depth
         self._jitter_max_depth = jitter_max_depth
         self._denoiser = denoiser or PassThroughDenoiser()

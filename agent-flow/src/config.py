@@ -82,6 +82,8 @@ class Settings(BaseSettings):
 
     # Barge-in
     barge_in_min_audio_bytes: int = 1600
+    # Barge-in RMS 阈值：AEC 场景调高（过滤残留回声尖峰），默认 300
+    barge_in_rms_threshold: int = 300
 
     # VAD cooldown after barge-in (seconds): discard residual audio to prevent false positives
     vad_cooldown_after_bargein: float = 0.5
