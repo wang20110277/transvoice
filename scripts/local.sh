@@ -298,14 +298,23 @@ start_mcp() {
     return 1
   fi
 
-  info "启动 MCP Server (port $MCP_PORT) ..."
+  # MCP 需 Java 21（Spring Boot 4.0 + record 语法）。强制使用 brew 的 openjdk@21，
+  # 覆盖系统可能存在的旧版 JAVA_HOME（如 Java 8），并兼容 Intel(/usr/local) 与 Apple Silicon(/opt/homebrew)
+  local jdk21_home
+  jdk21_home="$(brew --prefix openjdk@21 2>/dev/null || true)"
+  if [[ -z "$jdk21_home" || ! -x "$jdk21_home/bin/java" ]]; then
+    error "未找到 openjdk@21（'brew --prefix openjdk@21' 无效）。请先执行 brew install openjdk@21"
+    return 1
+  fi
+  export JAVA_HOME="$jdk21_home"
+  info "启动 MCP Server (port $MCP_PORT, JAVA_HOME=$jdk21_home) ..."
   # 优先使用已构建的 jar，否则 mvnw spring-boot:run
   local jar_path="$mcp_dir/target/mcp-server-0.0.1-SNAPSHOT.jar"
   if [[ -f "$jar_path" ]]; then
-    java -jar "$jar_path" >> "$LOG_DIR/mcp.log" 2>&1 &
+    "$jdk21_home/bin/java" -jar "$jar_path" >> "$LOG_DIR/mcp.log" 2>&1 &
   else
     info "jar 未找到，使用 mvnw spring-boot:run ..."
-    (cd "$mcp_dir" && JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}" ./mvnw spring-boot:run >> "$LOG_DIR/mcp.log" 2>&1) &
+    (cd "$mcp_dir" && ./mvnw spring-boot:run >> "$LOG_DIR/mcp.log" 2>&1) &
   fi
   echo $! > "$PID_DIR/mcp.pid"
   wait_http "MCP Server" "$MCP_PORT" 60
@@ -326,6 +335,9 @@ show_status() {
     pid=$(get_pid "$svc")
     if [[ "$svc" == "fs" ]]; then
       if is_fs_running; then s="running"; fi
+    elif [[ "$svc" == "mcp" ]]; then
+      # MCP (Spring Boot) 未暴露 /healthz，用 TCP 监听判断
+      if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then s="running"; fi
     elif is_running "$port"; then
       s="running"
     fi
