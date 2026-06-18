@@ -1,0 +1,6 @@
+{
+  "name": "智能外呼后管系统",
+  "description": "提供多租户隔离、独立RBAC权限体系、以及包含提示词管理、知识库管理、呼叫中心、呼叫记录和记忆系统等在内的核心功能交互演示后台。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
