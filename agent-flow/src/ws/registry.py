@@ -12,6 +12,8 @@ class ActiveCall:
     call_id: str
     biz_type: str
     user_key: str = ""
+    tenant_id: str = "default"
+    scenario: str = "default"
     cancel: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -21,11 +23,27 @@ class ActiveCallRegistry:
     def __init__(self) -> None:
         self._calls: dict[str, ActiveCall] = {}
 
-    def register(self, call_id: str, biz_type: str, user_key: str = "") -> ActiveCall:
+    def register(
+        self,
+        call_id: str,
+        biz_type: str,
+        user_key: str = "",
+        tenant_id: str = "default",
+        scenario: str = "default",
+    ) -> ActiveCall:
         """注册一个新通话。"""
-        call = ActiveCall(call_id=call_id, biz_type=biz_type, user_key=user_key)
+        call = ActiveCall(
+            call_id=call_id,
+            biz_type=biz_type,
+            user_key=user_key,
+            tenant_id=tenant_id,
+            scenario=scenario,
+        )
         self._calls[call_id] = call
-        logger.debug("[%s] call registered biz_type=%s user_key=%s", call_id, biz_type, user_key)
+        logger.debug(
+            "[%s] call registered tenant=%s biz_type=%s scenario=%s user_key=%s",
+            call_id, tenant_id, biz_type, scenario, user_key,
+        )
         return call
 
     def unregister(self, call_id: str) -> None:

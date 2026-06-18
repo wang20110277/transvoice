@@ -41,6 +41,9 @@ from src.clients.asr_grpc_client import ASRGrpcClient
 from src.clients.tts_grpc_client import TTSGrpcClient
 from src.clients.asr_ws_client import ASRWebSocketClient
 from src.clients.tts_ws_client import TTSWebSocketClient
+from sqlalchemy import select
+from src.database import async_session
+from src.db.models import InboundRoute
 
 logging.basicConfig(
     level=logging.INFO,
@@ -121,6 +124,39 @@ async def _init_ws_clients() -> tuple[ASRWebSocketClient | None, TTSWebSocketCli
 # ESL 事件处理
 # ═══════════════════════════════════════════════════════════════════
 
+async def _resolve_inbound_dimensions(did: str) -> tuple[str, str, str] | None:
+    """查 inbound_route 把 DID 解析为 (tenant_id, biz_type, scenario)。
+
+    匹配顺序:精确 did 优先,号段 did_pattern 正则兜底。无匹配返回 None(由调用方回落)。
+    """
+    if not did:
+        return None
+    try:
+        async with async_session() as session:
+            stmt = select(
+                InboundRoute.tenant_id, InboundRoute.biz_type, InboundRoute.scenario
+            ).where(InboundRoute.did == did, InboundRoute.is_active.is_(True))
+            row = (await session.execute(stmt)).first()
+            if row:
+                return row[0], row[1], row[2]
+
+            # 号段正则兜底
+            import re
+            stmt2 = select(
+                InboundRoute.tenant_id, InboundRoute.biz_type, InboundRoute.scenario,
+                InboundRoute.did_pattern,
+            ).where(InboundRoute.did_pattern.is_not(None), InboundRoute.is_active.is_(True))
+            for r in (await session.execute(stmt2)).all():
+                try:
+                    if re.fullmatch(r[3], did):
+                        return r[0], r[1], r[2]
+                except re.error:
+                    continue
+    except Exception as e:
+        logger.error("[%s] inbound_route resolve failed: %s", did, e)
+    return None
+
+
 def _create_esl_event_handlers(esl: ESLClient) -> None:
     """注册 CHANNEL_ANSWER / CHANNEL_HANGUP 事件处理。"""
 
@@ -152,9 +188,31 @@ def _create_esl_event_handlers(esl: ESLClient) -> None:
             event.headers.get("variable_user_key", "")
             or event.headers.get("Caller-Caller-ID-Number", "")
         )
-        logger.info("[%s] CHANNEL_ANSWER biz_type=%s user_key=%s", uuid, biz_type, user_key)
 
-        _call_registry.register(uuid, biz_type, user_key)
+        # DID → (tenant_id, biz_type, scenario);失败回落 dialplan 静态 variable_biz_type
+        did = (
+            event.headers.get("variable_did")
+            or event.headers.get("Caller-Destination-Number")
+            or ""
+        )
+        resolved = await _resolve_inbound_dimensions(did)
+        if resolved:
+            tenant_id, biz_type, scenario = resolved
+        else:
+            tenant_id = "default"
+            scenario = "default"
+            if did:
+                logger.warning(
+                    "[%s] no inbound_route match for did=%s, fallback biz_type=%s",
+                    uuid, did, biz_type,
+                )
+
+        logger.info(
+            "[%s] CHANNEL_ANSWER tenant=%s biz_type=%s scenario=%s user_key=%s",
+            uuid, tenant_id, biz_type, scenario, user_key,
+        )
+
+        _call_registry.register(uuid, biz_type, user_key, tenant_id=tenant_id, scenario=scenario)
 
         ws_url = f"ws://{settings.media_ws_host}:{settings.media_ws_port}/media/{uuid}"
         try:
@@ -338,5 +396,7 @@ async def ws_media_fork(websocket: WebSocket, call_id: str):
     call = _call_registry.get(call_id)
     biz_type = call.biz_type if call else "marketing"
     user_key = call.user_key if call else ""
+    tenant_id = call.tenant_id if call else "default"
+    scenario = call.scenario if call else "default"
 
-    await _streaming_handler.handle(websocket, call_id, biz_type, user_key)
+    await _streaming_handler.handle(websocket, call_id, biz_type, user_key, tenant_id, scenario)

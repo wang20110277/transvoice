@@ -97,10 +97,21 @@ class StreamingCallHandler:
     # 主循环
     # ───────────────────────────────────────────────────────────────
 
-    async def handle(self, websocket: WebSocket, call_id: str, biz_type: str, user_key: str) -> None:
+    async def handle(
+        self,
+        websocket: WebSocket,
+        call_id: str,
+        biz_type: str,
+        user_key: str,
+        tenant_id: str = "default",
+        scenario: str = "default",
+    ) -> None:
         """WebSocket 主循环：接收音频 → VAD 端点检测 → 流式管线 → barge-in 并发检测。"""
         await websocket.accept()
-        logger.info("[%s] WS connected biz_type=%s user_key=%s", call_id, biz_type, user_key)
+        logger.info(
+            "[%s] WS connected tenant=%s biz_type=%s scenario=%s user_key=%s",
+            call_id, tenant_id, biz_type, scenario, user_key,
+        )
 
         # TTSOutputBuffer: 单 writer 统一出口，拆帧（960B）匀速 30ms 发送，无数据时静音保活
         tts_buffer = TTSOutputBuffer(
@@ -109,7 +120,7 @@ class StreamingCallHandler:
         )
         await tts_buffer.start()
 
-        active_call = self._resolve_active_call(call_id, biz_type, user_key)
+        active_call = self._resolve_active_call(call_id, biz_type, user_key, tenant_id, scenario)
         vad = self._vad_factory() if self._vad_factory else SimpleVAD()
         jitter = JitterBuffer(target_depth=self._jitter_target_depth, max_depth=self._jitter_max_depth)
         audio_buffer = bytearray()
@@ -255,6 +266,8 @@ class StreamingCallHandler:
                                     precomputed_asr_result=precomputed_asr_result,
                                     ai_spoken_event=ai_has_spoken,
                                     tts_buffer=tts_buffer,
+                                    tenant_id=tenant_id,
+                                    scenario=scenario,
                                 ),
                                 name=f"stream-{call_id}-{turn_count}",
                             )
@@ -282,13 +295,18 @@ class StreamingCallHandler:
     # 音频处理辅助
     # ───────────────────────────────────────────────────────────────
 
-    def _resolve_active_call(self, call_id: str, biz_type: str, user_key: str) -> "ActiveCall | None":
+    def _resolve_active_call(
+        self, call_id: str, biz_type: str, user_key: str,
+        tenant_id: str = "default", scenario: str = "default",
+    ) -> "ActiveCall | None":
         """获取或注册 ActiveCall。"""
         if not self._registry:
             return None
         active_call = self._registry.get(call_id)
         if not active_call:
-            active_call = self._registry.register(call_id, biz_type, user_key)
+            active_call = self._registry.register(
+                call_id, biz_type, user_key, tenant_id=tenant_id, scenario=scenario,
+            )
         return active_call
 
     @staticmethod
@@ -512,6 +530,8 @@ class StreamingCallHandler:
         precomputed_asr_result: dict | None = None,
         ai_spoken_event: asyncio.Event | None = None,
         tts_buffer: TTSOutputBuffer | None = None,
+        tenant_id: str = "default",
+        scenario: str = "default",
     ) -> None:
         """Phase 1 (pre-LLM) + Phase 2 (streaming LLM+TTS) → TTSOutputBuffer 回传。"""
         downstream_pcm = bytearray()
@@ -524,6 +544,8 @@ class StreamingCallHandler:
             state = await self._pre_llm_fn(
                 call_id, biz_type, user_key, audio,
                 precomputed_asr_result=precomputed_asr_result,
+                tenant_id=tenant_id,
+                scenario=scenario,
             )
 
             if barge_in_event and barge_in_event.is_set():

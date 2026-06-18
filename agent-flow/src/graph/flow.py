@@ -26,6 +26,7 @@ from llm.sentence_splitter import Sentence
 from config import settings
 from rag.retriever import retrieve_scripts, build_rag_block, should_retrieve, grade_documents, rewrite_query
 from graph.prompt import build_messages
+from graph.render import render
 from memory.assembler import MemoryAssembler
 from clients.mcp import MCPClient
 from clients.tts import TTSClient
@@ -274,6 +275,8 @@ async def _rag_retrieve_node(state: CallGraphState) -> dict:
 async def run_pre_llm_phase(
     call_id: str, biz_type: str, user_key: str, audio_bytes: bytes,
     precomputed_asr_result: dict | None = None,
+    tenant_id: str = "default",
+    scenario: str = "default",
 ) -> CallGraphState:
     """Phase 1: ASR 识别 + 并行扇出（MCP 身份 + 记忆召回 + RAG 检索）。
 
@@ -283,17 +286,24 @@ async def run_pre_llm_phase(
         user_key: 用户标识
         audio_bytes: 用户音频 PCM
         precomputed_asr_result: 已通过 gRPC/WS 流式获取的 ASR 结果（跳过 HTTP ASR）
+        tenant_id: 租户/业务系统(提示词隔离维度)
+        scenario: 话术场景(提示词选择维度)
 
     Returns:
         组装好的 CallGraphState，供 run_streaming_pipeline 使用
     """
     t0 = time.monotonic()
-    logger.info("[%s] biz_type=%s user_key=%s", call_id, biz_type, user_key)
+    logger.info(
+        "[%s] tenant=%s biz_type=%s scenario=%s user_key=%s",
+        call_id, tenant_id, biz_type, scenario, user_key,
+    )
 
     # ── ASR ──
     state: CallGraphState = {
         "call_id": call_id,
+        "tenant_id": tenant_id,
         "biz_type": biz_type,
+        "scenario": scenario,
         "user_key": user_key,
         "user_input": "",
         "audio_bytes": audio_bytes,
@@ -363,12 +373,28 @@ async def run_streaming_pipeline(
 
     # ── 构建 Prompt ──
     from graph.prompt_config import get_system_prompt
-    system_prompt = await get_system_prompt(biz_type)
-    logger.info("[%s] biz_type=%s prompt loaded: %d chars", call_id, biz_type, len(system_prompt))
+    tenant_id = state.get("tenant_id", "default")
+    scenario = state.get("scenario", "default")
+    system_prompt = await get_system_prompt(tenant_id, biz_type, scenario)
+    logger.info(
+        "[%s] tenant=%s biz_type=%s scenario=%s prompt loaded: %d chars",
+        call_id, tenant_id, biz_type, scenario, len(system_prompt),
+    )
     logger.info("[%s] system_prompt content:\n%s", call_id, system_prompt)
+
+    # 聚合变量上下文:MCP 身份 ‖ 记忆 ‖ 外呼 call_task.vars(渲染 {占位符})
+    vars_context: dict = {}
+    identity = state.get("identity")
+    if isinstance(identity, dict):
+        vars_context.update(identity)
+    call_task_vars = state.get("call_task_vars")
+    if isinstance(call_task_vars, dict):
+        vars_context.update(call_task_vars)
+    rendered_prompt = render(system_prompt, vars_context)
+
     messages = build_messages(
         biz_type=biz_type,
-        system_prompt=system_prompt,
+        system_prompt=rendered_prompt,
         user_input=state["user_input"],
         memory_block=state.get("memory_block", ""),
         rag_block=state.get("rag_block", ""),
