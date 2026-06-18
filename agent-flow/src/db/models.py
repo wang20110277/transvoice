@@ -2,7 +2,7 @@
 from datetime import datetime
 from sqlalchemy import (
     BigInteger, Boolean, DateTime, Float, Integer, String, Text, func,
-    CheckConstraint, Index, UniqueConstraint, PrimaryKeyConstraint,
+    CheckConstraint, ForeignKey, Index, UniqueConstraint, PrimaryKeyConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -34,7 +34,9 @@ class CallSession(Base):
     user_id: Mapped[str] = mapped_column(Text, nullable=False)
     call_id: Mapped[str] = mapped_column(UUID, nullable=False)
     fs_uuid: Mapped[str] = mapped_column(UUID, nullable=False)
+    tenant_id: Mapped[str | None] = mapped_column(Text)
     biz_type: Mapped[str] = mapped_column(Text, nullable=False)
+    scenario: Mapped[str | None] = mapped_column(Text)
     task_id: Mapped[str | None] = mapped_column(Text)
     phone_hash: Mapped[str] = mapped_column(Text, nullable=False)
     user_key: Mapped[str] = mapped_column(Text, nullable=False)
@@ -250,22 +252,96 @@ class ScriptLibrary(Base):
 
 
 class PromptConfig(Base):
-    """提示词配置表 — 按业务系统 + 业务类型维度管理系统提示词"""
+    """提示词配置表 — 按 (租户, 业务场景, 话术场景) 三维度管理系统提示词。
+
+    Console(Drizzle)与 agent-flow(SQLAlchemy)共用本表,列名一致,杜绝双词汇表。
+    """
     __tablename__ = "prompt_config"
     __table_args__ = (
-        UniqueConstraint("biz_system", "biz_type", name="uq_prompt_config_system_type"),
+        UniqueConstraint("tenant_id", "biz_type", "scenario", name="uq_prompt_config_tenant_biz_scenario"),
+        Index("ix_prompt_config_tenant_biz", "tenant_id", "biz_type"),
         Index("ix_prompt_config_biz_type", "biz_type"),
         {"schema": "callbot"},
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    biz_system: Mapped[str] = mapped_column(Text, nullable=False, default="default")
+    tenant_id: Mapped[str] = mapped_column(Text, nullable=False, default="default")
     biz_type: Mapped[str] = mapped_column(Text, nullable=False)
+    scenario: Mapped[str] = mapped_column(Text, nullable=False, default="default")
     system_prompt: Mapped[str] = mapped_column(Text, nullable=False)
     max_reply_length: Mapped[int] = mapped_column(Integer, nullable=False, default=80)
     extra: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    description: Mapped[str | None] = mapped_column(Text)
+    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    create_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
+    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    update_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
+
+
+class PromptVersion(Base):
+    """提示词版本快照表 — 支撑版本历史查看与回滚(跨重启持久化)。"""
+    __tablename__ = "prompt_version"
+    __table_args__ = (
+        Index("ix_prompt_version_lookup", "tenant_id", "biz_type", "scenario", "version"),
+        {"schema": "callbot"},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(Text, nullable=False)
+    biz_type: Mapped[str] = mapped_column(Text, nullable=False)
+    scenario: Mapped[str] = mapped_column(Text, nullable=False)
+    system_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    update_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
+    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class InboundRoute(Base):
+    """呼入 DID 路由表 — 被叫号/号段 → (租户, 业务场景, 话术场景)。"""
+    __tablename__ = "inbound_route"
+    __table_args__ = (
+        UniqueConstraint("did", name="uq_inbound_route_did"),
+        {"schema": "callbot"},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    did: Mapped[str] = mapped_column(Text, nullable=False)
+    did_pattern: Mapped[str | None] = mapped_column(Text)
+    tenant_id: Mapped[str] = mapped_column(Text, nullable=False)
+    biz_type: Mapped[str] = mapped_column(Text, nullable=False)
+    scenario: Mapped[str] = mapped_column(Text, nullable=False, default="default")
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    description: Mapped[str | None] = mapped_column(Text)
+    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    create_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
+    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    update_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
+
+
+class CallTask(Base):
+    """外呼任务定义表 — 仅定义层(promptId 绑定 + 策略参数),不含执行态。
+
+    originate/调度/重拨属独立后续变更;本期策略字段为声明性存储,无执行器消费。
+    """
+    __tablename__ = "call_task"
+    __table_args__ = (
+        Index("ix_call_task_tenant", "tenant_id"),
+        {"schema": "callbot"},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(Text, nullable=False)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    prompt_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("callbot.prompt_config.id"), nullable=False)
+    kb_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="idle")
+    concurrent_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    allowed_hours: Mapped[str | None] = mapped_column(Text)
+    redial_strategy: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    dept_id: Mapped[str | None] = mapped_column(Text)
     description: Mapped[str | None] = mapped_column(Text)
     create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     create_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
