@@ -6,3 +6,9 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Next.js 构建产物
+.next/
+out/
+next-env.d.ts
+*.tsbuildinfo

@@ -2,34 +2,16 @@
   <section name="dialplan">
     <context name="public">
 
-      <!-- 客服: 拨打 8001 -->
-      <extension name="callbot-customer-service">
-        <condition field="destination_number" expression="^8001$">
+      <!--
+        catch-all 呼入拨号计划。
+        三元组 (tenant_id, biz_type, scenario) 不在 dialplan 硬编码 —— 由 agent-flow
+        在 CHANNEL_ANSWER 读 Caller-Destination-Number(=DID)后查 callbot.inbound_route 表解析。
+        新增/修改 DID 路由在 Console「DID 路由」页运营,无需改本文件、无需重启 FS。
+      -->
+      <extension name="callbot-inbound">
+        <condition field="destination_number" expression="^(\d+)$">
           <action application="set" data="call_start_time=${strftime(%Y-%m-%d %H:%M:%S)}"/>
-          <action application="set" data="biz_type=customer_service"/>
-          <!-- 呼入: caller_id_number=客户手机号; 呼出: destination_number=客户手机号 -->
-          <action application="set" data="user_key=${caller_id_number}"/>
-          <action application="answer"/>
-          <action application="playback" data="silence_stream://-1"/>
-        </condition>
-      </extension>
-
-      <!-- 催收: 拨打 8002 -->
-      <extension name="callbot-collection">
-        <condition field="destination_number" expression="^8002$">
-          <action application="set" data="call_start_time=${strftime(%Y-%m-%d %H:%M:%S)}"/>
-          <action application="set" data="biz_type=collection"/>
-          <action application="set" data="user_key=${caller_id_number}"/>
-          <action application="answer"/>
-          <action application="playback" data="silence_stream://-1"/>
-        </condition>
-      </extension>
-
-      <!-- 营销: 拨打 8003 -->
-      <extension name="callbot-marketing">
-        <condition field="destination_number" expression="^8003$">
-          <action application="set" data="call_start_time=${strftime(%Y-%m-%d %H:%M:%S)}"/>
-          <action application="set" data="biz_type=marketing"/>
+          <!-- user_key: 呼入为主叫手机号;呼出时由 originate 设为客户手机号 -->
           <action application="set" data="user_key=${caller_id_number}"/>
           <action application="answer"/>
           <action application="playback" data="silence_stream://-1"/>
