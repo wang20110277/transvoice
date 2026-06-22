@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import Link from 'next/link';
 import { useRouter, usePathname } from 'next/navigation';
 import {
   Layers,
@@ -11,9 +12,11 @@ import {
   FileSpreadsheet,
   Shield,
   LayoutDashboard,
+  Building2,
   LogOut,
 } from 'lucide-react';
 import { authClient } from '@/lib/auth-client';
+import TenantSwitcher from './TenantSwitcher';
 
 interface MenuItem {
   key: string;
@@ -23,6 +26,7 @@ interface MenuItem {
   enabled: boolean;
 }
 
+// 侧栏:纯业务菜单。平台管理功能(租户管理)放顶栏,按权限显隐。
 const MENUS: MenuItem[] = [
   { key: 'routes', label: 'DID 路由', icon: Route, href: '/inbound-routes', enabled: true },
   { key: 'prompts', label: '提示词管理', icon: Layers, href: '/prompts', enabled: true },
@@ -38,11 +42,13 @@ export default function ConsoleShell({
   tenantId,
   userEmail,
   userName,
+  role,
   children,
 }: {
   tenantId: string;
   userEmail: string;
   userName: string;
+  role: string;
   children: React.ReactNode;
 }) {
   const router = useRouter();
@@ -59,41 +65,43 @@ export default function ConsoleShell({
     <div className="min-h-screen flex bg-slate-50">
       {/* 侧边栏 */}
       <aside className={`${collapsed ? 'w-16' : 'w-56'} bg-white border-r border-slate-100 flex flex-col transition-all`}>
-        <div className="p-4 border-b border-slate-100">
+        <div className="h-14 px-4 border-b border-slate-100 flex items-center">
           <div className="flex items-center gap-2">
             <div className="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center text-white font-bold text-sm">智</div>
             {!collapsed && <span className="text-sm font-bold text-slate-800">外呼控制台</span>}
           </div>
         </div>
 
-        <nav className="flex-1 p-2 space-y-0.5">
-          {MENUS.map((m) => {
-            const Icon = m.icon;
-            const active = pathname === m.href;
-            return (
-              <button
-                key={m.key}
-                onClick={() => m.enabled && m.href && router.push(m.href)}
-                disabled={!m.enabled}
-                title={m.label}
-                className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-medium transition-colors ${
-                  active
-                    ? 'bg-indigo-50 text-indigo-700 font-bold'
-                    : m.enabled
-                      ? 'text-slate-600 hover:bg-slate-50'
-                      : 'text-slate-300 cursor-not-allowed'
-                }`}
-              >
-                <Icon className="w-4 h-4 shrink-0" />
-                {!collapsed && (
-                  <span className="flex-1 text-left">
-                    {m.label}
-                    {!m.enabled && <span className="ml-1 text-[9px] text-slate-300">下期</span>}
-                  </span>
-                )}
-              </button>
-            );
-          })}
+        <nav className="flex-1 p-2 overflow-y-auto">
+          <div className="space-y-0.5">
+            {MENUS.map((m) => {
+              const Icon = m.icon;
+              const active = pathname === m.href;
+              return (
+                <button
+                  key={m.key}
+                  onClick={() => m.enabled && m.href && router.push(m.href)}
+                  disabled={!m.enabled}
+                  title={m.label}
+                  className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-medium transition-colors ${
+                    active
+                      ? 'bg-indigo-50 text-indigo-700 font-bold'
+                      : m.enabled
+                        ? 'text-slate-600 hover:bg-slate-50'
+                        : 'text-slate-300 cursor-not-allowed'
+                  }`}
+                >
+                  <Icon className="w-4 h-4 shrink-0" />
+                  {!collapsed && (
+                    <span className="flex-1 text-left">
+                      {m.label}
+                      {!m.enabled && <span className="ml-1 text-[9px] text-slate-300">下期</span>}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
         </nav>
 
         <button
@@ -106,10 +114,25 @@ export default function ConsoleShell({
 
       {/* 主区 */}
       <div className="flex-1 flex flex-col overflow-hidden">
-        <header className="bg-white border-b border-slate-100 px-6 py-3 flex justify-between items-center">
+        <header className="h-14 bg-white border-b border-slate-100 px-6 flex justify-between items-center">
           <div className="flex items-center gap-3">
             <span className="text-xs text-slate-400">租户</span>
-            <span className="text-xs font-mono font-semibold bg-slate-100 px-2 py-0.5 rounded text-slate-700">{tenantId}</span>
+            <TenantSwitcher currentTenantId={tenantId} role={role} />
+            {/* 租户管理入口:放顶栏切换器区,仅 platform_admin 可见 */}
+            {role === 'platform_admin' && (
+              <Link
+                href="/tenants"
+                title="租户管理"
+                className={`flex items-center gap-1 text-xs px-2 py-1 rounded transition-colors ${
+                  pathname === '/tenants'
+                    ? 'bg-indigo-50 text-indigo-700 font-bold'
+                    : 'text-slate-600 hover:bg-slate-100'
+                }`}
+              >
+                <Building2 className="w-3.5 h-3.5" />
+                租户管理
+              </Link>
+            )}
           </div>
           <div className="flex items-center gap-3">
             <div className="text-right">

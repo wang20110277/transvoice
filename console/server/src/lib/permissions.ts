@@ -6,6 +6,7 @@
 export type PermissionCode =
   | 'menu:prompt'
   | 'menu:route'
+  | 'menu:tenant'
   | 'prompt:view'
   | 'prompt:create'
   | 'prompt:update'
@@ -14,7 +15,13 @@ export type PermissionCode =
   | 'route:view'
   | 'route:create'
   | 'route:update'
-  | 'route:delete';
+  | 'route:delete'
+  | 'tenant:view'
+  | 'tenant:create'
+  | 'tenant:update'
+  | 'tenant:delete'
+  | 'user:view'
+  | 'user:assign-tenant';
 
 const ROLE_PERMISSIONS: Record<string, PermissionCode[]> = {
   admin: [
@@ -29,5 +36,7 @@ const ROLE_PERMISSIONS: Record<string, PermissionCode[]> = {
 };
 
 export function hasPermission(role: string, code: PermissionCode): boolean {
+  // platform_admin 跨租户管理,拥有全部权限(admin 超集),短路返回 true
+  if (role === 'platform_admin') return true;
   return (ROLE_PERMISSIONS[role] ?? ROLE_PERMISSIONS.viewer).includes(code);
 }

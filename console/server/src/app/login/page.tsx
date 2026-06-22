@@ -70,6 +70,7 @@ export default function LoginPage() {
           <p className="font-sans font-semibold text-slate-500">本地测试账号:</p>
           <p>admin@transvoice.local / admin123 (tenant=default)</p>
           <p>fin@transvoice.local / admin123 (tenant=galaxy_fin)</p>
+          <p>platform@transvoice.local / platform123 (平台管理员,跨租户)</p>
         </div>
       </div>
     </div>

@@ -40,6 +40,12 @@ export const auth = betterAuth({
       role: { type: 'string', required: false, defaultValue: 'admin', input: false },
     },
   },
+  // 会话级活跃租户(多租户切换);空时 fallback 到 user.tenantId(主租户)
+  session: {
+    additionalFields: {
+      activeTenantId: { type: 'string', required: false, defaultValue: null },
+    },
+  },
 
   // ADFS(OIDC)预留:企业内网接入时启用。本期本地账密,关闭。
   // 启用方式:安装 @better-auth/generic-oauth,放开下方 socialProviders.genericOAuth,

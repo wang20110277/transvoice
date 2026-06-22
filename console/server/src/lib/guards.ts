@@ -11,7 +11,13 @@ export interface AuthCtx {
 
 function ctxFromSession(session: NonNullable<Awaited<ReturnType<typeof getSession>>>): AuthCtx {
   const u = session.user as { email: string; tenantId?: string; role?: string };
-  return { email: u.email, tenantId: u.tenantId ?? 'default', role: u.role ?? 'admin' };
+  const s = session as {
+    activeTenantId?: string | null;
+    session?: { activeTenantId?: string | null };
+  };
+  const active = s.activeTenantId ?? s.session?.activeTenantId ?? null;
+  // 活跃租户优先,空时 fallback user.tenantId
+  return { email: u.email, tenantId: active ?? u.tenantId ?? 'default', role: u.role ?? 'admin' };
 }
 
 /** 要求已登录;未登录 401。 */
@@ -29,6 +35,16 @@ export async function requirePermission(
   if (auth instanceof NextResponse) return auth;
   if (!hasPermission(auth.role, code)) {
     return NextResponse.json({ error: 'forbidden' }, { status: 403 });
+  }
+  return auth;
+}
+
+/** 要求登录 + 为 platform_admin(跨租户管理);否则 401 / 403。 */
+export async function requirePlatformAdmin(): Promise<AuthCtx | NextResponse> {
+  const auth = await requireAuth();
+  if (auth instanceof NextResponse) return auth;
+  if (auth.role !== 'platform_admin') {
+    return NextResponse.json({ error: 'forbidden: platform_admin required' }, { status: 403 });
   }
   return auth;
 }

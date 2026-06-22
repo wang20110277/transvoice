@@ -121,6 +121,8 @@ export const session = consoleAuth.table('session', {
   userId: text('user_id')
     .notNull()
     .references(() => user.id, { onDelete: 'cascade' }),
+  // 会话级活跃租户(多租户切换);空时 fallback 到 user.tenant_id(主租户)
+  activeTenantId: text('active_tenant_id'),
 });
 
 export const account = consoleAuth.table('account', {
@@ -150,4 +152,41 @@ export const verification = consoleAuth.table('verification', {
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
 });
 
+/** 租户主表 — tenant_id 字符串升为一等公民,有元数据。放 console_auth,agent-flow 不引用。 */
+export const tenant = consoleAuth.table(
+  'tenant',
+  {
+    id: text('id').primaryKey(),
+    name: text('name').notNull(),
+    status: text('status').notNull().default('active'),
+    quota: jsonb('quota').notNull().default(sql`'{}'::jsonb`),
+    description: text('description'),
+    createTime: timestamp('create_time', { withTimezone: true }).notNull().defaultNow(),
+    createUser: text('create_user').notNull().default('system'),
+    updateTime: timestamp('update_time', { withTimezone: true }).notNull().defaultNow(),
+    updateUser: text('update_user').notNull().default('system'),
+  },
+  (t) => [uniqueIndex('uq_tenant_name').on(t.name)],
+);
+
+/** 用户-租户关联 — 1 用户多租户。is_primary 标记主租户(登录默认活跃租户来源)。 */
+export const userTenant = consoleAuth.table(
+  'user_tenant',
+  {
+    id: bigserial('id', { mode: 'number' }).primaryKey(),
+    userId: text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
+    tenantId: text('tenant_id').notNull().references(() => tenant.id, { onDelete: 'cascade' }),
+    isPrimary: boolean('is_primary').notNull().default(false),
+    createTime: timestamp('create_time', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('uq_user_tenant_user_tenant').on(t.userId, t.tenantId),
+    index('ix_user_tenant_tenant').on(t.tenantId),
+    // 每用户仅一条 is_primary=true
+    uniqueIndex('uq_user_tenant_primary').on(t.userId).where(sql`${t.isPrimary}`),
+  ],
+);
+
 export type User = typeof user.$inferSelect;
+export type Tenant = typeof tenant.$inferSelect;
+export type UserTenant = typeof userTenant.$inferSelect;
