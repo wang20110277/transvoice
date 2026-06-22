@@ -63,7 +63,7 @@ npm run db:seed
 cd ../../agent-flow && CALLBOT_PG_DSN=postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/callbot PYTHONPATH=$(pwd)/src alembic upgrade head
 
 # 4. 启动
-npm run dev    # http://localhost:3000
+npm run dev    # http://localhost:3001
 ```
 
 ### 测试账号

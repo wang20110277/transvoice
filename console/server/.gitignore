@@ -12,3 +12,6 @@ coverage/
 out/
 next-env.d.ts
 *.tsbuildinfo
+
+# PM2 日志
+logs/
