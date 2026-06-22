@@ -3,12 +3,13 @@
 # 本地启动脚本 — FreeSWITCH / ASR / TTS / Flow 逐个启动
 #
 # 用法:
-#   ./scripts/local.sh              # 启动全部 (fs asr tts mcp flow)
+#   ./scripts/local.sh              # 启动全部 (fs asr tts mcp flow console)
 #   ./scripts/local.sh fs           # 仅启动 FreeSWITCH
 #   ./scripts/local.sh asr          # 仅启动 ASR
 #   ./scripts/local.sh tts          # 仅启动 TTS
 #   ./scripts/local.sh mcp          # 仅启动 MCP Server
 #   ./scripts/local.sh flow         # 仅启动 Flow
+#   ./scripts/local.sh console      # 仅启动 Console (Next.js, pm2 守护)
 #   ./scripts/local.sh fs asr tts   # 启动 FreeSWITCH + ASR + TTS
 #   ./scripts/local.sh stop         # 停止全部
 #   ./scripts/local.sh stop asr     # 仅停止 ASR
@@ -37,7 +38,9 @@ ASR_PORT=8080
 TTS_PORT=8081
 MCP_PORT=9090
 FLOW_PORT=8000
+CONSOLE_PORT=3001
 
+CONSOLE_DIR="$PROJECT_DIR/console/server"
 ASR_MODEL_DIR="$PROJECT_DIR/agent-asr/models/SenseVoiceSmall"
 TTS_MODEL_DIR="$PROJECT_DIR/agent-tts/models/CosyVoice3-0.5B"
 VOICES_DIR="$PROJECT_DIR/voices"
@@ -59,6 +62,26 @@ wait_http() {
   info "等待 $name 就绪 (port $port) ..."
   for i in $(seq 1 "$max"); do
     if is_running "$port"; then
+      info "$name 已就绪"
+      return 0
+    fi
+    sleep 2
+  done
+  warn "$name 在 $((max * 2))s 后未就绪"
+  return 1
+}
+
+# console (Next.js dev) 无 /healthz,用 TCP 监听判断就绪
+port_listening() {
+  local port=$1
+  lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+wait_listen() {
+  local name=$1 port=$2 max=${3:-60}
+  info "等待 $name 就绪 (port $port) ..."
+  for i in $(seq 1 "$max"); do
+    if port_listening "$port"; then
       info "$name 已就绪"
       return 0
     fi
@@ -175,14 +198,24 @@ stop_svc() {
       fi
       rm -f "$PID_DIR/mcp.pid"
       ;;
+    console)
+      if command -v pm2 >/dev/null 2>&1 && pm2 id console >/dev/null 2>&1; then
+        info "停止 console ..."
+        pm2 stop console >/dev/null 2>&1 || true
+        info "console 已停止"
+      else
+        info "console 未在运行"
+      fi
+      ;;
     *)
-      error "未知服务: $svc (可选: fs, asr, tts, mcp, flow)"
+      error "未知服务: $svc (可选: fs, asr, tts, mcp, flow, console)"
       ;;
   esac
 }
 
 stop_all() {
   info "停止所有服务 ..."
+  stop_svc console
   stop_svc flow
   stop_svc mcp
   stop_svc tts
@@ -197,6 +230,21 @@ start_fs() {
   if is_fs_running; then
     info "FreeSWITCH 已在运行"
     return 0
+  fi
+  # 自愈:macOS 内置 com.apple.ftp-proxy 默认在 launchd 层 socket-activate 占用 8021,
+  # 导致 mod_event_socket bind 失败(30s 超时)。netstat 可见监听但 lsof 无主,故用 netstat 检测。
+  if netstat -an 2>/dev/null | grep -q '8021.*LISTEN'; then
+    warn "8021 已被占用(疑似 launchd 的 ftp-proxy 残留),FS 将无法监听 ESL,尝试释放..."
+    if sudo -n launchctl bootout system/com.apple.ftp-proxy 2>/dev/null; then
+      sudo -n launchctl disable system/com.apple.ftp-proxy 2>/dev/null || true
+      info "已释放 8021 (ftp-proxy bootout + disable)"
+      sleep 1
+    else
+      error "自动释放失败(需 sudo 密码),请手动执行后重试:"
+      error "  sudo launchctl bootout system/com.apple.ftp-proxy"
+      error "  sudo launchctl disable system/com.apple.ftp-proxy"
+      return 1
+    fi
   fi
   if [[ ! -x "$FS_BIN" ]]; then
     error "FreeSWITCH 未找到: $FS_BIN"
@@ -287,7 +335,7 @@ start_flow() {
 }
 
 start_mcp() {
-  if is_running "$MCP_PORT"; then
+  if port_listening "$MCP_PORT"; then
     info "MCP Server 已在运行 (port $MCP_PORT)"
     return 0
   fi
@@ -317,7 +365,27 @@ start_mcp() {
     (cd "$mcp_dir" && ./mvnw spring-boot:run >> "$LOG_DIR/mcp.log" 2>&1) &
   fi
   echo $! > "$PID_DIR/mcp.pid"
-  wait_http "MCP Server" "$MCP_PORT" 60
+  wait_listen "MCP Server" "$MCP_PORT" 60
+}
+
+start_console() {
+  if port_listening "$CONSOLE_PORT"; then
+    info "console 已在运行 (port $CONSOLE_PORT)"
+    return 0
+  fi
+  if [[ ! -f "$CONSOLE_DIR/ecosystem.config.cjs" ]]; then
+    error "console 未找到: $CONSOLE_DIR/ecosystem.config.cjs"
+    return 1
+  fi
+  if ! command -v pm2 >/dev/null 2>&1; then
+    error "未找到 pm2,请先执行 npm install -g pm2"
+    return 1
+  fi
+
+  info "启动 console (Next.js dev, port $CONSOLE_PORT, pm2 守护) ..."
+  # pm2 start 已存在则 restart,不会报错;应用日志由 ecosystem.config.cjs 写入 console/server/logs/
+  (cd "$CONSOLE_DIR" && pm2 start ecosystem.config.cjs) >> "$LOG_DIR/console.log" 2>&1
+  wait_listen "console" "$CONSOLE_PORT" 60
 }
 
 show_status() {
@@ -329,7 +397,8 @@ show_status() {
              "ASR|SenseVoice|$ASR_PORT|asr" \
              "TTS|CosyVoice|$TTS_PORT|tts" \
              "MCP Server|Spring Boot|$MCP_PORT|mcp" \
-             "agent-flow|LangGraph|$FLOW_PORT|flow"; do
+             "agent-flow|LangGraph|$FLOW_PORT|flow" \
+             "Console|Next.js|$CONSOLE_PORT|console"; do
     IFS='|' read -r name engine port svc <<< "$row"
     local s="stopped" pid
     pid=$(get_pid "$svc")
@@ -338,6 +407,10 @@ show_status() {
     elif [[ "$svc" == "mcp" ]]; then
       # MCP (Spring Boot) 未暴露 /healthz，用 TCP 监听判断
       if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then s="running"; fi
+    elif [[ "$svc" == "console" ]]; then
+      # console (Next.js dev) 无 /healthz,用 TCP 监听判断;PID 由 pm2 管理
+      if port_listening "$port"; then s="running"; fi
+      pid="$(pm2 pid console 2>/dev/null || true)"
     elif is_running "$port"; then
       s="running"
     fi
@@ -356,18 +429,19 @@ for arg in "$@"; do
     stop)    ACTION="stop" ;;
     status)  ACTION="status" ;;
     -h|--help)
-      echo "用法: $0 [stop] [fs|asr|tts|flow] ..."
-      echo "  (无参数)    启动全部 (fs asr tts mcp flow)"
-      echo "  fs          仅启动 FreeSWITCH"
-      echo "  asr         仅启动 ASR"
-      echo "  tts         仅启动 TTS"
-      echo "  mcp         仅启动 MCP Server"
-      echo "  flow        仅启动 agent-flow"
-      echo "  stop        停止全部"
-      echo "  stop asr    仅停止 ASR"
-      echo "  stop flow   仅停止 agent-flow"
-      echo "  stop fs asr 停止 FreeSWITCH + ASR"
-      echo "  status      查看状态"
+      echo "用法: $0 [stop] [fs|asr|tts|mcp|flow|console] ..."
+      echo "  (无参数)         启动全部 (fs asr tts mcp flow console)"
+      echo "  fs               仅启动 FreeSWITCH"
+      echo "  asr              仅启动 ASR"
+      echo "  tts              仅启动 TTS"
+      echo "  mcp              仅启动 MCP Server"
+      echo "  flow             仅启动 agent-flow"
+      echo "  console          仅启动 Console (Next.js, pm2 守护)"
+      echo "  stop             停止全部"
+      echo "  stop asr         仅停止 ASR"
+      echo "  stop console     仅停止 console"
+      echo "  stop fs asr      停止 FreeSWITCH + ASR"
+      echo "  status           查看状态"
       exit 0 ;;
     *)       SERVICES+=("$arg") ;;
   esac
@@ -391,16 +465,17 @@ case "$ACTION" in
     info "══════════════════════════════════════"
 
     # 默认全部
-    [[ ${#SERVICES[@]} -eq 0 ]] && SERVICES=(fs asr tts mcp flow)
+    [[ ${#SERVICES[@]} -eq 0 ]] && SERVICES=(fs asr tts mcp flow console)
 
     for svc in "${SERVICES[@]}"; do
       case "$svc" in
-        fs)   start_fs ;;
-        asr)  start_asr ;;
-        tts)  start_tts ;;
-        mcp)  start_mcp ;;
-        flow) start_flow ;;
-        *)    error "未知服务: $svc (可选: fs, asr, tts, mcp, flow)" ;;
+        fs)      start_fs ;;
+        asr)     start_asr ;;
+        tts)     start_tts ;;
+        mcp)     start_mcp ;;
+        flow)    start_flow ;;
+        console) start_console ;;
+        *)       error "未知服务: $svc (可选: fs, asr, tts, mcp, flow, console)" ;;
       esac
     done
 
@@ -412,5 +487,6 @@ case "$ACTION" in
     info "  tail -f $LOG_DIR/tts.log"
     info "  tail -f $LOG_DIR/mcp.log"
     info "  tail -f $LOG_DIR/flow.log"
+    info "  console: pm2 logs console"
     ;;
 esac
