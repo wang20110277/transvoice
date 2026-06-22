@@ -24,8 +24,8 @@ interface MenuItem {
 }
 
 const MENUS: MenuItem[] = [
-  { key: 'prompts', label: '提示词管理', icon: Layers, href: '/prompts', enabled: true },
   { key: 'routes', label: 'DID 路由', icon: Route, href: '/inbound-routes', enabled: true },
+  { key: 'prompts', label: '提示词管理', icon: Layers, href: '/prompts', enabled: true },
   { key: 'dashboard', label: '数据看板', icon: LayoutDashboard, enabled: false },
   { key: 'callcenter', label: '外呼任务', icon: PhoneCall, enabled: false },
   { key: 'records', label: '通话记录', icon: FileSpreadsheet, enabled: false },
