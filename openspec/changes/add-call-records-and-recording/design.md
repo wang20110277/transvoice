@@ -9,7 +9,7 @@
 | 1 | `call_id` = `fs_uuid` = FreeSWITCH `Unique-ID`，**同值填 schema 两列**（UUID 列） | 全链路同一个 uuid：dialplan `record_session ${uuid}`、`_call_registry.register(uuid, ...)`、WS `/media/{uuid}`、`update_call_session_end(fs_uuid, ...)` 全用同一值。无独立"业务 call_id 生成器"——表内两列是 Citus 分布键预留，本期同值填即可，YAGNI 不为假设需求造生成器 |
 | 2 | repository 接线埋点：`main._on_channel_answer`（session start）/ `main._on_channel_hangup`（session end + recording artifact + barge-in 事件回填）/ `flow.run_streaming_pipeline`（每轮 user+assistant turn 双写）/ `handler` 关键节点（identity_verified / handoff event） | 与通话生命周期天然对齐，零新状态机；PG 写入 fire-and-forget `asyncio.create_task`，异常只记日志**不阻断通话**（与 Redis `save_turn` 同等级容错） |
 | 3 | Redis `save_turn` 与 PG `insert_turn` **双写并存** | 职责不同：Redis 给下一轮 LLM 跨轮热上下文（1h TTL），PG 给 console 审查（永久）。不互相替代 |
-| 4 | FS `record_session` 录整通双向混音到 `${recordings_dir}/${uuid}.wav` | FS 原生后台录音，agent-flow / ESL 断了甚至重启照样录完整通，最稳、代码最少（vs ESL `uuid_record` 依赖连接稳定性） |
+| 4 | **agent-flow 自录双声道**（`CallRecorder`）——caller（upstream 收帧）+ AI（downstream TTS PCM）分别累加，挂断合成立体声 wav（L=用户 R=AI） | 实测 FS `record_session` 录不到 mod_audio_fork 注入的 AI TTS（media bug 叠加在播放层，R 声道 -91dB 静音）。agent-flow 是音频枢纽（两路都过它），自录天然同步、单一来源、无需合并。dialplan 不再 record_session |
 | 5 | 录音 `call_id`/`fs_uuid` = `${uuid}`（决策 1），CHANNEL_HANGUP 时读文件 → `upload_recording` 上传 MinIO → `insert_artifact(kind='recording', storage='minio', uri=key)` 回写 | `record_session` 执行时业务 call_id 即 uuid，无映射问题；`call_artifact` 表即为此设计（一通话可多 artifact），`insert_artifact` 首次接线 |
 | 6 | console 通话记录读侧：`schema.ts` 加 4 表 Drizzle 只读映射（**不改 DDL**，agent-flow alembic 已建表）；`/api/calls` 按 `activeTenantId` 隔离；详情页 presigned URL 1h 播放 | 与 tenants / inbound-routes 隔离一致；列名与 SQLAlchemy 严格对齐杜绝双词汇表 |
 
@@ -115,29 +115,32 @@ barge-in / handoff / end 等 terminal action 触发时写 `call_event`：
 ```
 ① dialplan CHANNEL_ANSWER
    ├─ answer
-   ├─ playback 录音提示音（recording_notice_played 标志）
-   ├─ record_session ${recordings_dir}/${uuid}.wav   ← FS 原生后台录音
-   └─ playback silence_stream://-1                    ← 保活
+   ├─ playback 录音提示音（recording_notice_played 标志，本地可注释）
+   └─ playback silence_stream://-1   ← 保活（不再 record_session）
 
-② 通话进行中：FS 持续写 ${uuid}.wav（双向混音），agent-flow 存活无关
+② 通话进行中（agent-flow handler 主循环）：
+   ├─ 收 caller 帧 → recorder.feed_caller(frame)（主循环 + barge-in 路径，全部帧）
+   └─ streaming 管线 audio_callback(pcm) → recorder.feed_ai(pcm)（每段 TTS）
 
-③ CHANNEL_HANGUP
-   ├─ FS flush 关闭 ${uuid}.wav 文件
-   └─ ESL event → main._on_channel_hangup(uuid)
-        ├─ repository.update_call_session_end(uuid, end_ts, hangup_cause, result_code)
-        ├─ asyncio.create_task(_archive_recording(uuid, ...))
-        │     ├─ 读 ${recordings_dir}/${uuid}.wav（路径 §6）
-        │     ├─ minio_storage.upload_recording(wav_bytes, call_id=uuid, biz_type, tenant_id)
-        │     │     └─ object key = recordings/{date}/{uuid}.wav
-        │     └─ repository.insert_artifact(
-        │           call_id=uuid, fs_uuid=uuid, kind='recording',
-        │           storage='minio', uri=key, size_bytes, content_type='audio/wav',
-        │       )
-        ├─ esl.audio_fork_stop(uuid)
-        └─ _call_registry.cancel_call(uuid)
+③ CHANNEL_HANGUP / WS 关闭（_cleanup）
+   ├─ recorder.write_to(${recordings_dir}/{uuid}.wav)
+   │     合成立体声 wav（L=caller R=ai，短边补静音 0），16kHz 16-bit
+   ├─ esl.audio_fork_stop / cancel_call
+   └─ asyncio.create_task(_archive_recording(uuid, ...))（强引用持有）
+        ├─ await asyncio.sleep(3)   ← 用户要求挂断后间隔 3s
+        ├─ 读 ${recordings_dir}/{uuid}.wav
+        ├─ minio_storage.upload_recording(...)（MINIO_* 经 load_dotenv 加载到 os.environ）
+        │     └─ object key = recordings/{date}/{uuid}.wav
+        └─ repository.insert_artifact(call_id=uuid, fs_uuid=uuid, kind='recording',
+              storage='minio', uri=key, size_bytes, content_type='audio/wav')
+
+④ console 播放（GET /api/calls/:id/recording-url）
+   └─ 读 call_artifact.uri（object key）→ minio-client.presignedRecordingUrl(key, 1h)
+        → 返回 {url} → <audio src>
 ```
 
-> **时序注意**：`record_session` 文件在 CHANNEL_HANGUP 后才 flush 完成。用户要求挂断后**间隔 3 秒**再上传（`recording_archive_delay_sec`，等 FS flush 完 wav）。`_archive_recording` 用 `asyncio.create_task` 异步执行，先 `await sleep(3)` 再读上传。MinIO 未配置时跳过上传（与 `save_turn_audio` 同样 `if not MINIO_ENDPOINT: return`）。
+> **为何 agent-flow 自录**：FS `record_session` 抓原生媒体帧，mod_audio_fork 把 TTS 经 media bug 叠加到播放层（caller 听得到），但 bug 注入不在 record 抓的帧上 → R 声道 -91dB 静音。agent-flow 同时持有 caller 收帧 + AI TTS PCM，自录天然同步。
+> **DB 存 object key 非 URL**：presigned 1h 过期，key 永久稳定、endpoint 无关。console 播放时现生成签名 URL。
 
 ## 5. console 读侧（Drizzle 只读映射 + API + UI）
 
