@@ -20,6 +20,12 @@ _src = str(Path(__file__).resolve().parent / "src")
 if _src not in sys.path:
     sys.path.insert(0, _src)
 
+# 把整个 .env 灌进 os.environ —— pydantic-settings(env_prefix=CALLBOT_) 只加载
+# CALLBOT_ 前缀字段，无前缀的 MINIO_* 不会进 os.environ，而 minio_storage 在 import 时
+# 用 os.environ.get 读 MINIO_*。load_dotenv 必须在任何 src.storage import 之前执行。
+from dotenv import load_dotenv
+load_dotenv()
+
 import asyncio
 import hashlib
 import logging
@@ -61,6 +67,7 @@ _initialized = False
 _streaming_handler = None
 _call_registry = ActiveCallRegistry()
 _audio_fork_started: set[str] = set()  # 防止 ESL 多连接重复触发 audio_fork_start
+_ongoing_archives: set = set()  # 强引用持有 _archive_recording task，防 fire-and-forget 被 GC
 
 
 def _mask_phone(s: str) -> str:
@@ -81,6 +88,8 @@ async def _archive_recording(fs_uuid: str, biz_type: str, tenant_id: str, user_k
     # 用户要求：挂断后间隔 3 秒再上传（等 FS flush 完 wav）
     await asyncio.sleep(settings.recording_archive_delay_sec)
     path = os.path.join(settings.recordings_dir, f"{fs_uuid}.wav")
+    logger.info("[%s] _archive_recording start: %s (exists=%s)",
+                fs_uuid, path, os.path.exists(path))
     if not os.path.exists(path):
         logger.warning("[%s] recording file not found after %ds: %s",
                        fs_uuid, settings.recording_archive_delay_sec, path)
@@ -95,6 +104,8 @@ async def _archive_recording(fs_uuid: str, biz_type: str, tenant_id: str, user_k
 
     key = await minio_storage.upload_recording(fs_uuid, wav_bytes, biz_type, tenant_id)
     if key is None:
+        logger.info("[%s] upload_recording returned None (MinIO 未配置或 endpoint=%s)，跳过归档",
+                    fs_uuid, os.environ.get("MINIO_ENDPOINT", ""))
         return  # MinIO 未配置，静默跳过
 
     try:
@@ -233,6 +244,8 @@ def _create_esl_event_handlers(esl: ESLClient) -> None:
             archive_task = asyncio.create_task(
                 _archive_recording(uuid, active.biz_type, active.tenant_id, active.user_key)
             )
+            _ongoing_archives.add(archive_task)  # 强引用，防 GC 回收未完成的 task
+            archive_task.add_done_callback(_ongoing_archives.discard)
             archive_task.add_done_callback(
                 lambda t: t.exception() and logger.error(
                     "[%s] _archive_recording failed: %s", uuid, t.exception(),
