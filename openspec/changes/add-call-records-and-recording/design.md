@@ -10,7 +10,7 @@
 | 2 | repository 接线埋点：`main._on_channel_answer`（session start）/ `main._on_channel_hangup`（session end + recording artifact + barge-in 事件回填）/ `flow.run_streaming_pipeline`（每轮 user+assistant turn 双写）/ `handler` 关键节点（identity_verified / handoff event） | 与通话生命周期天然对齐，零新状态机；PG 写入 fire-and-forget `asyncio.create_task`，异常只记日志**不阻断通话**（与 Redis `save_turn` 同等级容错） |
 | 3 | Redis `save_turn` 与 PG `insert_turn` **双写并存** | 职责不同：Redis 给下一轮 LLM 跨轮热上下文（1h TTL），PG 给 console 审查（永久）。不互相替代 |
 | 4 | FS `record_session` 录整通双向混音到 `${recordings_dir}/${uuid}.wav` | FS 原生后台录音，agent-flow / ESL 断了甚至重启照样录完整通，最稳、代码最少（vs ESL `uuid_record` 依赖连接稳定性） |
-| 5 | 录音 `call_id`/`fs_uuid` = `${uuid}`（决策 1），CHANNEL_HANGUP 后**间隔 3s**（等 FS flush wav）读文件 → `upload_recording` 上传 MinIO → **UPDATE `call_session.recording_uri`** 回写 | 用户明确要求录音链接存 call_session（每通 1 行 1 链接，console 直接读）；需 alembic 给 call_session 加 `recording_uri TEXT` 列。**不用 call_artifact**（YAGNI——每通单录音，无需多产物表） |
+| 5 | 录音 `call_id`/`fs_uuid` = `${uuid}`（决策 1），CHANNEL_HANGUP 时读文件 → `upload_recording` 上传 MinIO → `insert_artifact(kind='recording', storage='minio', uri=key)` 回写 | `record_session` 执行时业务 call_id 即 uuid，无映射问题；`call_artifact` 表即为此设计（一通话可多 artifact），`insert_artifact` 首次接线 |
 | 6 | console 通话记录读侧：`schema.ts` 加 4 表 Drizzle 只读映射（**不改 DDL**，agent-flow alembic 已建表）；`/api/calls` 按 `activeTenantId` 隔离；详情页 presigned URL 1h 播放 | 与 tenants / inbound-routes 隔离一致；列名与 SQLAlchemy 严格对齐杜绝双词汇表 |
 
 ## 2. call_id / fs_uuid 关系澄清（决策 1 展开）
@@ -126,17 +126,18 @@ barge-in / handoff / end 等 terminal action 触发时写 `call_event`：
    └─ ESL event → main._on_channel_hangup(uuid)
         ├─ repository.update_call_session_end(uuid, end_ts, hangup_cause, result_code)
         ├─ asyncio.create_task(_archive_recording(uuid, ...))
-        │     ├─ await asyncio.sleep(3)   ← 等 FS flush 完 wav（可配 recording_archive_delay_sec）
-        │     ├─ 读 ${recordings_dir}/${uuid}.wav
+        │     ├─ 读 ${recordings_dir}/${uuid}.wav（路径 §6）
         │     ├─ minio_storage.upload_recording(wav_bytes, call_id=uuid, biz_type, tenant_id)
         │     │     └─ object key = recordings/{date}/{uuid}.wav
-        │     └─ repository.update_call_session_recording_uri(uuid, key)
-        │           └─ UPDATE callbot.call_session SET recording_uri=key WHERE fs_uuid=uuid
+        │     └─ repository.insert_artifact(
+        │           call_id=uuid, fs_uuid=uuid, kind='recording',
+        │           storage='minio', uri=key, size_bytes, content_type='audio/wav',
+        │       )
         ├─ esl.audio_fork_stop(uuid)
         └─ _call_registry.cancel_call(uuid)
 ```
 
-> **时序注意**：用户明确要求挂断后**间隔 3 秒**再上传（等 FS flush 完 wav 文件）。`_archive_recording` 用 `asyncio.create_task` 异步执行，先 `sleep(3)` 再读上传。MinIO 未配置时跳过上传（与 `save_turn_audio` 同样 `if not MINIO_ENDPOINT: return`），recording_uri 留空。
+> **时序注意**：`record_session` 文件在 CHANNEL_HANGUP 后才 flush 完成。`_archive_recording` 用 `asyncio.create_task` 异步执行，自然延后于 hangup 清理；若文件尚未就绪，加短重试（最多 3 次 × 0.5s）。MinIO 未配置时跳过上传（与 `save_turn_audio` 同样 `if not MINIO_ENDPOINT: return`）。
 
 ## 5. console 读侧（Drizzle 只读映射 + API + UI）
 

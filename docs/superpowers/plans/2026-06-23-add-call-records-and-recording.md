@@ -72,8 +72,6 @@ Modify `agent-flow/src/config.py`，在 Settings 类（参照现有 `media_sampl
     recordings_dir: str = "/Users/lindaw/freeswitch/var/lib/freeswitch/recordings"
     recording_notice_enabled: bool = True
     recording_archive_timeout: int = 30
-    # 挂断后间隔秒数再上传录音（等 FS flush 完 wav）；用户要求 3 秒
-    recording_archive_delay_sec: int = 3
     recording_notice_sound: str = "ivr/recording_notice.wav"
 ```
 
@@ -296,19 +294,21 @@ Modify `_on_channel_hangup`（main.py:163-173）。当前函数体替换为：
         _call_registry.cancel_call(uuid)
 ```
 
-- [ ] **Step 7: main.py _archive_recording 协程（3s 延时 + update call_session）**
+- [ ] **Step 7: main.py _archive_recording 协程**
 
 Modify `agent-flow/main.py`，模块级加（`_mask_phone` 附近）：
 
 ```python
 async def _archive_recording(fs_uuid: str, biz_type: str, tenant_id: str, user_key: str) -> None:
-    """挂断后间隔 3s → 读 FS 录音 → 上传 MinIO → UPDATE call_session.recording_uri。"""
-    # 用户要求：挂断后间隔 3 秒再上传（等 FS flush 完 wav）
-    await asyncio.sleep(settings.recording_archive_delay_sec)
+    """读 FS 录音文件 → 上传 MinIO → 回写 call_artifact。文件未就绪短重试。"""
     path = os.path.join(settings.recordings_dir, f"{fs_uuid}.wav")
-    if not os.path.exists(path):
-        logger.warning("[%s] recording file not found after %ds: %s",
-                       fs_uuid, settings.recording_archive_delay_sec, path)
+    # FS flush 关闭 wav 有延迟，重试等待文件就绪
+    for _ in range(3):
+        if os.path.exists(path):
+            break
+        await asyncio.sleep(0.5)
+    else:
+        logger.warning("[%s] recording file not found: %s", fs_uuid, path)
         return
 
     try:
@@ -320,86 +320,34 @@ async def _archive_recording(fs_uuid: str, biz_type: str, tenant_id: str, user_k
 
     key = await minio_storage.upload_recording(fs_uuid, wav_bytes, biz_type, tenant_id)
     if key is None:
-        return  # MinIO 未配置，静默跳过（recording_uri 留空）
+        return  # MinIO 未配置，静默跳过
 
     try:
-        await repository.update_call_session_recording_uri(fs_uuid, key)
+        await repository.insert_artifact(
+            call_id=fs_uuid, fs_uuid=fs_uuid, biz_type=biz_type,
+            user_id=user_key, user_key=user_key,
+            kind="recording", storage="minio", uri=key,
+            size_bytes=len(wav_bytes), content_type="audio/wav",
+        )
         logger.info("[%s] recording archived: %s (%d bytes)", fs_uuid, key, len(wav_bytes))
     except Exception as e:
-        logger.error("[%s] update_call_session_recording_uri failed: %s", fs_uuid, e)
+        logger.error("[%s] insert_artifact(recording) failed: %s", fs_uuid, e)
 ```
-
-> 用 `update_call_session_recording_uri`（Step 6b 加），**不用 insert_artifact**——用户要求链接存 call_session.recording_uri。
-
-- [ ] **Step 6b: alembic 迁移 + models.py + repository.update_call_session_recording_uri**
-
-> 必须在 Step 7 运行前完成（列存在）。
-
-Create `agent-flow/alembic/versions/0004_call_session_recording_uri.py`（参照 0002/0003 风格）：
-
-```python
-"""call_session 加 recording_uri 列（整通录音 MinIO object key 回写）。
-
-Revision ID: 0004_call_session_recording_uri
-Revises: 0003_prompt_pipeline_align
-"""
-from alembic import op
-
-SCHEMA = "callbot"
-revision = "0004_call_session_recording_uri"
-down_revision = "0003_prompt_pipeline_align"
-branch_labels = None
-depends_on = None
-
-
-def upgrade() -> None:
-    op.execute(
-        f'ALTER TABLE {SCHEMA}.call_session '
-        f'ADD COLUMN IF NOT EXISTS recording_uri TEXT'
-    )
-
-
-def downgrade() -> None:
-    op.execute(f'ALTER TABLE {SCHEMA}.call_session DROP COLUMN IF EXISTS recording_uri')
-```
-
-Modify `agent-flow/src/db/models.py` `CallSession` 类（在 `recording_notice_played` 后加）：
-
-```python
-    recording_uri: Mapped[str | None] = mapped_column(Text)
-```
-
-Modify `agent-flow/src/storage/repository.py`，加：
-
-```python
-async def update_call_session_recording_uri(fs_uuid: str, recording_uri: str) -> None:
-    """整通录音上传后，把 MinIO object key 回写到 call_session.recording_uri。"""
-    try:
-        async with async_session() as session:
-            stmt = (
-                update(CallSession)
-                .where(CallSession.fs_uuid == fs_uuid)
-                .values(recording_uri=recording_uri, update_time=datetime.now())
-            )
-            await session.execute(stmt)
-            await session.commit()
-    except SQLAlchemyError as e:
-        logger.error("update_call_session_recording_uri failed: %s", e)
-        raise
-```
-
-Run migration: `cd agent-flow && PYTHONPATH=$(pwd)/src alembic upgrade head`
-Verify: `docker exec callbot-postgres psql -U postgres -d callbot -c '\d callbot.call_session' | grep recording_uri` → 见 `recording_uri | text |`
 
 - [ ] **Step 8: 真实呼入集成验证**
 
-Run: 重启 `./scripts/local.sh stop flow && ./scripts/local.sh flow`；真实 SIP 呼入完整一通 → 挂断 → **等 3 秒+**。
+Run: 重启 `./scripts/local.sh stop flow && ./scripts/local.sh flow`；真实 SIP 呼入完整一通 → 挂断。
 Verify:
 ```bash
 docker exec callbot-postgres psql -U postgres -d callbot -c \
-  "SELECT call_id, fs_uuid, phone_masked, biz_type, start_ts, end_ts, hangup_cause, recording_uri FROM callbot.call_session ORDER BY id DESC LIMIT 1"
+  "SELECT call_id, fs_uuid, user_id, phone_masked, biz_type, tenant_id, start_ts, end_ts, hangup_cause, recording_notice_played FROM callbot.call_session ORDER BY id DESC LIMIT 1"
 ```
-Expected: call_id == fs_uuid；phone_masked 形如 `138****5678`；start_ts/end_ts/hangup_cause 已填；**recording_uri 形如 `recordings/<date>/<uuid>.wav`**。通话过程 flow.log 无异常。
+Expected: call_id == fs_uuid；phone_masked 形如 `138****5678`；start_ts/end_ts/hangup_cause 已填。
+```bash
+docker exec callbot-postgres psql -U postgres -d callbot -c \
+  "SELECT kind, storage, uri, size_bytes FROM callbot.call_artifact WHERE call_id='<uuid>'"
+```
+Expected: `recording / minio / recordings/<date>/<uuid>.wav / <bytes>`。通话过程 flow.log 无异常。
 
 - [ ] **Step 9: Commit**
 
@@ -559,7 +507,6 @@ export const callSession = callbot.table('call_session', {
   identityVerified: boolean('identity_verified').notNull().default(false),
   verifyAttempts: integer('verify_attempts').notNull().default(0),
   recordingNoticePlayed: boolean('recording_notice_played').notNull().default(false),
-  recordingUri: text('recording_uri'),
   createTime: timestamp('create_time', { withTimezone: true }).notNull().defaultNow(),
   createUser: text('create_user').notNull().default('system'),
   updateTime: timestamp('update_time', { withTimezone: true }).notNull().defaultNow(),
@@ -723,7 +670,6 @@ export interface SessionDTO {
   resultCode: string | null;
   identityVerified: boolean;
   recordingNoticePlayed: boolean;
-  recordingUri: string | null;
   durationMs: number | null;
 }
 
@@ -740,7 +686,6 @@ export function toSessionDTO(row: SessionRow): SessionDTO {
     userKey: row.userKey, startTs: row.startTs, endTs: row.endTs,
     hangupCause: row.hangupCause, resultCode: row.resultCode,
     identityVerified: row.identityVerified, recordingNoticePlayed: row.recordingNoticePlayed,
-    recordingUri: row.recordingUri,
     durationMs,
   };
 }
@@ -793,11 +738,14 @@ export async function getCallDetail(id: number, tenantId: string): Promise<CallD
 }
 
 export async function getRecordingUrl(id: number, tenantId: string): Promise<string | null> {
-  // 录音链接存 call_session.recording_uri（用户要求，非 call_artifact）
-  const sess = await db.select().from(callSession)
+  // 跨租户不泄漏：先校验 session 归属
+  const sess = await db.select({ callId: callSession.callId }).from(callSession)
     .where(and(eq(callSession.id, id), eq(callSession.tenantId, tenantId)));
-  if (sess.length === 0 || !sess[0].recordingUri) return null;
-  return presignedRecordingUrl(sess[0].recordingUri); // 1h presigned；MinIO 未配置返回 null
+  if (sess.length === 0) return null;
+  const arts = await db.select().from(callArtifact)
+    .where(and(eq(callArtifact.callId, sess[0].callId), eq(callArtifact.kind, 'recording')));
+  if (arts.length === 0) return null;
+  return presignedRecordingUrl(arts[0].uri); // 1h presigned；MinIO 未配置返回 null
 }
 ```
 
