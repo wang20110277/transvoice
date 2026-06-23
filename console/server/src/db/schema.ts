@@ -14,6 +14,7 @@ import {
   jsonb,
   pgSchema,
   pgTable,
+  real,
   text,
   timestamp,
   uniqueIndex,
@@ -122,6 +123,101 @@ export const callTask = callbot.table(
 );
 
 export type CallTask = typeof callTask.$inferSelect;
+
+/**
+ * 通话四表 — 只读映射，DDL 由 agent-flow alembic 维护（0001_initial_schema）。
+ * 列名与 agent-flow SQLAlchemy (src/db/models.py) 严格 snake_case 对齐，杜绝双词汇表。
+ * console 仅 select，不写这四表（写入由 agent-flow 接线负责）。
+ */
+
+/** 通话会话事实表（models.py CallSession）。整通录音链接在 call_artifact，不在本表。 */
+export const callSession = callbot.table('call_session', {
+  id: bigserial('id', { mode: 'number' }).primaryKey(),
+  userId: text('user_id').notNull(),
+  callId: text('call_id').notNull(),
+  fsUuid: text('fs_uuid').notNull(),
+  tenantId: text('tenant_id'),
+  bizType: text('biz_type').notNull(),
+  scenario: text('scenario'),
+  taskId: text('task_id'),
+  phoneHash: text('phone_hash').notNull(),
+  userKey: text('user_key').notNull(),
+  phoneMasked: text('phone_masked'),
+  startTs: timestamp('start_ts', { withTimezone: true }).notNull(),
+  endTs: timestamp('end_ts', { withTimezone: true }),
+  resultCode: text('result_code'),
+  hangupCause: text('hangup_cause'),
+  identityVerified: boolean('identity_verified').notNull().default(false),
+  verifyAttempts: integer('verify_attempts').notNull().default(0),
+  recordingNoticePlayed: boolean('recording_notice_played').notNull().default(false),
+  createTime: timestamp('create_time', { withTimezone: true }).notNull().defaultNow(),
+  createUser: text('create_user').notNull().default('system'),
+  updateTime: timestamp('update_time', { withTimezone: true }).notNull().defaultNow(),
+  updateUser: text('update_user').notNull().default('system'),
+});
+
+/** 逐轮对话表（models.py CallTurn）。console 详情页逐轮回放。 */
+export const callTurn = callbot.table('call_turn', {
+  id: bigserial('id', { mode: 'number' }).primaryKey(),
+  userId: text('user_id').notNull(),
+  callId: text('call_id').notNull(),
+  fsUuid: text('fs_uuid').notNull(),
+  bizType: text('biz_type').notNull(),
+  userKey: text('user_key').notNull(),
+  role: text('role').notNull(),
+  text: text('text'),
+  asrConf: real('asr_conf'),
+  startMs: integer('start_ms'),
+  endMs: integer('end_ms'),
+  ts: timestamp('ts', { withTimezone: true }).notNull().defaultNow(),
+  createTime: timestamp('create_time', { withTimezone: true }).notNull().defaultNow(),
+  createUser: text('create_user').notNull().default('system'),
+  updateTime: timestamp('update_time', { withTimezone: true }).notNull().defaultNow(),
+  updateUser: text('update_user').notNull().default('system'),
+});
+
+/** 事件流表（models.py CallEvent）。console 详情页事件时间线。 */
+export const callEvent = callbot.table('call_event', {
+  id: bigserial('id', { mode: 'number' }).primaryKey(),
+  userId: text('user_id').notNull(),
+  callId: text('call_id').notNull(),
+  fsUuid: text('fs_uuid').notNull(),
+  bizType: text('biz_type').notNull(),
+  userKey: text('user_key').notNull(),
+  eventType: text('event_type').notNull(),
+  payload: jsonb('payload').notNull().default(sql`'{}'::jsonb`),
+  ts: timestamp('ts', { withTimezone: true }).notNull().defaultNow(),
+  createTime: timestamp('create_time', { withTimezone: true }).notNull().defaultNow(),
+  createUser: text('create_user').notNull().default('system'),
+  updateTime: timestamp('update_time', { withTimezone: true }).notNull().defaultNow(),
+  updateUser: text('update_user').notNull().default('system'),
+});
+
+/** 录音/音频产物表（models.py CallArtifact）。整通录音 kind='recording'，与 call_session 一对多。 */
+export const callArtifact = callbot.table('call_artifact', {
+  id: bigserial('id', { mode: 'number' }).primaryKey(),
+  userId: text('user_id').notNull(),
+  callId: text('call_id').notNull(),
+  fsUuid: text('fs_uuid').notNull(),
+  bizType: text('biz_type').notNull(),
+  userKey: text('user_key').notNull(),
+  kind: text('kind').notNull(),
+  storage: text('storage').notNull(),
+  uri: text('uri').notNull(),
+  sha256: text('sha256'),
+  sizeBytes: bigint('size_bytes', { mode: 'number' }),
+  contentType: text('content_type'),
+  ts: timestamp('ts', { withTimezone: true }).notNull().defaultNow(),
+  createTime: timestamp('create_time', { withTimezone: true }).notNull().defaultNow(),
+  createUser: text('create_user').notNull().default('system'),
+  updateTime: timestamp('update_time', { withTimezone: true }).notNull().defaultNow(),
+  updateUser: text('update_user').notNull().default('system'),
+});
+
+export type CallSession = typeof callSession.$inferSelect;
+export type CallTurn = typeof callTurn.$inferSelect;
+export type CallEvent = typeof callEvent.$inferSelect;
+export type CallArtifact = typeof callArtifact.$inferSelect;
 
 // ── console_auth schema(Better Auth 自带) ───────────────────────────
 
