@@ -6,6 +6,7 @@ coverage/
 *.log
 .env*
 !.env.example
+!.env.local
 
 # Next.js 构建产物
 .next/
