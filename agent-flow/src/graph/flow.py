@@ -28,6 +28,7 @@ from rag.retriever import retrieve_scripts, build_rag_block, should_retrieve, gr
 from graph.prompt import build_messages
 from graph.render import render
 from memory.assembler import MemoryAssembler
+from memory.chat_history import load_chat_history, save_turn
 from clients.mcp import MCPClient
 from clients.tts import TTSClient
 from clients.asr import ASRClient
@@ -176,10 +177,7 @@ async def _asr_node(state: CallGraphState) -> dict:
     else:
         user_input = state.get("user_input", "")
 
-    # TODO: re-enable after fixing RedisSearch (FT._LIST)
-    chat_history: list = []
-
-    return {"user_input": user_input, "chat_history": chat_history}
+    return {"user_input": user_input}
 
 
 async def _mcp_identity_node(state: CallGraphState) -> dict:
@@ -326,6 +324,9 @@ async def run_pre_llm_phase(
     else:
         asr_result = await _asr_node(state)
         state.update(asr_result)
+
+    # 加载跨轮对话历史 (plain Redis LIST,无 RediSearch 依赖),供 LLM 区分首轮/后续轮
+    state["chat_history"] = await load_chat_history(call_id, biz_type)
 
     logger.info("[%s] ASR done: user_input=%s", call_id, state.get("user_input", "")[:50])
 
@@ -490,12 +491,9 @@ async def run_streaming_pipeline(
     if tts_tasks:
         await asyncio.gather(*tts_tasks, return_exceptions=True)
 
-    # TODO: re-enable chat history save after fixing RedisSearch
-    # try:
-    #     history = get_chat_history(call_id, biz_type)
-    #     await save_turn(history, state.get("user_input", ""), full_text)
-    # except Exception as e:
-    #     logger.warning("[%s] save history failed: %s", call_id, e)
+    # 持久化本轮对话 (plain Redis LIST),供下一轮加载,避免 LLM 每轮丢失上下文/重复问候
+    if full_text.strip():
+        await save_turn(call_id, biz_type, state.get("user_input", ""), full_text)
 
     elapsed = (time.monotonic() - t0) * 1000
     logger.info("[%s] streaming pipeline done in %.0fms, %d sentences TTS'd",

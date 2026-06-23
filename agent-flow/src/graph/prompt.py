@@ -20,6 +20,15 @@ def build_messages(
         parts.append(memory_block)
 
     system_content = "\n\n".join(parts)
+
+    # 非首轮(已有历史):注入运行时约束,压制系统提示词 Initialization 里
+    # "首先问候…例如'您好,欢迎致电…'" 导致的每轮重复问候;首轮不动。
+    if chat_history:
+        system_content += (
+            "\n\n【运行时约束】通话已经开始且你已完成开场问候。"
+            "禁止再次问候、自我介绍或说\"欢迎致电\"。直接回答用户最新一句话。"
+        )
+
     messages = [SystemMessage(content=system_content)]
 
     if chat_history:
