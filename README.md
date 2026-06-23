@@ -1,18 +1,20 @@
 # 智能外呼系统
-采用分层流向架构，从底层通信层→语音交换层→语音识别层→流程编排层→业务服务层→大模型智能层→存储层→语音合成层→语音播放层，严格按业务数据流顺序绘制，**全程同步透传唯一通话标识CallID与用户手机号两大核心标识**，标注所有通信协议、调用方式、事件通知、数据传递逻辑，完整业务流转流程如下：
+采用分层流向架构，从底层通信层→语音交换层→语音识别层→流程编排层→业务服务层→大模型智能层→存储层→语音合成层→语音播放层，严格按业务数据流顺序绘制，**全程同步透传四维隔离键 `(tenant_id, biz_type, scenario, user_key)` 与通话标识 CallID/fs_uuid**，标注所有通信协议、调用方式、事件通知、数据传递逻辑，完整业务流转流程如下：
 
-1. **接入层**：SIP User发起外呼通话，通话媒体流、通话唯一标识CallID、主叫/被叫用户手机号同步上行传输
-2. **语音交换层**：通话接入FreeSWITCH软交换，负责媒体流转发、通话事件调度、上下行语音流中转，全程携带CallID+手机号
-3. **WebSocket音频流层（事件驱动）**：FreeSWITCH拨号计划 `answer → playback silence_stream://-1`（无限静音保活）触发 CHANNEL_ANSWER 事件 → agent-flow ESL handler 调用 `uuid_audio_fork start` → FreeSWITCH建立与agent-flow的WebSocket双向音频流，**上行传输用户语音PCM流，下行接收TTS合成音频**，全程携带CallID与用户手机号。agent-flow运行在**uvloop事件循环**上（libuv C实现），减少高并发下GC停顿
-4. **语音识别层**：agent-flow首节点调用agent-asr（内置GPU推理引擎），完成语音转文字，生成**同时携带CallID与用户手机号**的ASR识别文本。支持**三种传输协议**：HTTP（默认）、gRPC client-streaming（`CALLBOT_ASR_USE_GRPC`开关）、WebSocket streaming（`asr_ws_client.py`），边收边传减少传输延迟
+> **多租户四维隔离**：自 tenant-management 变更起，业务隔离键由「仅 3 biz_type」升级为 `(tenant_id, biz_type, scenario)` 三元组（加上 per-user 的 `user_key`）。DID 不再在拨号计划硬编码，由 agent-flow 查 `callbot.inbound_route` 解析三元组。详见「多租户四维隔离」章节。
+
+1. **接入层**：SIP User发起外呼通话，通话媒体流、通话唯一标识 CallID/fs_uuid、主叫/被叫用户手机号同步上行传输
+2. **语音交换层**：通话接入 FreeSWITCH 软交换，拨号计划为 **catch-all `^(\d+)$` → answer → playback silence_stream://-1**（无限静音保活）。`tenant_id/biz_type/scenario` **不在 dialplan 硬编码**，由 agent-flow 在 CHANNEL_ANSWER 读取被叫号(DID)后查 `callbot.inbound_route` 解析。全程携带 CallID+手机号
+3. **WebSocket音频流层（事件驱动）**：CHANNEL_ANSWER 事件 → agent-flow ESL handler 调用 `uuid_audio_fork start` → FreeSWITCH 建立与 agent-flow 的 WebSocket 双向音频流，**上行传输用户语音 PCM 流，下行接收 TTS 合成音频**，全程携带四维隔离键。agent-flow 运行在 **uvloop 事件循环**上（libuv C 实现），减少高并发下 GC 停顿
+4. **语音识别层**：agent-flow 首节点调用 agent-asr（内置 GPU 推理引擎），完成语音转文字。输入音频经 **WebRTCAPM（AEC+NS+AGC）或 Denoiser 降噪 → 可插拔 VAD（WebRTC/Silero）** 端点检测。支持**三种传输协议**：HTTP（默认）、gRPC client-streaming（`CALLBOT_ASR_USE_GRPC`开关）、WebSocket streaming（`asr_ws_client.py`），边收边传减少传输延迟
 5. **LangGraph第一业务节点（用户身份核验）**
-编排引擎内置MCP Client，通过HTTP Streamable传输协议调用java-mcp-server用户中心MCP服务，**传入用户手机号**调用`user_identity_query`工具；查询获取用户ID、脱敏手机号、身份证后四位，流程全程保留State内ASR文本、CallID、手机号
+编排引擎内置 MCP Client，通过 HTTP Streamable 传输协议调用 java-mcp-server 用户中心 MCP 服务，**传入用户手机号**调用 `user_identity_query` 工具；查询获取用户ID、脱敏手机号、身份证后四位，流程全程保留 State 内 ASR 文本、四维隔离键
 6. **LangGraph第二业务节点（征信合规核验）**
-复用MCP Client调用java-mcp-server，**使用用户ID**调用`user_credit_query`工具，获取用户征信档案数据，校验征信资质与风险等级（仅marketing业务类型触发），征信不合规直接触发风控预警，以上两个业务节点执行全程保留LangGraph状态内的ASR原始文本、CallID、手机号
+复用 MCP Client 调用 java-mcp-server，**使用用户ID**调用 `user_credit_query` 工具，获取用户征信档案数据，校验征信资质与风险等级（仅 marketing 业务类型触发），征信不合规直接触发风控预警，以上两个业务节点执行全程保留 LangGraph 状态内的 ASR 原始文本、四维隔离键
 7. **LangGraph第三业务节点（LLM智能应答 + TTS语音合成）**
-**从LangGraph全局State中提取完整ASR用户识别文本、CallID、用户手机号、用户ID**，统一送入LLM大模型；LLM解析用户语音文本语义，结合用户手机号绑定的历史用户数据，自主判定是否调取RAG知识库匹配业务标准话术，最终生成标准化外呼应答话术文本；**流式模式下LLM逐token输出，通过IncrementalJSONParser解析、SentenceSplitter切分为完整句子，每句并行调用agent-tts（内置GPU推理引擎，支持gRPC unary和WebSocket streaming调用）合成语音音频，PCM音频经TTSOutputBuffer以稳态30ms帧率通过WebSocket回传FreeSWITCH**，归档至MinIO；依托LangChain Memory记忆体系做分层数据存储：Redis存储短期会话记忆、PostgreSQL(PG)存储长期业务会话数据，同步记录实时对话内容、语音文件存储路径、绑定手机号与CallID关联关系，支持客户二次呼入时通过**用户ID/手机号/CallID**双维度调取全量历史会话数据，结合历史对话信息生成连贯应答话术
-8. **终端播放层**：agent-flow通过WebSocket将TTS音频回传FreeSWITCH，FreeSWITCH下行推送至SIP User通话终端，完成整通智能外呼语音交互闭环
-9. **打断与挂断控制层**：用户在AI说话过程中开口时，可插拔 VAD（WebRTC/Silero）实时检测语音，ESL uuid_break停止FreeSWITCH当前播放，取消流式任务，开启新一轮对话；ESL订阅CHANNEL_ANSWER（自动触发uuid_audio_fork start开启音频流）和CHANNEL_HANGUP事件（uuid_audio_fork stop关闭音频流，通过ActiveCallRegistry取消活跃通话并清理资源）
+提示词按三维 `get_system_prompt(tenant_id, biz_type, scenario)` 加载（Redis 5min 缓存 → DB 降级）并经 `render.py` 渲染变量占位符；**从 LangGraph 全局 State 中提取完整 ASR 用户识别文本、四维隔离键、用户ID**，统一送入 LLM 大模型；LLM 解析用户语音文本语义，结合用户手机号绑定的历史用户数据，自主判定是否调取 RAG 知识库匹配业务标准话术，最终生成标准化外呼应答话术文本；**流式模式下 LLM 逐 token 输出，通过 IncrementalJSONParser 解析、SentenceSplitter 切分为完整句子，每句并行调用 agent-tts（内置 GPU 推理引擎，支持 gRPC unary 和 WebSocket streaming 调用）合成语音音频，PCM 音频经 TTSOutputBuffer 以稳态 30ms 帧率通过 WebSocket 回传 FreeSWITCH**；依托 LangChain Memory 记忆体系做分层数据存储：Redis 存储短期会话记忆、PostgreSQL(PG) 存储长期业务会话数据，每轮对话 fire-and-forget 双写 PG（call_turn），整通录音经 CallRecorder 双声道合并后归档 MinIO
+8. **终端播放层**：agent-flow 通过 WebSocket 将 TTS 音频回传 FreeSWITCH，FreeSWITCH 下行推送至 SIP User 通话终端，完成整通智能外呼语音交互闭环
+9. **录音归档与打断/挂断控制层**：**录音**：CallRecorder 全程累加双声道 PCM（L=caller VAD前 / R=AI TTS），挂断时 `finalize_stereo_wav` 短边补静音，延迟 3s 读 FS 录音 wav → 上传 MinIO → insert_artifact(kind='recording')。**打断**：用户在 AI 说话过程中开口时，可插拔 VAD（WebRTC/Silero）实时检测 → **清空 TTSOutputBuffer（不调用 uuid_break，避免终止 dialplan playback）** → 冷却期防误触发 → 新一轮对话。**挂断**：ESL 订阅 CHANNEL_ANSWER（自动触发 uuid_audio_fork start）和 CHANNEL_HANGUP 事件（uuid_audio_fork stop → ActiveCallRegistry 取消活跃通话 → 录音归档 → 清理资源）
 
 ## 统一绘图强制规范
 1. 整体布局：数据流从左至右分层排布，层级从上至下划分清晰
@@ -56,21 +58,22 @@ aiphone/
 ├── agent-flow/     # LangGraph 7 节点编排 (FastAPI HTTP + WebSocket)
 │   ├── main.py             # FastAPI 入口: WS /media/{uuid} (事件驱动 audio_fork), GET /healthz, ESL生命周期
 │   ├── src/                # 核心源码 (PYTHONPATH includes src/)
-│   │   ├── config.py       # pydantic-settings, CALLBOT_ 环境变量前缀 (含ESL/VAD/JitterBuffer/gRPC/Denoise配置)
+│   │   ├── config.py       # pydantic-settings, CALLBOT_ 环境变量前缀 (含ESL/VAD/JitterBuffer/gRPC/Denoise/AEC/Recording配置)
 │   │   ├── database.py     # SQLAlchemy 2.0 async engine
 │   │   ├── clients/        # mcp.py (用户中心), tts.py (TTS), asr.py (ASR), esl.py (Event Socket, 自动重连+心跳)
 │   │   │                    # tts_grpc_client.py, asr_grpc_client.py, asr_grpc/, tts_grpc/ (gRPC proto)
 │   │   │                    # tts_ws_client.py, asr_ws_client.py (WebSocket 第三传输)
-│   │   ├── ws/             # handler.py (StreamingCallHandler 流式+打断), vad.py (可插拔 VAD: WebRTC/Silero), jitter_buffer.py,
-│   │   │                    # registry.py (ActiveCallRegistry), denoise.py (前置降噪)
-│   │   ├── graph/          # flow.py (7 节点 StateGraph + 流式管道), prompt.py, prompts/{biz_type}.yaml
+│   │   ├── ws/             # handler.py (StreamingCallHandler 流式+打断+录音+APM), vad.py (可插拔 VAD: WebRTC/Silero), jitter_buffer.py,
+│   │   │                    # registry.py (ActiveCallRegistry 携带 tenant_id/scenario), denoise.py (前置降噪),
+│   │   │                    # audio_processing.py (WebRTCAPM AEC/NS/AGC), call_recorder.py (双声道录音)
+│   │   ├── graph/          # flow.py (7 节点 StateGraph + 流式管道), prompt.py, prompt_config.py (三维 Redis→DB 加载), render.py (变量渲染)
 │   │   ├── llm/            # service.py, json_stream.py (增量JSON), sentence_splitter.py (句级切分)
 │   │   ├── memory/         # assembler.py, chat_history.py, redis_memory.py, store.py
 │   │   ├── rag/            # retriever.py (Agentic RAG: 自适应检索+文档评分+查询改写)
-│   │   ├── db/             # models.py (SQLAlchemy ORM, callbot schema, 8 表: call_session, call_turn, call_event, call_artifact, config_snapshot, user_memory_fact, user_memory_vector, script_library)
-│   │   └── storage/        # repository.py (异步仓储层), minio_storage.py (MinIO 对象存储)
+│   │   ├── db/             # models.py (SQLAlchemy ORM, callbot schema, 12 表; 含 prompt_config/prompt_version/inbound_route/call_task)
+│   │   └── storage/        # repository.py (异步仓储层), minio_storage.py (upload_recording 录音归档), persistence_helpers.py (fire-and-forget 双写)
 │   ├── llm/                # Qwen LLM 推理引擎 Dockerfile (vLLM)
-│   ├── alembic/            # 数据库迁移 (versions/0001_initial_schema.py)
+│   ├── alembic/            # 数据库迁移 (0001_initial_schema, 0002_prompt_config, 0003_prompt_pipeline_align)
 │   ├── alembic.ini         # Alembic 配置
 │   ├── requirements.txt    # Python 依赖
 │   ├── Dockerfile          # 应用镜像 (含 alembic 自动迁移)
@@ -87,13 +90,22 @@ aiphone/
 │       │   └── application.yaml        # MCP 配置 (STATELESS, /mcp, :9090)
 │       ├── Dockerfile                  # MCP server 容器
 │       └── pom.xml                     # Maven build
+├── console/                # 管理控制台 (Next.js 15 + Drizzle + Better Auth, :3001)
+│   └── server/
+│       ├── src/app/        # App Router: pages (calls/call-tasks/inbound-routes/prompts/tenants/login) + route handlers (/api/prompts,/api/calls,/api/inbound-routes,/api/call-tasks,/api/tenants,/api/session)
+│       ├── src/lib/        # services (prompts/calls/routes/call-tasks) + minio/redis/llm/perms/auth-client
+│       ├── src/db/         # schema.ts (Drizzle 只读映射 callbot.*), migrations (0001_console_auth, 0002_tenant_management), seed
+│       ├── src/components/ # ConsoleShell, CallRecordsList, CallDetail, PromptManager, InboundRoutesManager, CallTasksManager, TenantsManager, TenantSwitcher
+│       ├── auth.ts         # Better Auth (本地账密 + active_tenant_id)
+│       ├── ecosystem.config.cjs  # PM2 部署
+│       └── README.md       # Console 文档
 ├── freeswitch/             # FreeSWITCH 配置文件
 │   ├── vars.xml            # 全局变量 (SIP, RTP, WebSocket URL)
 │   ├── modules.conf        # 模块加载列表
 │   ├── autoload_configs/   # modules.conf.xml (XML 模块配置)
 │   ├── sip_profiles/       # internal.xml (SIP profile)
 │   ├── event_socket.conf.xml  # ESL 监听配置
-│   ├── dialplan/public/       # 拨号计划: 00_biz_type.xml (answer + playback silence_stream://-1, ESL 事件驱动)
+│   ├── dialplan/public/       # 00_biz_type.xml — catch-all 呼入 (answer + playback silence_stream://-1); DID/三元组由 agent-flow 查 inbound_route 解析
 │   └── mrcp-plugin/          # UniMRCP 1.5.0 (MRCP/ASR 备选)
 ├── scripts/                # 启动脚本
 │   ├── local.sh            # 本地开发 (conda): asr/tts/flow, stop, status
@@ -101,7 +113,8 @@ aiphone/
 ├── voices/                 # TTS 音色样本
 │   ├── default_female.wav
 │   └── tts_test.wav
-├── openspec/               # 变更提案 (OpenSpec)
+├── openspec/               # 稳定规格 (8 能力) + changes/archive/
+├── docs/                   # superpowers plans/specs (设计记录)
 ├── docker-compose.yml      # 基础 Docker Compose (基础设施 + 服务)
 ├── docker-compose.prod.yml # 生产覆盖 (GPU固定, 健康检查)
 └── .env                     # 环境变量 (CALLBOT_ 前缀, 不提交)
@@ -130,7 +143,9 @@ aiphone/
 
 **并行扇出**: ② mcp_identity、④ recall_memory、⑤ rag_retrieve 在 ① receive_asr 之后并发执行。
 
-**流式模式** (WebSocket 生产路径): `run_pre_llm_phase()` 执行 ① + 并行扇出，`run_streaming_pipeline()` 流式输出 LLM token → `IncrementalJSONParser` → `SentenceSplitter` → 每句并行 TTS → `TTSOutputBuffer` 稳态30ms帧回传 FreeSWITCH。支持 **Barge-in 打断**：用户说话时 VAD（WebRTC/Silero）检测 → ESL uuid_break 停止播放 → 取消流式任务。
+**提示词三维加载**：`get_system_prompt(tenant_id, biz_type, scenario)` 以 `(tenant_id, biz_type, scenario)` 为键，Redis 缓存 `cb:prompt:{tenant_id}:{biz_type}:{scenario}`（TTL 5min）未命中回源 DB（`is_active=true`）回填；任一级失败降级返回空串 + 告警，不中断通话。加载后经 `render.py` 渲染 `extra.variables` 声明的占位符（vars_context = MCP 身份 + 记忆 + 外呼 call_task.vars）。`(tenant_id, biz_type, scenario, user_key)` 四元组全程透传：dialplan DID → ESL CHANNEL_ANSWER → ActiveCallRegistry → CallGraphState → run_streaming_pipeline。
+
+**流式模式** (WebSocket 生产路径): `run_pre_llm_phase()` 执行 ① + 并行扇出，`run_streaming_pipeline()` 流式输出 LLM token → `IncrementalJSONParser` → `SentenceSplitter` → 每句并行 TTS → `TTSOutputBuffer` 稳态30ms帧回传 FreeSWITCH；每轮 fire-and-forget 双写 PG（`call_turn` role=user + assistant）。支持 **Barge-in 打断**：用户说话时 VAD（WebRTC/Silero）检测 → **清空 TTSOutputBuffer（不调用 uuid_break，避免终止 dialplan playback）** → 冷却期防误触发 → 取消流式任务 → 新一轮。
 
 
 ## 全链路数据流（事件驱动 uuid_audio_fork）
@@ -138,55 +153,61 @@ aiphone/
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │  FreeSWITCH                                                                 │
-│  dialplan/public/00_biz_type.xml                                            │
+│  dialplan/public/00_biz_type.xml  (catch-all 拨号计划)                      │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │ 来电 → set biz_type → set user_key(cond) → answer → playback silence_stream://-1 │   │
+│  │ 来电 → condition ^(\d+)$ → set user_key → answer → playback silence_stream://-1 │   │
+│  │ (DID/三元组不在 dialplan 硬编码；recording_notice 提示音由开关控制)  │   │
 │  │          ↓ CHANNEL_ANSWER 事件                                       │   │
 │  └──────────────────────────────────────────────────────────────────────┘   │
 │       │ ESL Event Socket (:8021)                                            │
 │       ↓                                                                     │
 │  agent-flow main.py::_on_channel_answer                                     │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │ 1. event.headers → variable_biz_type, variable_user_key             │   │
-│  │ 2. ActiveCallRegistry.register(uuid, biz_type, user_key)            │   │
-│  │ 3. esl.audio_fork_start(uuid, "ws://.../media/{uuid}", 16000Hz)    │   │
+│  │ 1. event.headers → variable_did (DID), variable_user_key             │   │
+│  │ 2. _resolve_inbound_route(did) → 查 callbot.inbound_route           │   │
+│  │      → (tenant_id, biz_type, scenario)  [精确 did 优先, 号段 pattern 兜底]│   │
+│  │      (失败回落 dialplan 静态 variable_biz_type, tenant=default)       │   │
+│  │ 3. ActiveCallRegistry.register(uuid, biz_type, user_key,             │   │
+│  │                                   tenant_id, scenario)               │   │
+│  │ 4. repository.insert_call_session(...)  ← 写 call_session 行          │   │
+│  │      (recording_notice_played = settings.recording_notice_enabled)    │   │
+│  │ 5. esl.audio_fork_start(uuid, "ws://.../media/{uuid}", 16000Hz)     │   │
 │  └──────────────────────────────────────────────────────────────────────┘   │
 │       ↓ uuid_audio_fork start                                               │
 │  FreeSWITCH 连接 WebSocket ws://agent-flow:8000/media/{uuid}               │
 └─────────────────────────────────────────────────────────────────────────────┘
        ↓ WebSocket 双向 PCM (16kHz 16-bit)
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  agent-flow StreamingCallHandler.handle()   handler.py:199                  │
+│  agent-flow StreamingCallHandler.handle()                                   │
+│  每通通话创建 1 个 CallRecorder (双声道累加)                                │
 │                                                                             │
 │  ┌─ 接收循环 (FreeSWITCH → agent-flow) ──────────────────────────────────┐ │
 │  │                                                                        │ │
 │  │  websocket.receive() → binary PCM frame                                │ │
+│  │  recorder.feed_caller(frame)  ← 录音 L 声道 (VAD 前原始帧, 不丢音)     │ │
 │  │       ↓                                                                │ │
 │  │  JitterBuffer.insert(frame)    ← 抖动平滑 (预填充3帧=90ms)           │ │
 │  │       ↓                                                                │ │
 │  │  JitterBuffer.drain() → smooth_frame                                   │ │
 │  │       ↓                                                                │ │
-│  │  Denoiser.process(frame)       ← 降噪 (highpass/noisereduce/rnnoise) │ │
+│  │  WebRTCAPM.process(near, reverse) ← AEC+NS+AGC (CALLBOT_AEC_ENABLED)  │ │
+│  │   或 Denoiser.process(frame)   ← 或降噪 (highpass/noisereduce/rnnoise) │ │
 │  │       ↓                                                                │ │
-│  │  audio_buffer.extend(denoised)                                         │ │
+│  │  audio_buffer.extend(processed)                                        │ │
 │  │       ↓                                                                │ │
 │  │  VAD.is_end_of_speech()  ← 可插拔 VAD 端点检测 (WebRTC/Silero)       │ │
 │  │       ↓ (静音 N帧 → 判定说完, 默认15帧=450ms, 生产建议40帧=1200ms)    │ │
 │  │  ┌──────────────────────────────────────────┐                          │ │
 │  │  │ ASR 识别 (三种传输，优先级: WS > gRPC > HTTP)                      │ │
-│  │  │                                                │                    │ │
-│  │  │ asr_stream.send_audio(chunk) → 实时送音        │                    │ │
-│  │  │ jitter.drain_all() → 剩余音频一次性送入        │                    │ │
-│  │  │ asr_stream.finish() → 等待识别结果             │                    │ │
-│  │  │        ↓                                       │                    │ │
-│  │  │ {"text": "我想咨询贷款", "confidence": 0.95}   │                    │ │
+│  │  │  → {"text": "我想咨询贷款", "confidence": 0.95}                     │ │
 │  │  └──────────────────────────────────────────┘                          │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │       ↓ ASR text                                                            │
 │  ┌─ Pre-LLM 阶段 (run_pre_llm_phase, flow.py) ─────────────────────────┐  │
 │  │                                                                       │  │
+│  │ get_system_prompt(tenant_id, biz_type, scenario)  ← 三维 Redis→DB    │  │
+│  │ render.py 渲染 {变量} 占位符                                          │  │
 │  │ ① receive_asr_node    → ASR文本 + Redis对话历史                      │  │
-│  │       ↓                                                               │  │
 │  │ ② mcp_identity_node   ─┐                                             │  │
 │  │ ④ recall_memory_node   ─┤ fan-out 并发 (asyncio.gather)              │  │
 │  │ ⑤ rag_retrieve_node    ─┘                                             │  │
@@ -204,24 +225,14 @@ aiphone/
 │  │ ┌─────────────────────────────────────────────────────────┐           │  │
 │  │ │ _tts_sentence(sentence)                                  │           │  │
 │  │ │   TTS 传输优先级: WS streaming > gRPC > HTTP            │           │  │
-│  │ │                                                          │           │  │
-│  │ │   ① WS streaming: tts_ws.synthesize_streaming_raw()     │           │  │
-│  │ │      → async for chunk → audio_callback(chunk, idx)     │           │  │
-│  │ │                                                          │           │  │
-│  │ │   ② Batch: tts_ws/tts_grpc/tts.synthesize_raw()         │           │  │
-│  │ │      → WAV → _strip_wav_header() → PCM                  │           │  │
-│  │ │      → audio_callback(pcm, idx)                          │           │  │
+│  │ │   → audio_callback(pcm, idx)  ← recorder.feed_ai(pcm)   │ ← 录音 R │  │
 │  │ └─────────────────────────────────────────────────────────┘           │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
 │       ↓ audio_callback(pcm, sentence_index)                                  │
 │  ┌─ TTS 输出缓冲 → 回传 FreeSWITCH ────────────────────────────────────┐  │
 │  │                                                                       │  │
-│  │ audio_callback → pending[index] 有序队列                              │  │
-│  │       ↓ (按 sentence_index 顺序写入)                                  │  │
 │  │ TTSOutputBuffer.write(pcm)    ← 拆帧 (960B = 30ms @ 16kHz)          │  │
-│  │       ↓                                                               │  │
 │  │ TTSOutputBuffer._send_loop() ← 30ms 间隔匀速发送                     │  │
-│  │       ↓                                                               │  │
 │  │ websocket.send_bytes(frame)  → FreeSWITCH 接收 PCM → 播放给用户      │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
 │                                                                             │
@@ -231,22 +242,158 @@ aiphone/
 │  │       ↓ VAD 检测到用户说话                                            │  │
 │  │ barge_in_event.set()                                                  │  │
 │  │       ↓                                                               │  │
-│  │ esl.uuid_break(uuid)          ← 停止 FreeSWITCH 当前播放            │  │
+│  │ tts_buffer.clear()            ← 清空 TTS 输出缓冲 (不调 uuid_break!) │  │
 │  │ streaming_task.cancel()        ← 取消当前 LLM+TTS 流                │  │
-│  │ tts_buffer.stop()              ← 停止 TTS 输出缓冲                   │  │
+│  │ 冷却期 (CALLBOT_VAD_COOLDOWN_AFTER_BARGEIN) 防残留噪声误判           │  │
 │  │       ↓ 开始新一轮对话                                                │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────┘
        ↓ CHANNEL_HANGUP
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  清理                                                                       │
+│  清理 + 录音归档                                                            │
+│  recorder.finalize_stereo_wav() → ${recordings_dir}/{uuid}.wav (L=caller/R=AI, 短边补静音)│
 │  esl.audio_fork_stop(uuid) → FS 停止音频分流                               │
 │  _call_registry.cancel_call(uuid) → handler 循环退出                       │
+│  repository.update_call_session_end(fs_uuid, end_ts, hangup_cause, result_code)│
+│  _archive_recording(uuid,...)  ← fire-and-forget (延迟3s 读 FS wav)       │
+│    → minio.upload_recording(fs_uuid, wav, biz_type, tenant_id)            │
+│       → key = recordings/{YYYYMMDD}/{uuid}.wav                            │
+│    → repository.insert_artifact(kind='recording', uri=key)  (MinIO 未配置静默跳过)│
 │  WebSocket 关闭 → 资源释放                                                 │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 > TTS (CosyVoice) 输出 22050Hz PCM，agent-flow 通过 `_resample_pcm()` 重采样到 16kHz 后写入 TTSOutputBuffer。FreeSWITCH 内部自动将 16kHz 下采样到电话编码 (G.711 8kHz) 播放。全链路统一 16kHz，帧大小 960 字节 (30ms @ 16kHz 16-bit)。
+
+---
+
+## 管理控制台 console
+
+**console/server** 是 Next.js 15 (App Router) + Drizzle ORM + Better Auth 管理控制台（端口 3001）。与 agent-flow **共用同一物理 PostgreSQL `callbot` schema 和 Redis 实例**——发布/回滚动作直接删除 Redis key `cb:prompt:{tenant_id}:{biz_type}:{scenario}`，实现配置变更零延迟生效（无需重启 agent-flow）。
+
+### 技术栈
+- **后端**：Next.js Route Handlers（`/api/*`）+ Drizzle ORM（node-postgres）
+- **认证**：Better Auth（本地账密 email/password；ADFS OAuth 走 `CONSOLE_ADFS_ENABLED` 预留）
+- **多租户**：`session.user.tenantId` 隔离，跨租户返回 404（不泄漏存在性）；活跃租户取值 `session.active_tenant_id ?? user.tenant_id ?? 'default'`
+- **缓存失效**：publish/rollback 直删 Redis key（与 agent-flow 共享同一 Redis）
+
+### 数据模型（与 agent-flow SQLAlchemy 同表同列名）
+- `callbot.prompt_config` — 主表，`UNIQUE(tenant_id, biz_type, scenario)`，单行即当前内容
+- `callbot.prompt_version` — 版本快照（支撑回滚）
+- `callbot.inbound_route` — DID/号段 → `(tenant_id, biz_type, scenario)`，呼入解析
+- `callbot.call_task` — 外呼任务定义（仅定义层，无执行引擎）
+- `callbot.call_session/turn/event/artifact` — Drizzle 只读映射（Console 不写这四表）
+- `console_auth.*` — Better Auth 自带（user/session/account/verification）+ tenant/user_tenant（多租户）
+
+> `prompt_config`/`prompt_version`/`inbound_route`/`call_task` 由 **agent-flow alembic** 建表（0002/0003）；`console_auth` 由 Console 自行建表（`src/db/migrations/`）。
+
+### DID 呼入路由（与 FreeSWITCH dialplan 的关系）
+三元组 `(tenant_id, biz_type, scenario)` **不在 dialplan 硬编码**：
+```
+呼入 → FS catch-all 拨号计划（仅 answer + user_key + 保活）
+     → agent-flow CHANNEL_ANSWER 读 Caller-Destination-Number = DID
+     → 查 callbot.inbound_route（精确 did 优先，号段 did_pattern 兜底）
+     → (tenant_id, biz_type, scenario) → 命中 prompt_config
+```
+- **新增 DID / 租户 / scenario**：Console「DID 路由」页加一行 → 即时生效，不动 FreeSWITCH
+- dialplan 改为 catch-all 后，需在 FS 执行一次 `fs_cli -x "reloadxml"`（仅首次切换时；之后增删路由无需再 reload）
+
+### 页面与 API
+| 页面 | 路由 | 能力 |
+|------|------|------|
+| 提示词管理 | `/prompts` | 草稿/发布/版本回滚/克隆/变量渲染测试 |
+| DID 路由 | `/inbound-routes` | DID/号段 → 三元组 CRUD |
+| 外呼任务 | `/call-tasks` | 任务定义 CRUD（仅定义层，无执行） |
+| 通话记录 | `/calls`, `/calls/[id]` | 只读列表+详情+录音回放（presigned URL） |
+| 租户管理 | `/tenants` | 租户 CRUD、用户多租户归属 |
+
+主要 API：`/api/prompts/{id}/{publish,rollback,clone,test,versions}`、`/api/inbound-routes`、`/api/call-tasks`、`/api/calls[/{id}][/{recording-url}]`、`/api/tenants`、`/api/session/{tenants,switch-tenant}`。受 Better Auth + RBAC 守护：`prompt:*` / `route:*` / `calltask:*` / `call:view` / `tenant:*`。
+
+详见 `console/server/README.md`。
+
+---
+
+## 多租户四维隔离
+
+自 tenant-management / align-prompt-config-pipeline 变更起，业务隔离键由「仅 3 biz_type」升级为 **`(tenant_id, biz_type, scenario)` 三元组**（加上 per-user 的 `user_key`）。各维度的隔离职责：
+
+| 维度 | 隔离点 | 说明 |
+|------|--------|------|
+| `tenant_id` | PG 列 + Redis key 前缀 + Console RBAC | 多租户顶层隔离，default 兜底 |
+| `biz_type` | TTS voice profile + PG 列 + Redis key 前缀 | customer_service/collection/marketing，TTS 音色/语速/音量按此分 |
+| `scenario` | prompt 三维键 | 业务场景（如 activation/repayment/consult），DID 路由解析 |
+| `user_key` | PG 分布键 + Redis hot memory | `{core_user_id}:{phone_hash_salted}`，per-user 数据分区 |
+
+- **Redis**：`cb:{tenant_id}:{biz_type}:...`；prompt 缓存 `cb:prompt:{tenant_id}:{biz_type}:{scenario}`（5min TTL）
+- **PostgreSQL**：`tenant_id` + `biz_type` 列；分布键 `user_id`（非 biz_type / tenant_id）；Console 用 Drizzle 只读映射同表
+- **Console RBAC**：`prompt:*` / `route:*` / `calltask:*` / `call:view` / `tenant:*`，按 `tenant_id` 隔离；`platform_admin` 可跨租户，普通用户切租户需 `user_tenant` 归属
+- **DID 路由**：`callbot.inbound_route` 把 DID/号段映射到三元组，agent-flow CHANNEL_ANSWER 解析（dialplan 保持哑）
+- **征信查询**：仅 marketing biz_type
+- **旧「3 biz_type」**：仍作为 biz_type 维度生效（TTS profile / 征信），tenant 为新增的上层隔离维度
+
+---
+
+## 通话录音（CallRecorder 双声道）
+
+录音方案为 **agent-flow 自录双声道**（Plan B），不依赖 FS `record_session`（FS 录不到 mod_audio_fork 注入的 AI 音频）。
+
+### 双声道原理
+- **L 声道（caller）**：`CallRecorder.feed_caller(frame)`，喂接收循环每帧——mod_audio_fork 实时转发的 caller 原始 PCM，**VAD 门控之前**，全部帧不丢音
+- **R 声道（AI）**：`CallRecorder.feed_ai(pcm)`，喂 streaming 管线 `audio_callback` 的每段 TTS PCM；barge-in 路径 `_receive_during_streaming` 也喂 caller 帧，覆盖 AI 说话期间
+- `finalize_stereo_wav()`：短边以 int16 静音(0)补齐到长边，输出 16kHz 16-bit 立体声 wav（L/R 交错）；无音频（全程无 caller 帧也无 AI PCM）返回 None 不写空 wav
+
+### 归档流程（fire-and-forget）
+```
+CHANNEL_HANGUP
+  → CallRecorder.finalize_stereo_wav() 写 ${CALLBOT_RECORDINGS_DIR}/{uuid}.wav
+  → audio_fork_stop / cancel_call / WebSocket 关闭
+  → _archive_recording(uuid,...)  ← fire-and-forget (asyncio.create_task, _ongoing_archives 强引用防 GC)
+      → sleep(CALLBOT_RECORDING_ARCHIVE_DELAY_SEC=3) 等 FS 写盘
+      → 读 ${recordings_dir}/{uuid}.wav
+      → minio.upload_recording(uuid, wav, biz_type, tenant_id)
+          → key = recordings/{YYYYMMDD}/{uuid}.wav, content_type=audio/wav
+          → MINIO_ENDPOINT 为空时静默返回 None（不写 artifact）
+      → repository.insert_artifact(kind='recording', storage='minio', uri=key)
+```
+
+### 录音提示音合规
+- `CALLBOT_RECORDING_NOTICE_ENABLED=true`（默认）时 dialplan 在 answer 后播放提示音（`CALLBOT_RECORDING_NOTICE_SOUND`）
+- `call_session.recording_notice_played` 置为 `settings.recording_notice_enabled`
+- 本地测试可关开关或注释 dialplan 提示音行
+
+### Console 回放
+- `GET /api/calls/:id/recording-url` → MinIO presigned URL（按 tenant_id 隔离，跨租户 404）
+
+### 关键约束
+- MINIO_* env 无 CALLBOT_ 前缀，pydantic 不加载；需 main.py 顶部 `load_dotenv()` 注入 os.environ，否则 `upload_recording` 静默跳过
+- 录音写入 FS 的 `${recordings_dir}`（非 NAS 分轨），Console 读取 artifact.uri 的 MinIO 对象
+
+---
+
+## WebRTCAPM 音频处理（AEC + NS + AGC）
+
+`agent-flow/src/ws/audio_processing.py` 封装 livekit 的 `AudioProcessingModule`，提供 **HPF + AEC + NS + AGC 一次过**，替代 `denoise.py` 的具体降噪器 + 固定 `CALLBOT_AUDIO_GAIN`。
+
+### 帧语义（30ms @ 16kHz mono = 960 字节）
+- **near 端**：麦克风回采（含 TTS 回声 + 语音 + 噪声），每 30ms 帧直接喂入 APM（livekit AudioFrame 无 10ms 限制，省掉拆帧）
+- **reverse 端**：正在播放的 TTS 帧（AEC 远端参考）；AI 沉默时为静音帧
+
+### 处理顺序（livekit in-place 语义）
+每帧：`set_stream_delay_ms` → `process_reverse_stream`（喂远端参考 + 设延迟）→ `process_stream`（in-place 处理 capture）。单帧失败降级透传原帧（不影响通话）。
+
+### 配置（CALLBOT_ 前缀）
+| 配置项 | 默认 | 说明 |
+|--------|------|------|
+| `CALLBOT_AEC_ENABLED` | false | 开启 WebRTCAPM（与 denoise 互斥） |
+| `CALLBOT_AEC_TYPE` | 2 | 1=AECM(移动端), 2=老AEC（AEC3 源码注释不可用） |
+| `CALLBOT_AEC_NS_LEVEL` | 2 | NS 抑制等级 0-3 |
+| `CALLBOT_AEC_AGC_TYPE` | 1 | 0=关, 1=AdaptiveDigital, 2=AdaptiveAnalog |
+| `CALLBOT_AEC_SYSTEM_DELAY_MS` | 80 | 回声延迟先验（has_echo 监控后标定） |
+
+### 互斥关系
+- AEC 开启时：`WebRTCAPM.process()` 取代 denoiser，AGC 逐帧处理不再叠加固定 `CALLBOT_AUDIO_GAIN`
+- AEC 关闭时：走原 `denoise.py`（highpass/noisereduce/rnnoise）+ 固定增益
+- 库缺失：`create_audio_processing()` 返回 None，handler 走 passthrough
 
 ---
 
@@ -256,26 +403,28 @@ aiphone/
 **媒体流（WebSocket 双向音频）**
 - 被叫用户 ⇄ FreeSWITCH（SIP/RTP）
 - FreeSWITCH（`mod_audio_fork`）⇄ agent-flow（WebSocket :8000, uvloop）
-  - 上行：用户语音 PCM → JitterBuffer → Denoiser降噪 → VAD(WebRTC/Silero) → agent-asr(:8080/gRPC:50051) 内置 GPU 推理
+  - 上行：用户语音 PCM → JitterBuffer → WebRTCAPM(AEC/NS/AGC) 或 Denoiser降噪 → VAD(WebRTC/Silero) → agent-asr(:8080/gRPC:50051) 内置 GPU 推理
   - 下行：agent-tts(:8081/gRPC:50052) 内置 GPU 推理 → TTSOutputBuffer 稳态30ms帧 → FreeSWITCH → 用户
+  - 录音：CallRecorder 双声道累加（L=caller / R=AI），挂断 finalize_stereo_wav → MinIO
 
 **控制流（agent-flow 统一调度）**
-- agent-flow 串联 ASR → LLM → TTS 完整链路（对客户无感）
+- agent-flow 串联 ASR → LLM → TTS 完整链路（对客户无感），全程透传四维键 `(tenant_id, biz_type, scenario, user_key)`
   - Node ①：调用 agent-asr 识别音频
-  - Node ②④⑤：MCP 查询 + 记忆 + RAG 并行扇出
+  - Node ②④⑤：MCP 查询 + 记忆 + RAG 并行扇出；提示词三维 `get_system_prompt(tenant_id, biz_type, scenario)` 加载 + `render.py` 渲染
   - Node ⑥：LLM 流式输出 → 句级切分 → 并行 TTS
-  - Node ⑦：TTSOutputBuffer 稳态帧 WebSocket 回传
+  - Node ⑦：TTSOutputBuffer 稳态帧 WebSocket 回传；fire-and-forget 双写 PG call_turn
 
 **事件控制流（ESL Event Socket）**
 - agent-flow ESL Client → FreeSWITCH Event Socket(:8021)
-  - CHANNEL_HANGUP 订阅 → ActiveCallRegistry 取消活跃通话 → 清理资源
-  - uuid_break：打断 FreeSWITCH 当前播放（barge-in）
+  - CHANNEL_ANSWER 订阅 → `_resolve_inbound_route(DID)` 解析三元组 → register + insert_call_session → uuid_audio_fork start
+  - CHANNEL_HANGUP 订阅 → uuid_audio_fork stop → update_call_session_end → `_archive_recording`(fire-and-forget) → ActiveCallRegistry 取消活跃通话 → 清理资源
   - uuid_transfer：转人工（handoff）
   - uuid_kill：挂断通话（end）
+  - 打断：**清空 TTSOutputBuffer（不调 uuid_break，避免终止 dialplan playback）**
 
 **决策流（本地LLM，流式输出）**
 - Orchestrator → Qwen3.5-9B 推理服务（GPU2，独立部署）
-  - 输入：业务域 Prompt + 会话状态 + 记忆召回块 + 用户最新文本
+  - 输入：业务域 Prompt（三维） + 会话状态 + 记忆召回块 + 用户最新文本
   - 输出：流式 token → IncrementalJSONParser → SentenceSplitter → 句级 TTS 并行
   - 结构化动作（say/ask/handoff/end）+ 文本 + 标签
 
@@ -283,12 +432,16 @@ aiphone/
 - Orchestrator → java-mcp-server(:9090)：`user_identity_query`（phone + biz_type → user_id, phone_masked, id_card_last_four）
 - Orchestrator → java-mcp-server(:9090)：`user_credit_query`（user_id → credit_qualified, risk_level，仅 marketing）
 
-**数据/记忆/审计**  
-- Redis：会话态、短期记忆、TTS缓存索引  
-- PostgreSQL 17 + pgvector：call_session/turn/event/artifact/config_snapshot + 向量召回  
-- mem0：记忆抽取/更新/衰减，落地 PG/Redis  
-- NAS：录音热存（按 biz_type 目录隔离）  
-- MinIO：归档（按 biz_type bucket 隔离，生命周期 1–3 年）  
+**运营流（console 控制台 :3001）**
+- console ⇄ PostgreSQL `callbot` schema（prompt_config/prompt_version/inbound_route/call_task + 只读 call_session/turn/event/artifact）+ `console_auth` schema（tenant/user/session）
+- console ⇄ Redis（publish/rollback 直删 `cb:prompt:{tenant_id}:{biz_type}:{scenario}` 实现零延迟生效）
+- console ⇄ MinIO（presigned URL 回放录音）
+
+**数据/记忆/审计**
+- Redis：会话态、短期记忆、TTS缓存索引、prompt 三维缓存（5min TTL），key 前缀 `cb:{tenant_id}:{biz_type}:...`
+- PostgreSQL 17 + pgvector：12 张业务表（call_session/turn/event/artifact/config_snapshot/user_memory_fact/user_memory_vector/script_library/prompt_config/prompt_version/inbound_route/call_task）+ 向量召回；console_auth schema（Better Auth + tenant/user_tenant/session）
+- mem0：记忆抽取/更新/衰减，落地 PG/Redis
+- MinIO：整通双声道录音归档（key `recordings/{YYYYMMDD}/{uuid}.wav`，生命周期 1–3 年）
 
 **监控告警**
 - Prometheus：采集 FS/ASR/TTS/LLM/Orchestrator/存储指标
@@ -393,7 +546,7 @@ aiphone/
 
 ### 4.2 WebSocket 连接配置
 - vars.xml 中设置 `agent_flow_ws_url=ws://10.0.0.20:8000/media/{uuid}`
-- dialplan 中 `answer` + `playback silence_stream://-1`（无限静音保活），由 agent-flow ESL 事件驱动 `uuid_audio_fork` 动态控制
+- dialplan 为 catch-all `^(\d+)$` + `answer` + `playback silence_stream://-1`（无限静音保活），三元组由 agent-flow 查 inbound_route 解析；由 agent-flow ESL 事件驱动 `uuid_audio_fork` 动态控制
 
 监控要求：
 - WebSocket 连接状态探测
@@ -411,15 +564,13 @@ aiphone/
 - `mod_dptools`（playback/record 等）
 - `mod_sndfile`、`mod_native_file`（音频文件读写）
 
-### 5.2 dialplan（关键）
-接通后必须具备：
-1) **固定录音告知**：播放法务固定音频文件（WAV/PCM）
-2) 开启录音（分轨/混音），路径按 biz_type 强隔离
-3) 设置 channel variables（贯穿 Orchestrator / 录音 / 审计）：
-   - `biz_type, task_id, call_id, core_user_id, phone_hash_salted, user_key`
-4) `answer` + `playback silence_stream://-1` 保持通话（无限静音保活），agent-flow 通过 ESL `uuid_audio_fork` 动态控制音频分流：
-   - CHANNEL_ANSWER 事件 → agent-flow 注册通话 → `uuid_audio_fork start ws://...mono 16000`
-   - CHANNEL_HANGUP 事件 → `uuid_audio_fork stop` → 清理资源
+### 5.2 dialplan（关键，catch-all 呼入）
+拨号计划为 **catch-all `^(\d+)$`**，三元组 `(tenant_id, biz_type, scenario)` **不在 dialplan 硬编码**——由 agent-flow 在 CHANNEL_ANSWER 读取被叫号(DID)后查 `callbot.inbound_route` 解析。新增/修改 DID 路由在 Console「DID 路由」页运营，无需改本文件、无需重启 FS。接通后必须具备：
+1) **录音提示音合规**：`CALLBOT_RECORDING_NOTICE_ENABLED=true`（默认）时在 answer 后播放提示音（`CALLBOT_RECORDING_NOTICE_SOUND`），写 `call_session.recording_notice_played=true`；本地测试可关开关或注释 dialplan 提示音行
+2) 设置 channel variables：`user_key = ${caller_id_number}`、DID = `destination_number`（贯穿 Orchestrator / 录音 / 审计）
+3) `answer` + `playback silence_stream://-1` 保持通话（无限静音保活），agent-flow 通过 ESL `uuid_audio_fork` 动态控制音频分流：
+   - CHANNEL_ANSWER 事件 → `_resolve_inbound_route(DID)` 解析三元组 → register + insert_call_session → `uuid_audio_fork start ws://...mono 16000`
+   - CHANNEL_HANGUP 事件 → `uuid_audio_fork stop` → update_call_session_end → `_archive_recording`(fire-and-forget) → 清理资源
 
 ---
 
@@ -481,15 +632,16 @@ aiphone/
   3) 并行扇出：MCP 身份查询 ‖ 记忆召回 ‖ RAG 检索
   4) Qwen3.5-9B 流式输出 → IncrementalJSONParser → SentenceSplitter → 句级文本
   5) 每句并行调用 agent-tts 合成语音（gRPC/HTTP/WebSocket 三传输） → WAV→PCM → TTSOutputBuffer 稳态30ms帧 → WebSocket 回传 FreeSWITCH
-  6) Barge-in：用户说话时 VAD（WebRTC/Silero）检测 → ESL uuid_break 停止播放 → 取消流式任务 → 新一轮
-  7) CHANNEL_HANGUP：ESL 事件订阅 → ActiveCallRegistry 取消 → 清理资源
+  6) Barge-in：用户说话时 VAD（WebRTC/Silero）检测 → **清空 TTSOutputBuffer（不调 uuid_break）** → 冷却期防误触发 → 取消流式任务 → 新一轮
+  7) CHANNEL_HANGUP：ESL 事件订阅 → update_session_end → CallRecorder.finalize_stereo_wav → `_archive_recording`(fire-and-forget) → ActiveCallRegistry 取消 → 清理资源
 - FreeSWITCH 播放 TTS 音频，完成一轮交互
 
-### 7.4 三业务隔离“强制编码规则”
-- 所有函数签名必须包含 `biz_type`
+### 7.4 多租户四维隔离“强制编码规则”
+- 核心函数签名须透传四维键 `(tenant_id, biz_type, scenario, user_key)`，不得用 `default` 兜底替代 tenant_id/scenario
 - `tts_profile` 只能由 `biz_type` 映射获取（不允许外部透传任意 profile）
-- Redis key、MinIO bucket、NAS path 均由 `biz_type` 派生
-- Prompt/Flow 版本由 `biz_type` + `task_id` 决定
+- Redis key 必须含 `tenant_id`：`cb:{tenant_id}:{biz_type}:...`；prompt 缓存 `cb:prompt:{tenant_id}:{biz_type}:{scenario}`
+- Prompt 按 `(tenant_id, biz_type, scenario)` 三维加载，版本由 `prompt_config.version` + `prompt_version` 快照决定
+- MinIO 对象 key 含 tenant_id/biz_type（录音 `recordings/{YYYYMMDD}/{uuid}.wav`）
 
 ---
 
@@ -560,26 +712,98 @@ CREATE TABLE IF NOT EXISTS callbot.call_session (
   call_id            UUID PRIMARY KEY,
   fs_uuid            UUID UNIQUE NOT NULL,
   biz_type           TEXT NOT NULL CHECK (biz_type IN ('customer_service','collection','marketing')),
+  tenant_id          TEXT NOT NULL DEFAULT 'default',  -- 多租户隔离键(0003迁移新增)
+  scenario           TEXT NOT NULL DEFAULT 'default',  -- DID 路由解析出的场景(0003迁移新增)
   task_id            TEXT,
   core_user_id       TEXT NOT NULL,
   phone_hash         TEXT NOT NULL,
   user_key           TEXT NOT NULL, -- core_user_id:phone_hash
-  phone_masked       TEXT,
+  phone_masked       TEXT,          -- 中间四位掩码, 形如 138****1234
   start_ts           TIMESTAMPTZ NOT NULL,
   end_ts             TIMESTAMPTZ,
   result_code        TEXT,
   hangup_cause       TEXT,
   identity_verified  BOOLEAN NOT NULL DEFAULT FALSE,
   verify_attempts    INT NOT NULL DEFAULT 0,
-  recording_notice_played BOOLEAN NOT NULL DEFAULT FALSE,
+  recording_notice_played BOOLEAN NOT NULL DEFAULT FALSE,  -- = settings.recording_notice_enabled
   created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_call_session_biz_user_start
-  ON callbot.call_session (biz_type, user_key, start_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_call_session_tenant_biz_user_start
+  ON callbot.call_session (tenant_id, biz_type, user_key, start_ts DESC);
 
 CREATE INDEX IF NOT EXISTS idx_call_session_task_start
-  ON callbot.call_session (biz_type, task_id, start_ts DESC);
+  ON callbot.call_session (tenant_id, biz_type, task_id, start_ts DESC);
+```
+
+### 10.2a 提示词配置 + 版本快照（0002/0003 迁移）
+```sql
+-- 主表: (tenant_id, biz_type, scenario) 三元组唯一键; is_active 标记当前生效版本
+CREATE TABLE IF NOT EXISTS callbot.prompt_config (
+  id            BIGSERIAL PRIMARY KEY,
+  tenant_id     TEXT NOT NULL DEFAULT 'default',
+  biz_type      TEXT NOT NULL,
+  scenario      TEXT NOT NULL,
+  title         TEXT,
+  content       TEXT NOT NULL,       -- 含 {变量} 占位符
+  category      TEXT,
+  extra         JSONB NOT NULL DEFAULT '{}'::jsonb,  -- variables[] 声明
+  dept_id       TEXT,                 -- 映射 biz_type
+  version       INT NOT NULL DEFAULT 1,
+  is_active     BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, biz_type, scenario)
+);
+
+-- 版本快照: 支持回滚, 每次编辑保存 version 自增 + 写一条快照
+CREATE TABLE IF NOT EXISTS callbot.prompt_version (
+  id            BIGSERIAL PRIMARY KEY,
+  prompt_id     BIGINT NOT NULL REFERENCES callbot.prompt_config(id),
+  version       INT NOT NULL,
+  title         TEXT,
+  content       TEXT,
+  category      TEXT,
+  extra         JSONB NOT NULL DEFAULT '{}'::jsonb,
+  is_active     BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+### 10.2b DID 呼入路由（0003 迁移）
+```sql
+-- DID/号段 → (tenant_id, biz_type, scenario); agent-flow CHANNEL_ANSWER 查此表解析
+CREATE TABLE IF NOT EXISTS callbot.inbound_route (
+  id            BIGSERIAL PRIMARY KEY,
+  tenant_id     TEXT NOT NULL DEFAULT 'default',
+  did           TEXT UNIQUE,        -- 精确号(优先匹配)
+  did_pattern   TEXT,               -- 号段正则(兜底匹配)
+  biz_type      TEXT NOT NULL,
+  scenario      TEXT NOT NULL,
+  is_active     BOOLEAN NOT NULL DEFAULT TRUE,
+  description   TEXT,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+### 10.2c 外呼任务定义（0003 迁移，定义层无执行引擎）
+```sql
+-- 仅定义层: prompt_id 外键引用 prompt_config.id; 策略字段声明性存储, 不被任何执行器消费
+CREATE TABLE IF NOT EXISTS callbot.call_task (
+  id                BIGSERIAL PRIMARY KEY,
+  tenant_id         TEXT NOT NULL DEFAULT 'default',
+  name              TEXT NOT NULL,
+  prompt_id         BIGINT NOT NULL REFERENCES callbot.prompt_config(id),
+  kb_ids            JSONB NOT NULL DEFAULT '[]'::jsonb,
+  status            TEXT NOT NULL DEFAULT 'idle',  -- idle/running/paused/completed (仅定义)
+  concurrent_limit  INT,
+  allowed_hours     JSONB,
+  redial_strategy   JSONB,
+  dept_id           TEXT,                            -- 映射 biz_type
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 ```
 
 ### 10.3 逐轮对话表（按月分区）
@@ -588,6 +812,7 @@ CREATE TABLE IF NOT EXISTS callbot.call_turn (
   turn_id        BIGSERIAL,
   call_id        UUID NOT NULL,
   fs_uuid        UUID NOT NULL,
+  tenant_id      TEXT NOT NULL DEFAULT 'default',
   biz_type       TEXT NOT NULL,
   user_key       TEXT NOT NULL,
   role           TEXT NOT NULL CHECK (role IN ('user','assistant','system','tool')),
@@ -602,8 +827,8 @@ CREATE TABLE IF NOT EXISTS callbot.call_turn (
 CREATE INDEX IF NOT EXISTS idx_call_turn_call
   ON callbot.call_turn (call_id, ts);
 
-CREATE INDEX IF NOT EXISTS idx_call_turn_biz_user_ts
-  ON callbot.call_turn (biz_type, user_key, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_call_turn_tenant_biz_user_ts
+  ON callbot.call_turn (tenant_id, biz_type, user_key, ts DESC);
 ```
 
 **分区创建（示例：每月）**
@@ -620,6 +845,7 @@ CREATE TABLE IF NOT EXISTS callbot.call_event (
   event_id      BIGSERIAL,
   call_id       UUID NOT NULL,
   fs_uuid       UUID NOT NULL,
+  tenant_id     TEXT NOT NULL DEFAULT 'default',
   biz_type      TEXT NOT NULL,
   user_key      TEXT NOT NULL,
   event_type    TEXT NOT NULL,
@@ -631,11 +857,11 @@ CREATE TABLE IF NOT EXISTS callbot.call_event (
 CREATE INDEX IF NOT EXISTS idx_call_event_call
   ON callbot.call_event (call_id, ts);
 
-CREATE INDEX IF NOT EXISTS idx_call_event_biz_user_ts
-  ON callbot.call_event (biz_type, user_key, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_call_event_tenant_biz_user_ts
+  ON callbot.call_event (tenant_id, biz_type, user_key, ts DESC);
 
 CREATE INDEX IF NOT EXISTS idx_call_event_type_ts
-  ON callbot.call_event (biz_type, event_type, ts DESC);
+  ON callbot.call_event (tenant_id, biz_type, event_type, ts DESC);
 ```
 
 ### 10.5 录音/音频产物表（用于回放与审计）
@@ -644,11 +870,12 @@ CREATE TABLE IF NOT EXISTS callbot.call_artifact (
   artifact_id   BIGSERIAL PRIMARY KEY,
   call_id       UUID NOT NULL,
   fs_uuid       UUID NOT NULL,
+  tenant_id     TEXT NOT NULL DEFAULT 'default',
   biz_type      TEXT NOT NULL,
   user_key      TEXT NOT NULL,
-  kind          TEXT NOT NULL, -- caller_wav/bot_wav/mix_wav/tts_wav/meta_json
+  kind          TEXT NOT NULL, -- recording(整通双声道)/caller_wav/bot_wav/mix_wav/tts_wav/meta_json
   storage       TEXT NOT NULL CHECK (storage IN ('nas','minio')),
-  uri           TEXT NOT NULL, -- 路径或对象key
+  uri           TEXT NOT NULL, -- MinIO 对象 key: recordings/{YYYYMMDD}/{uuid}.wav
   sha256        TEXT,
   size_bytes    BIGINT,
   content_type  TEXT,
@@ -658,8 +885,8 @@ CREATE TABLE IF NOT EXISTS callbot.call_artifact (
 CREATE INDEX IF NOT EXISTS idx_artifact_call
   ON callbot.call_artifact (call_id, kind);
 
-CREATE INDEX IF NOT EXISTS idx_artifact_biz_ts
-  ON callbot.call_artifact (biz_type, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_artifact_tenant_biz_ts
+  ON callbot.call_artifact (tenant_id, biz_type, ts DESC);
 ```
 
 ### 10.6 配置快照表（Prompt/TTS/Flow版本可追溯）
@@ -741,24 +968,29 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 
 ## 11. 开机自启、目录规划、日志隔离、录音隔离方案 [1]
 
-### 11.1 Redis Key 规范（按 用户 + 业务类型 + 时间 分割）
+### 11.1 Redis Key 规范（按 租户 + 业务 + 用户 + 时间 分割）
 
 #### 11.1.1 命名约定（统一前缀）
+- `tenant_id`：租户（kebab-case，迁移回填自历史值，default 兜底）
 - `biz_type`：`customer_service|collection|marketing`
+- `scenario`：业务场景（DID 路由解析，如 activation/repayment/consult）
 - `user_key`：`{core_user_id}:{phone_hash_salted}`
 - `yyyymm`：例如 `202605`
 - `fs_uuid`：FreeSWITCH Unique-ID（uuid）
 
-统一前缀：
-- `cb:{biz_type}:{user_key}:{yyyymm}:...`
-- 与会话相关的临时态可用 `cb:call:{fs_uuid}:...`（仍需在 value 中带 biz_type/user_key 以便审计与排障）
+统一前缀（**含 tenant_id**）：
+- `cb:{tenant_id}:{biz_type}:{user_key}:{yyyymm}:...`
+- 提示词缓存：`cb:prompt:{tenant_id}:{biz_type}:{scenario}`（TTL 5min，Console publish/rollback 直删此 key 实现零延迟生效）
+- 与会话相关的临时态可用 `cb:call:{fs_uuid}:...`（仍需在 value 中带 tenant_id/biz_type 以便审计与排障）
 
 #### 11.1.2 通话会话态（强烈建议，TTL=24h）
 - Key：`cb:call:state:{fs_uuid}`
 - Type：Hash
 - Fields（示例）：
   - `call_id`
+  - `tenant_id`
   - `biz_type`
+  - `scenario`
   - `user_key`
   - `task_id`
   - `recording_notice_played`（0/1）
@@ -783,7 +1015,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 - 给 LLM 组装短上下文（避免每轮都查 PG）
 
 #### 11.1.4 用户“当月热记忆”缓存（TTL=90d，按业务可调）
-- Key：`cb:mem:hot:{biz_type}:{user_key}:{yyyymm}`
+- Key：`cb:mem:hot:{tenant_id}:{biz_type}:{user_key}:{yyyymm}`
 - Type：Hash 或 JSON（建议 Hash：便于更新单个 fact）
 - Fields（示例）：
   - `pref_contact_time`
@@ -805,7 +1037,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
   - 禁止缓存含敏感个资的动态句子（或必须加密+短TTL）
 
 #### 11.1.6 MCP 身份查询缓存（TTL=10–30min）
-- Key：`cb:core:id:{biz_type}:{user_key}`
+- Key：`cb:core:id:{tenant_id}:{biz_type}:{user_key}`
 - Type：String(JSON)
 - 用途：降低 java-mcp-server 请求频次（注意与合规一致：仅缓存必要字段，脱敏/最小化）
 
@@ -883,7 +1115,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 - ASR 识别文本为空：检查 VAD 参数（WebRTC/Silero）、音频格式、agent-asr 健康状态
 - orchestrator 超时：检查 LLM 响应时间、MCP Server 连通性、TTS 合成延迟
 - WebSocket 断连：检查 agent-flow 进程状态、FreeSWITCH mod_audio_fork 日志
-- Barge-in 失效：检查 ESL 连接、VAD 灵敏度（CALLBOT_BARGE_IN_MIN_AUDIO_BYTES）
+- Barge-in 失效：检查 ESL 连接、VAD 灵敏度（CALLBOT_BARGE_IN_MIN_AUDIO_BYTES）；打断靠清空 TTSOutputBuffer（**不调 uuid_break**），检查冷却期 CALLBOT_VAD_COOLDOWN_AFTER_BARGEIN 是否把残留噪声当说话
 - TTS 音频断续：检查 JitterBuffer 深度配置（CALLBOT_JITTER_TARGET_DEPTH）、TTSOutputBuffer 帧率
 - CHANNEL_HANGUP 未触发：检查 ESL Event Socket 连接、event_socket.conf.xml 配置
 
@@ -950,9 +1182,10 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 
 ### 阶段 2: 拨号计划
 
-3. **dialplan/public/00_biz_type.xml** - 业务路由
-   - 业务变量设置 (biz_type, user_key)
-   - answer + playback silence_stream://-1 保持通话，由 agent-flow ESL 事件驱动 uuid_audio_fork
+3. **dialplan/public/00_biz_type.xml** - catch-all 呼入路由
+   - catch-all `^(\d+)$` → set user_key → answer + playback silence_stream://-1 保持通话
+   - **三元组不在 dialplan 硬编码**，由 agent-flow CHANNEL_ANSWER 查 inbound_route 解析（Console 运营，即时生效）
+   - 录音提示音由 `CALLBOT_RECORDING_NOTICE_ENABLED` 开关控制
    - 转人工：loopback/1001
 
 ### 阶段 3: 应用服务
@@ -982,32 +1215,39 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 ```
 用户来电
     │
-    └─→ FreeSWITCH (mod_sofia) → dialplan(set变量 → answer → playback silence_stream://-1) → CHANNEL_ANSWER 事件
+    └─→ FreeSWITCH (mod_sofia) → dialplan(catch-all ^(\d+)$ → set user_key → answer → playback silence_stream://-1) → CHANNEL_ANSWER 事件
             │
             ├─→ ESL Event Socket (:8021) ←── agent-flow
             │       │
-            │       ├─→ CHANNEL_ANSWER 订阅 → ActiveCallRegistry 注册 → uuid_audio_fork start
-            │       ├─→ CHANNEL_HANGUP 订阅 → uuid_audio_fork stop → ActiveCallRegistry 取消通话
-            │       ├─→ uuid_break 打断播放 (Barge-in)
+            │       ├─→ CHANNEL_ANSWER 订阅 → _resolve_inbound_route(DID) → (tenant_id,biz_type,scenario) → register + insert_call_session → uuid_audio_fork start
+            │       ├─→ CHANNEL_HANGUP 订阅 → uuid_audio_fork stop → update_session_end → _archive_recording(fire-and-forget) → ActiveCallRegistry 取消通话
+            │       ├─→ 打断：清空 TTSOutputBuffer（不调 uuid_break，避免终止 dialplan playback）
             │       └─→ uuid_transfer 转人工 / uuid_kill 挂断
             │
             └─→ uuid_audio_fork ──→ agent-flow (:8000, uvloop) WebSocket /media/{uuid} 双向音频
                     │
-                    ├─→ JitterBuffer → Denoiser → VAD(WebRTC/Silero) → agent-asr (:8080 / gRPC:50051 / WS) ──→ SenseVoice GPU0
+                    ├─→ CallRecorder.feed_caller(frame)  ← 录音 L 声道 (VAD 前)
+                    ├─→ JitterBuffer → WebRTCAPM(AEC/NS/AGC) 或 Denoiser → VAD(WebRTC/Silero) → agent-asr (:8080 / gRPC:50051 / WS) ──→ SenseVoice GPU0
                     │                                                       └─→ 返回识别文本
                     │
+                    ├─→ get_system_prompt(tenant_id, biz_type, scenario) ← 三维 Redis→DB + render.py 渲染
                     ├─→ 决策 ──→ agent-flow LangGraph 7 节点 (流式管道)
                     │              │
                     │              ├─→ java-mcp-server (:9090) 用户中心（身份/征信查询）
                     │              ├─→ Qwen3.5-9B (GPU2) 流式输出
-                    │              ├─→ Redis（热记忆/对话历史）
-                    │              ├─→ PG17 pgvector（长期记忆/RAG话术库）
+                    │              ├─→ Redis（热记忆/对话历史/prompt 三维缓存）
+                    │              ├─→ PG17 pgvector（长期记忆/RAG话术库/call_turn fire-and-forget 双写）
                     │              └─→ agent-tts (:8081 / gRPC:50052 / WS) ──→ CosyVoice GPU1
+                    │                       └─→ recorder.feed_ai(pcm)  ← 录音 R 声道
                     │
                     └─→ TTS 音频 ──→ TTSOutputBuffer ──→ WebSocket 回传 FreeSWITCH ──→ 播放给用户
 ```
 
-FreeSWITCH 拨号计划 `answer` + `playback silence_stream://-1`（无限静音保活）后，agent-flow 通过 ESL 订阅 CHANNEL_ANSWER 事件，动态调用 `uuid_audio_fork` 启动 WebSocket 双向音频流。agent-flow 统一调度 ASR → 流式决策 → 句级 TTS 全链路。ESL Event Socket 实现接通/挂断/打断/转接全生命周期控制。
+FreeSWITCH 拨号计划为 catch-all，`answer` + `playback silence_stream://-1`（无限静音保活）后，agent-flow 通过 ESL 订阅 CHANNEL_ANSWER 事件，查 `inbound_route` 解析三元组，动态调用 `uuid_audio_fork` 启动 WebSocket 双向音频流。agent-flow 统一调度 ASR → 流式决策 → 句级 TTS 全链路。ESL Event Socket 实现接通/挂断/打断/转接全生命周期控制。**Console (:3001) 共用 callbot schema + Redis**，发布提示词即时失效缓存，新增 DID/租户/scenario 即时生效，无需改 FreeSWITCH。
+
+**新增：console 服务**（依赖 PG/Redis，与 agent-flow 共库）
+- 端口 3001，Next.js + Drizzle + Better Auth
+- 部署后执行 console 自有迁移（`console/server/src/db/migrations/`）建 `console_auth` schema；`callbot` schema 表由 agent-flow alembic 维护
 
 ## 验收要点
 
@@ -1040,9 +1280,11 @@ FreeSWITCH 拨号计划 `answer` + `playback silence_stream://-1`（无限静音
 
 ### 业务隔离
 - [ ] 三种 biz_type 音色不同
-- [ ] Redis key 按 biz_type 隔离
+- [ ] Redis key 按 (tenant_id, biz_type) 隔离
+- [ ] prompt 三维缓存 key `cb:prompt:{tenant_id}:{biz_type}:{scenario}`
+- [ ] Console 跨租户返回 404（不泄漏存在性）
 - [ ] 录音目录按 biz_type 隔离
-- [ ] PG 数据按 biz_type 过滤
+- [ ] PG 数据按 (tenant_id, biz_type) 过滤
 
 ## 配置参数对照表
 
@@ -1062,7 +1304,9 @@ FreeSWITCH 拨号计划 `answer` + `playback silence_stream://-1`（无限静音
 | Orchestrator | VAD 引擎 | CALLBOT_VAD_TYPE=webrtc (webrtc/silero) |
 | Orchestrator | VAD 灵敏度 | CALLBOT_VAD_AGGRESSIVENESS=3 (WebRTC), CALLBOT_VAD_SILERO_THRESHOLD=0.5 (Silero) |
 | Orchestrator | Jitter Buffer | CALLBOT_JITTER_TARGET_DEPTH=3 |
-| Orchestrator | 降噪模式 | CALLBOT_DENOISE_ENABLED="" (highpass/noisereduce/rnnoise) |
+| Orchestrator | 降噪模式 | CALLBOT_DENOISE_ENABLED="" (highpass/noisereduce/rnnoise; 与 AEC 互斥) |
+| Orchestrator | WebRTC APM(AEC) | CALLBOT_AEC_ENABLED=false, CALLBOT_AEC_TYPE=2(1=AECM/2=老AEC), CALLBOT_AEC_NS_LEVEL=2, CALLBOT_AEC_AGC_TYPE=1, CALLBOT_AEC_SYSTEM_DELAY_MS=80 (开启时取代 denoise + 固定增益) |
+| Orchestrator | 录音 | CALLBOT_RECORDINGS_DIR, CALLBOT_RECORDING_NOTICE_ENABLED=true, CALLBOT_RECORDING_NOTICE_SOUND, CALLBOT_RECORDING_ARCHIVE_DELAY_SEC=3, CALLBOT_RECORDING_ARCHIVE_TIMEOUT=30 |
 | Orchestrator | ASR gRPC | CALLBOT_ASR_USE_GRPC=false, CALLBOT_ASR_GRPC_TARGET=:50051 |
 | Orchestrator | TTS gRPC | CALLBOT_TTS_USE_GRPC=false, CALLBOT_TTS_GRPC_TARGET=:50052 |
 | Orchestrator | ASR WebSocket | CALLBOT_ASR_USE_WS=false, CALLBOT_ASR_WS_URL=ws://127.0.0.1:8080/ws/asr/streaming-recognize |
@@ -1072,9 +1316,10 @@ FreeSWITCH 拨号计划 `answer` + `playback silence_stream://-1`（无限静音
 | Orchestrator | 事件循环 | uvloop (Dockerfile --loop uvloop) |
 | TTS | CosyVoice device | COSYVOICE_DEVICE=auto (cpu/mps/auto, Mac本地建议cpu) |
 | MCP Server | 用户中心 | :9090 |
+| Console | 管理控制台 | :3001 (DATABASE_URL/REDIS_URL/MINIO_*/CONSOLE_ADFS_ENABLED, 详见 console/server/.env.example) |
 | Redis | 地址 | 10.0.0.30:6379 |
 | PG | 地址 | 10.0.0.31:5432 |
-| MinIO | 地址 | 10.0.0.32:9000 |
+| MinIO | 地址 | 10.0.0.32:9000 (录音归档 + Console presigned 回放) |
 | NAS | 挂载点 | /nas/rec |
 
 ## 常见问题
@@ -1101,10 +1346,16 @@ FreeSWITCH 拨号计划 `answer` + `playback silence_stream://-1`（无限静音
 - Mac 本地开发: COSYVOICE_DEVICE=cpu 避免 MPS fallback 开销（local.sh 已默认）
 - 检查 biz_type 对应的音色配置
 
-### 4. 录音文件不存在
-- 检查 NAS 挂载
-- 检查权限
-- 检查目录路径是否正确创建
+### 4. 录音文件不存在 / 录音归档失败
+- 检查 `CALLBOT_RECORDINGS_DIR` 下是否有 `${uuid}.wav`（CallRecorder 写入）
+- 检查 MinIO 配置：`MINIO_ENDPOINT` 为空时 `upload_recording` 静默跳过（不写 call_artifact）
+- 注意：MINIO_* 无 CALLBOT_ 前缀，靠 main.py 顶部 `load_dotenv()` 加载；pydantic 不加载无前缀的 env，漏配置会静默跳过
+- 检查 `_archive_recording` 是否被 GC（强引用集 `_ongoing_archives`），挂断后延迟 `CALLBOT_RECORDING_ARCHIVE_DELAY_SEC`（默认3s）才读 wav
+- 检查 inbound_route 无 DID 匹配时回落 default（tenant_id/scenario = default）
+
+### 4.1 WebRTCAPM 降级
+- `CALLBOT_AEC_ENABLED=true` 但日志见 "WebRTCAPM process failed, passthrough"：livekit 库缺失或帧格式错误，单帧错误降级透传原帧（不影响通话）
+- AEC 开启时不再叠加固定 `CALLBOT_AUDIO_GAIN`（AGC 由 WebRTCAPM 逐帧处理）
 
 ### 5. gRPC 连接失败
 - 检查 agent-asr gRPC 端口 50051 是否监听
