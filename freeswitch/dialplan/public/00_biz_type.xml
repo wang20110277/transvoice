@@ -14,6 +14,11 @@
           <!-- user_key: 呼入为主叫手机号;呼出时由 originate 设为客户手机号 -->
           <action application="set" data="user_key=${caller_id_number}"/>
           <action application="answer"/>
+          <!-- 录音提示音（合规）。本地测试或 wav 不存在时注释此行；缺失文件 FS 仅记日志不影响通话 -->
+          <action application="playback" data="ivr/recording_notice.wav"/>
+          <!-- 整通双向混音录音（单声道）；FS 原生后台录音，agent-flow 存活无关。挂断后由 agent-flow 间隔 3s 上传 MinIO -->
+          <action application="set" data="RECORD_STEREO=false"/>
+          <action application="record_session" data="${recordings_dir}/${uuid}.wav"/>
           <action application="playback" data="silence_stream://-1"/>
         </condition>
       </extension>
