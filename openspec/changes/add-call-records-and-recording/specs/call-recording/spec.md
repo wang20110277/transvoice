@@ -60,23 +60,27 @@
 - **WHEN** 该通话无 kind='recording' 的 call_artifact 行
 - **THEN** presigned URL 接口 SHALL 返回 404（console 显示"录音未归档"）
 
-### Requirement: 录音 artifact 回写
+### Requirement: 录音链接回写 call_session
 
-系统 SHALL 在 CHANNEL_HANGUP 时，通过 `main._on_channel_hangup` 异步执行 `_archive_recording`：读取 wav 文件 → upload_recording → `repository.insert_artifact(call_id=uuid, fs_uuid=uuid, kind='recording', storage='minio', uri=<object_key>, size_bytes, content_type='audio/wav')`。整个归档 SHALL 为 fire-and-forget（`asyncio.create_task`），不阻塞 hangup 清理。
+系统 SHALL 在 `call_session` 表新增 `recording_uri TEXT`（可空）列（alembic 迁移）。CHANNEL_HANGUP 后异步执行 `_archive_recording`：**间隔 3 秒**（等 FS flush wav，可配 `recording_archive_delay_sec`）→ 读 wav → `upload_recording` 上传 MinIO → `repository.update_call_session_recording_uri(fs_uuid, uri)` 把 object key 写入该通 call_session.recording_uri。整个归档 SHALL 为 fire-and-forget（`asyncio.create_task`），不阻塞 hangup 清理。
 
 #### Scenario: 挂断后录音归档
-- **WHEN** CHANNEL_HANGUP 触发，`_archive_recording` 找到 `${uuid}.wav` 文件
-- **THEN** 系统 SHALL 上传 MinIO 并写入一行 call_artifact(kind='recording', storage='minio')
-- **AND** artifact 行的 call_id/fs_uuid SHALL 等于 uuid
-- **AND** uri SHALL 为 MinIO object key（非完整 URL）
+- **WHEN** CHANNEL_HANGUP 触发，间隔 3 秒后 `_archive_recording` 找到 `${uuid}.wav` 文件
+- **THEN** 系统 SHALL 上传 MinIO 并 UPDATE call_session.recording_uri = object_key（WHERE fs_uuid=uuid）
+- **AND** recording_uri SHALL 为 MinIO object key（如 `recordings/{date}/{uuid}.wav`，非完整 URL）
 
-#### Scenario: 录音文件未就绪重试
-- **WHEN** CHANNEL_HANGUP 后 `${uuid}.wav` 尚未 flush 完成（FS 写盘延迟）
-- **THEN** `_archive_recording` SHALL 以短间隔（0.5s）重试，最多 3 次
-- **AND** 重试耗尽仍失败时 SHALL 记录 warning 日志，不写 artifact
+#### Scenario: 3 秒延时等 FS flush
+- **WHEN** CHANNEL_HANGUP 触发
+- **THEN** `_archive_recording` SHALL 先 `await asyncio.sleep(recording_archive_delay_sec)`（默认 3）
+- **AND** 之后再读取录音文件，确保 FS 已 flush 关闭 wav
+
+#### Scenario: 录音文件不存在
+- **WHEN** 3 秒后 `${uuid}.wav` 仍不存在（FS 未录或路径错）
+- **THEN** 系统 SHALL 记录 warning 日志
+- **AND** call_session.recording_uri SHALL 保持为空（console 显示"录音未归档"）
 
 #### Scenario: 归档失败不阻断 hangup
-- **WHEN** `_archive_recording`（upload 或 insert_artifact）抛出异常
+- **WHEN** `_archive_recording`（upload 或 update_recording_uri）抛出异常
 - **THEN** 系统 SHALL 仅记录日志
 - **AND** SHALL NOT 阻塞 audio_fork_stop / cancel_call / 下一通通话
 
