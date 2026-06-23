@@ -73,36 +73,6 @@ async def upload_audio_async(audio_bytes: bytes, object_name: str) -> None:
     await asyncio.to_thread(upload_audio, audio_bytes, object_name)
 
 
-async def save_turn_audio(
-    upstream_pcm: bytes,
-    downstream_pcm: bytes,
-    call_id: str,
-    turn: int,
-    upstream_sr: int = 8000,
-    downstream_sr: int = 8000,
-) -> None:
-    """保存一轮对话的上行（用户）和下行（AI）音频到 MinIO。
-
-    upstream_pcm: 用户音频原始 PCM int16 (8kHz)
-    downstream_pcm: AI 回复音频原始 PCM int16 (downstream_sr Hz)
-    """
-    if not MINIO_ENDPOINT:
-        return
-    suffix = f"t{turn}"
-
-    if upstream_pcm:
-        wav = wrap_wav_header(upstream_pcm, sample_rate=upstream_sr)
-        key = build_object_key(prefix="upstream", call_id=call_id, suffix=suffix)
-        if key:
-            asyncio.create_task(upload_audio_async(wav, key))
-
-    if downstream_pcm:
-        wav = wrap_wav_header(downstream_pcm, sample_rate=downstream_sr)
-        key = build_object_key(prefix="downstream", call_id=call_id, suffix=suffix)
-        if key:
-            asyncio.create_task(upload_audio_async(wav, key))
-
-
 async def upload_recording(
     call_id: str, wav_bytes: bytes, biz_type: str, tenant_id: str,
 ) -> str | None:

@@ -548,7 +548,6 @@ class StreamingCallHandler:
         recorder: CallRecorder | None = None,
     ) -> None:
         """Phase 1 (pre-LLM) + Phase 2 (streaming LLM+TTS) → TTSOutputBuffer 回传。"""
-        downstream_pcm = bytearray()
         t0 = time.monotonic()
         try:
             if active_call and active_call.cancel.is_set():
@@ -582,7 +581,6 @@ class StreamingCallHandler:
                     return
 
                 pending.setdefault(index, []).append(pcm)
-                downstream_pcm.extend(pcm)
                 if recorder:
                     recorder.feed_ai(pcm)
 
@@ -614,19 +612,8 @@ class StreamingCallHandler:
                 await tts_buffer.wait_drained(timeout=10.0)
                 await self._execute_terminal_action(terminal_action, call_id)
 
-            # 保存本轮音频（fire-and-forget）
-            if audio or downstream_pcm:
-                await minio_storage.save_turn_audio(
-                    upstream_pcm=audio,
-                    downstream_pcm=bytes(downstream_pcm),
-                    call_id=call_id,
-                    turn=turn,
-                    downstream_sr=_settings.media_sample_rate,
-                )
-
             elapsed = (time.monotonic() - t0) * 1000
-            logger.info("[%s] turn %d done in %.0fms, %d bytes downstream",
-                        call_id, turn, elapsed, len(downstream_pcm))
+            logger.info("[%s] turn %d done in %.0fms", call_id, turn, elapsed)
 
         except asyncio.CancelledError:
             logger.info("[%s] turn %d cancelled (barge-in)", call_id, turn)
