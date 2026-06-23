@@ -21,12 +21,16 @@ if _src not in sys.path:
     sys.path.insert(0, _src)
 
 import asyncio
+import hashlib
 import logging
+import os
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import FastAPI, WebSocket
 
 from src.config import settings
+from src.storage import minio_storage, repository
 from src.graph.flow import set_services, run_pre_llm_phase, run_streaming_pipeline
 from src.memory.assembler import MemoryAssembler
 from src.clients.mcp import MCPClient
@@ -57,6 +61,52 @@ _initialized = False
 _streaming_handler = None
 _call_registry = ActiveCallRegistry()
 _audio_fork_started: set[str] = set()  # 防止 ESL 多连接重复触发 audio_fork_start
+
+
+def _mask_phone(s: str) -> str:
+    """手机号脱敏：首3末4，中间掩码（138****5678）。短串原样返回。"""
+    return f"{s[:3]}****{s[-4:]}" if len(s) >= 7 else s
+
+
+def _phone_hash(s: str) -> str:
+    """手机号 sha256（脱敏存储，供跨通话关联同一用户；canonical user_id 待 MCP 重启）。"""
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+async def _archive_recording(fs_uuid: str, biz_type: str, tenant_id: str, user_key: str) -> None:
+    """挂断后间隔 3s → 读 FS 录音 → 上传 MinIO → insert_artifact(kind='recording')。
+
+    fire-and-forget 由 CHANNEL_HANGUP 调起；任何异常仅记日志，不阻断下一通。
+    """
+    # 用户要求：挂断后间隔 3 秒再上传（等 FS flush 完 wav）
+    await asyncio.sleep(settings.recording_archive_delay_sec)
+    path = os.path.join(settings.recordings_dir, f"{fs_uuid}.wav")
+    if not os.path.exists(path):
+        logger.warning("[%s] recording file not found after %ds: %s",
+                       fs_uuid, settings.recording_archive_delay_sec, path)
+        return
+
+    try:
+        with open(path, "rb") as f:
+            wav_bytes = f.read()
+    except OSError as e:
+        logger.warning("[%s] read recording failed: %s", fs_uuid, e)
+        return
+
+    key = await minio_storage.upload_recording(fs_uuid, wav_bytes, biz_type, tenant_id)
+    if key is None:
+        return  # MinIO 未配置，静默跳过
+
+    try:
+        await repository.insert_artifact(
+            call_id=fs_uuid, fs_uuid=fs_uuid, biz_type=biz_type,
+            user_id=user_key, user_key=user_key,
+            kind="recording", storage="minio", uri=key,
+            size_bytes=len(wav_bytes), content_type="audio/wav",
+        )
+        logger.info("[%s] recording archived: %s (%d bytes)", fs_uuid, key, len(wav_bytes))
+    except Exception as e:
+        logger.error("[%s] insert_artifact(recording) failed: %s", fs_uuid, e)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -166,6 +216,29 @@ def _create_esl_event_handlers(esl: ESLClient) -> None:
             return
         logger.info("[%s] CHANNEL_HANGUP", uuid)
         _audio_fork_started.discard(uuid)
+
+        hangup_cause = event.headers.get("Hangup-Cause", "")
+        result_code = event.headers.get("Variable-Hangup-Cause", "")
+        end_ts = datetime.now()
+        active = _call_registry.get(uuid)
+
+        # session end + 录音归档（fire-and-forget，不阻塞 hangup 清理）
+        if active:
+            try:
+                await repository.update_call_session_end(
+                    uuid, end_ts, hangup_cause, result_code,
+                )
+            except Exception as e:
+                logger.error("[%s] update_call_session_end failed: %s", uuid, e)
+            archive_task = asyncio.create_task(
+                _archive_recording(uuid, active.biz_type, active.tenant_id, active.user_key)
+            )
+            archive_task.add_done_callback(
+                lambda t: t.exception() and logger.error(
+                    "[%s] _archive_recording failed: %s", uuid, t.exception(),
+                )
+            )
+
         try:
             await esl.audio_fork_stop(uuid)
         except Exception:
@@ -213,6 +286,20 @@ def _create_esl_event_handlers(esl: ESLClient) -> None:
         )
 
         _call_registry.register(uuid, biz_type, user_key, tenant_id=tenant_id, scenario=scenario)
+
+        # session 写入 PG（fire-and-forget，DB 异常仅记日志不阻断通话）
+        try:
+            await repository.insert_call_session({
+                "call_id": uuid, "fs_uuid": uuid,          # 决策 1：同值
+                "user_id": user_key,                        # 本期 fallback（MCP 禁用，见 design §7）
+                "biz_type": biz_type, "tenant_id": tenant_id, "scenario": scenario,
+                "phone_hash": _phone_hash(user_key), "user_key": user_key,
+                "phone_masked": _mask_phone(user_key),
+                "start_ts": datetime.now(),
+                "recording_notice_played": settings.recording_notice_enabled,
+            })
+        except Exception as e:
+            logger.error("[%s] insert_call_session failed: %s", uuid, e)
 
         ws_url = f"ws://{settings.media_ws_host}:{settings.media_ws_port}/media/{uuid}"
         try:
