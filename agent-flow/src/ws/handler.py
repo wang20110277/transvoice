@@ -171,7 +171,7 @@ class StreamingCallHandler:
                         websocket, call_id, vad, jitter, audio_buffer,
                         streaming_task, barge_in_event, active_call,
                         barge_grace_until, ai_has_spoken, barge_speech_counter,
-                        barge_tolerance_counter, tts_buffer,
+                        barge_tolerance_counter, tts_buffer, recorder,
                     )
 
                     if barge_detected:
@@ -458,6 +458,7 @@ class StreamingCallHandler:
         speech_counter: list[int],
         tolerance_counter: list[int],
         tts_buffer: "TTSOutputBuffer",
+        recorder: CallRecorder | None = None,
     ) -> bool:
         """AI 说话时并发接收用户音频，检测 barge-in。
 
