@@ -500,12 +500,12 @@ async def run_streaming_pipeline(
         _user_key = state.get("user_key", "")
         if state.get("user_input", "").strip():
             fire_insert_turn(
-                call_id, call_id=call_id, fs_uuid=call_id, biz_type=biz_type,
+                call_id=call_id, fs_uuid=call_id, biz_type=biz_type,
                 user_id=_user_key, user_key=_user_key, role="user",
                 text=state.get("user_input", ""),
             )
         fire_insert_turn(
-            call_id, call_id=call_id, fs_uuid=call_id, biz_type=biz_type,
+            call_id=call_id, fs_uuid=call_id, biz_type=biz_type,
             user_id=_user_key, user_key=_user_key, role="assistant", text=full_text,
         )
 
