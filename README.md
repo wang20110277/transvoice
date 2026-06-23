@@ -1297,7 +1297,7 @@ FreeSWITCH 拨号计划为 catch-all，`answer` + `playback silence_stream://-1`
 | ASR | 服务地址 | :8080 |
 | ASR | 模型路径 | MODEL_DIR=/opt/sensevoice/models/SenseVoiceSmall |
 | TTS | 服务地址 | :8081 |
-| TTS | 模型路径 | MODEL_DIR=/opt/cosyvoice/pretrained_models/CosyVoice3-0.5B |
+| TTS | 模型路径 | MODEL_DIR=/opt/cosyvoice/models/CosyVoice3-0.5B |
 | LLM | 推理地址 | :8083 (GPU2) |
 | Orchestrator | 服务地址 | :8000 |
 | Orchestrator | ESL 地址 | CALLBOT_ESL_HOST:CALLBOT_ESL_PORT |
