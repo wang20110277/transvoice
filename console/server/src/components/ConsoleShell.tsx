@@ -32,7 +32,7 @@ const MENUS: MenuItem[] = [
   { key: 'prompts', label: '提示词管理', icon: Layers, href: '/prompts', enabled: true },
   { key: 'dashboard', label: '数据看板', icon: LayoutDashboard, enabled: false },
   { key: 'callcenter', label: '外呼任务', icon: PhoneCall, href: '/call-tasks', enabled: true },
-  { key: 'records', label: '通话记录', icon: FileSpreadsheet, enabled: false },
+  { key: 'records', label: '通话记录', icon: FileSpreadsheet, href: '/calls', enabled: true },
   { key: 'kb', label: '知识库', icon: Database, enabled: false },
   { key: 'memory', label: '记忆系统', icon: BrainCircuit, enabled: false },
   { key: 'rbac', label: '权限管理', icon: Shield, enabled: false },
