@@ -26,6 +26,7 @@ from ws.jitter_buffer import JitterBuffer, TTSOutputBuffer
 from ws.registry import ActiveCallRegistry
 from ws.denoise import BaseDenoiser, PassThroughDenoiser
 from ws.audio_processing import WebRTCAPM
+from ws.call_recorder import CallRecorder
 from storage import minio_storage
 from storage.persistence_helpers import fire_insert_event
 
@@ -127,6 +128,7 @@ class StreamingCallHandler:
         audio_buffer = bytearray()
         audio_gain = _settings.audio_gain
         turn_count = 0
+        recorder = CallRecorder(sample_rate=_settings.media_sample_rate)
 
         # ASR streaming state
         asr_stream: ASRStream | None = None
@@ -179,7 +181,7 @@ class StreamingCallHandler:
                         logger.info("[%s] barge-in: TTS buffer cleared", call_id)
                         # 关键事件落 PG（fire-and-forget，不延迟清空）
                         fire_insert_event(
-                            call_id, call_id=call_id, fs_uuid=call_id,
+                            call_id=call_id, fs_uuid=call_id,
                             biz_type=biz_type, user_id=user_key, user_key=user_key,
                             event_type="barge_in", payload={"turn": turn_count},
                         )
@@ -219,6 +221,7 @@ class StreamingCallHandler:
                         continue
 
                     frame = data["bytes"]
+                    recorder.feed_caller(frame)
                     jitter.insert(frame)
 
                     while True:
@@ -275,6 +278,7 @@ class StreamingCallHandler:
                                     tts_buffer=tts_buffer,
                                     tenant_id=tenant_id,
                                     scenario=scenario,
+                                    recorder=recorder,
                                 ),
                                 name=f"stream-{call_id}-{turn_count}",
                             )
@@ -296,7 +300,7 @@ class StreamingCallHandler:
         except Exception as e:
             logger.error("[%s] WS error: %s", call_id, e, exc_info=True)
         finally:
-            await self._cleanup(streaming_task, asr_stream, tts_buffer, call_id, turn_count)
+            await self._cleanup(streaming_task, asr_stream, tts_buffer, call_id, turn_count, recorder)
 
     # ───────────────────────────────────────────────────────────────
     # 音频处理辅助
@@ -475,6 +479,7 @@ class StreamingCallHandler:
 
         if "bytes" in data and data["bytes"]:
             jitter.insert(data["bytes"])
+            recorder.feed_caller(data["bytes"])
 
             while True:
                 smooth_frame = jitter.drain()
@@ -539,6 +544,7 @@ class StreamingCallHandler:
         tts_buffer: TTSOutputBuffer | None = None,
         tenant_id: str = "default",
         scenario: str = "default",
+        recorder: CallRecorder | None = None,
     ) -> None:
         """Phase 1 (pre-LLM) + Phase 2 (streaming LLM+TTS) → TTSOutputBuffer 回传。"""
         downstream_pcm = bytearray()
@@ -576,6 +582,8 @@ class StreamingCallHandler:
 
                 pending.setdefault(index, []).append(pcm)
                 downstream_pcm.extend(pcm)
+                if recorder:
+                    recorder.feed_ai(pcm)
 
                 # 按句序写入 tts_buffer
                 while next_to_send in pending:
@@ -643,7 +651,7 @@ class StreamingCallHandler:
         user_key = active.user_key if active else ""
         if action in ("end", "handoff"):
             fire_insert_event(
-                call_id, call_id=call_id, fs_uuid=call_id, biz_type=biz_type,
+                call_id=call_id, fs_uuid=call_id, biz_type=biz_type,
                 user_id=user_key, user_key=user_key,
                 event_type="hangup_by_bot" if action == "end" else "handoff",
                 payload={"extension": self._handoff_extension} if action == "handoff" else {},
@@ -665,6 +673,7 @@ class StreamingCallHandler:
     async def _cleanup(
         self, streaming_task: asyncio.Task | None, asr_stream: "ASRStream | None",
         tts_buffer: TTSOutputBuffer, call_id: str, turn_count: int,
+        recorder: CallRecorder | None = None,
     ) -> None:
         """清理所有资源。"""
         if streaming_task and not streaming_task.done():
@@ -679,6 +688,12 @@ class StreamingCallHandler:
             except Exception:
                 pass
         await tts_buffer.stop()
+        # 写 agent-flow 自录的立体声 wav（L=caller R=ai）到 FS recordings_dir，
+        # 供 main._archive_recording 读取上传（取代 FS record_session 录不到 AI 的问题）
+        if recorder and recorder.has_audio:
+            import os
+            path = os.path.join(_settings.recordings_dir, f"{call_id}.wav")
+            recorder.write_to(path)
         if self._registry:
             self._registry.unregister(call_id)
         logger.info("[%s] WS closed, total turns=%d", call_id, turn_count)

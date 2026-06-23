@@ -16,9 +16,8 @@
           <action application="answer"/>
           <!-- 录音提示音（合规）。本地测试或 wav 不存在时注释此行；缺失文件 FS 仅记日志不影响通话 -->
           <!-- <action application="playback" data="ivr/recording_notice.wav"/> -->
-          <!-- 整通录音：立体声 L=用户(upstream) R=AI(downstream)；FS 原生后台录音，agent-flow 存活无关。挂断后由 agent-flow 间隔 3s 上传 MinIO -->
-          <action application="set" data="RECORD_STEREO=true"/>
-          <action application="record_session" data="${recordings_dir}/${uuid}.wav"/>
+          <!-- 整通录音由 agent-flow 自录双声道（caller+AI TTS），FS 不再 record_session
+               （FS record_session 录不到 mod_audio_fork 注入的 AI 音频）。agent-flow 挂断后写入此目录并上传 MinIO -->
           <action application="playback" data="silence_stream://-1"/>
         </condition>
       </extension>
