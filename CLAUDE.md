@@ -75,21 +75,6 @@ openspec/
 - **不循环 node**：需要多个符号源码时用 `codegraph_explore`（一次调用），不要循环 `codegraph_node`。
 - **索引进后用 Read**：当响应包含 "⚠️ Some files referenced below were edited since the last index sync" 时，对列出的文件用 Read 获取准确内容。
 
-### Code Review Graph — 代码审查
-
-**Token 高效审查流程**：
-
-1. 先调 `get_minimal_context(task="review changes")` 获取风险概览。
-2. 低风险：`detect_changes(detail_level="minimal")` → 报告摘要 + 测试缺口。
-3. 中/高风险：`detect_changes(detail_level="standard")` → 对高风险函数查 callers → 查 affected_flows。
-4. 只在需要源码片段时才调 `get_review_context`。
-
-**审查原则**：
-
-- **每次代码变更后同步索引**：`codegraph sync` 或 CRG 的 `build_or_update_graph_tool`。
-- **风险驱动审查深度**：低风险快速过，高风险深入查。
-- **关注测试缺口**：高连接度节点（hub nodes）必须有测试覆盖。
-
 ## AI-Assisted Development
 
 ### Superpowers 技能系统
@@ -119,30 +104,6 @@ openspec/
 - 流程技能优先（brainstorming、debugging），实现技能其次。
 - 刚性技能（TDD、debugging）严格遵循；弹性技能（patterns）可适配上下文。
 - 技能检查在澄清问题和任何操作之前。
-
-### Oh-My-ClaudeCode (OMC)
-
-**可用模式**：
-
-| 模式 | 命令 | 说明 |
-|------|------|------|
-| ultrawork | `/oh-my-claudecode:ultrawork` | 深度专注执行模式 |
-| autopilot | `/oh-my-claudecode:autopilot` | 自主迭代执行 |
-| ralph | `/oh-my-claudecode:ralph` | 代码审查模式 |
-| plan | `/oh-my-claudecode:plan` | 规划模式 |
-
-**工作记忆 (Notepad)**：
-
-- Priority Context：每次会话加载，存放关键上下文（<500字符）。
-- Working Memory：带时间戳，7天自动清理。
-- Manual：手动条目，永不清理。
-- 使用 `notepad_write_priority` 写入关键信息，`notepad_write_working` 记录临时发现。
-
-**项目记忆 (Project Memory)**：
-
-- 持久化项目级知识（技术栈、构建、约定、结构）。
-- 通过 `project_memory_write` 写入，跨会话持久化。
-- 重要的用户反馈和行为偏好写入 memory 文件。
 
 ### Claude Code 通用规范
 
