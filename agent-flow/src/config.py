@@ -140,6 +140,14 @@ class Settings(BaseSettings):
     splitter_flush_timeout: float = 0.2
     splitter_eager_first: bool = True
 
+    # 录音归档（FS record_session 写入路径，agent-flow 读取路径）
+    recordings_dir: str = "/Users/lindaw/freeswitch/var/lib/freeswitch/recordings"
+    recording_notice_enabled: bool = True
+    recording_archive_timeout: int = 30
+    # 挂断后间隔秒数再上传录音（等 FS flush 完 wav）；用户要求 3 秒
+    recording_archive_delay_sec: int = 3
+    recording_notice_sound: str = "ivr/recording_notice.wav"
+
     model_config = {"env_prefix": "CALLBOT_", "env_file": ".env", "extra": "ignore"}
 
 

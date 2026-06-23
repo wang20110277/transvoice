@@ -5,7 +5,7 @@ import logging
 import os
 import struct
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from minio import Minio
 
@@ -101,3 +101,30 @@ async def save_turn_audio(
         key = build_object_key(prefix="downstream", call_id=call_id, suffix=suffix)
         if key:
             asyncio.create_task(upload_audio_async(wav, key))
+
+
+async def upload_recording(
+    call_id: str, wav_bytes: bytes, biz_type: str, tenant_id: str,
+) -> str | None:
+    """上传整通录音 wav 到 MinIO。返回 object key；MinIO 未配置返回 None。"""
+    if not MINIO_ENDPOINT:
+        return None
+    key = build_object_key(prefix="recordings", call_id=call_id)
+    if key is None:
+        return None
+    await upload_audio_async(wav_bytes, key)
+    return key
+
+
+def presigned_get_url(object_key: str, expiry: int = 3600) -> str | None:
+    """生成 MinIO presigned GET URL（默认 1h）。MinIO 未配置或异常返回 None。"""
+    client = _client()
+    if client is None:
+        return None
+    try:
+        return client.presigned_get_object(
+            MINIO_BUCKET, object_key, expires=timedelta(seconds=expiry),
+        )
+    except Exception as e:
+        logger.error("presigned_get_url failed: %s", e)
+        return None
