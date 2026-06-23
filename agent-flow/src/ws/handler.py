@@ -27,6 +27,7 @@ from ws.registry import ActiveCallRegistry
 from ws.denoise import BaseDenoiser, PassThroughDenoiser
 from ws.audio_processing import WebRTCAPM
 from storage import minio_storage
+from storage.persistence_helpers import fire_insert_event
 
 if TYPE_CHECKING:
     from clients.esl import ESLClient
@@ -176,6 +177,12 @@ class StreamingCallHandler:
                         # 不调用 uuid_break — 它会终止 dialplan 的 playback silence_stream://-1 导致挂断
                         tts_buffer.clear()
                         logger.info("[%s] barge-in: TTS buffer cleared", call_id)
+                        # 关键事件落 PG（fire-and-forget，不延迟清空）
+                        fire_insert_event(
+                            call_id, call_id=call_id, fs_uuid=call_id,
+                            biz_type=biz_type, user_id=user_key, user_key=user_key,
+                            event_type="barge_in", payload={"turn": turn_count},
+                        )
                         # 不对 barge-in 音频做 ASR — 音频缓冲混入 AI 回声，ASR 无法识别
                         # 直接重置，让正常 VAD/ASR 路径处理用户下一轮语音
                         asr_stream, speech_started = await self._cancel_asr_stream(asr_stream, speech_started)
@@ -630,6 +637,17 @@ class StreamingCallHandler:
         if self._esl is None:
             logger.warning("[%s] ESL unavailable, cannot execute: %s", call_id, action)
             return
+        # 关键事件落 PG（fire-and-forget）；biz_type/user_key 从 registry 取，取不到留空
+        active = self._registry.get(call_id) if self._registry else None
+        biz_type = active.biz_type if active else ""
+        user_key = active.user_key if active else ""
+        if action in ("end", "handoff"):
+            fire_insert_event(
+                call_id, call_id=call_id, fs_uuid=call_id, biz_type=biz_type,
+                user_id=user_key, user_key=user_key,
+                event_type="hangup_by_bot" if action == "end" else "handoff",
+                payload={"extension": self._handoff_extension} if action == "handoff" else {},
+            )
         try:
             if action == "end":
                 result = await self._esl.hangup(call_id)

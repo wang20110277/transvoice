@@ -37,6 +37,7 @@ from clients.asr_grpc_client import ASRGrpcClient
 from clients.tts_ws_client import TTSWebSocketClient
 from clients.asr_ws_client import ASRWebSocketClient
 from storage import minio_storage
+from storage.persistence_helpers import fire_insert_turn
 
 logger = logging.getLogger(__name__)
 
@@ -494,6 +495,19 @@ async def run_streaming_pipeline(
     # 持久化本轮对话 (plain Redis LIST),供下一轮加载,避免 LLM 每轮丢失上下文/重复问候
     if full_text.strip():
         await save_turn(call_id, biz_type, state.get("user_input", ""), full_text)
+
+        # PG call_turn 双写（console 审查持久化；fire-and-forget 不阻断下一轮）
+        _user_key = state.get("user_key", "")
+        if state.get("user_input", "").strip():
+            fire_insert_turn(
+                call_id, call_id=call_id, fs_uuid=call_id, biz_type=biz_type,
+                user_id=_user_key, user_key=_user_key, role="user",
+                text=state.get("user_input", ""),
+            )
+        fire_insert_turn(
+            call_id, call_id=call_id, fs_uuid=call_id, biz_type=biz_type,
+            user_id=_user_key, user_key=_user_key, role="assistant", text=full_text,
+        )
 
     elapsed = (time.monotonic() - t0) * 1000
     logger.info("[%s] streaming pipeline done in %.0fms, %d sentences TTS'd",
