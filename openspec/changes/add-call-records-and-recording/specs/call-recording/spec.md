@@ -70,10 +70,10 @@
 - **AND** artifact 行的 call_id/fs_uuid SHALL 等于 uuid
 - **AND** uri SHALL 为 MinIO object key（非完整 URL）
 
-#### Scenario: 录音文件未就绪重试
-- **WHEN** CHANNEL_HANGUP 后 `${uuid}.wav` 尚未 flush 完成（FS 写盘延迟）
-- **THEN** `_archive_recording` SHALL 以短间隔（0.5s）重试，最多 3 次
-- **AND** 重试耗尽仍失败时 SHALL 记录 warning 日志，不写 artifact
+#### Scenario: 挂断后 3 秒延时上传
+- **WHEN** CHANNEL_HANGUP 触发
+- **THEN** `_archive_recording` SHALL 先 `await asyncio.sleep(recording_archive_delay_sec)`（默认 3 秒，等 FS flush 完 wav）
+- **AND** 3 秒后 `${uuid}.wav` 仍不存在时 SHALL 记录 warning 日志，不写 artifact
 
 #### Scenario: 归档失败不阻断 hangup
 - **WHEN** `_archive_recording`（upload 或 insert_artifact）抛出异常

@@ -137,7 +137,7 @@ barge-in / handoff / end 等 terminal action 触发时写 `call_event`：
         └─ _call_registry.cancel_call(uuid)
 ```
 
-> **时序注意**：`record_session` 文件在 CHANNEL_HANGUP 后才 flush 完成。`_archive_recording` 用 `asyncio.create_task` 异步执行，自然延后于 hangup 清理；若文件尚未就绪，加短重试（最多 3 次 × 0.5s）。MinIO 未配置时跳过上传（与 `save_turn_audio` 同样 `if not MINIO_ENDPOINT: return`）。
+> **时序注意**：`record_session` 文件在 CHANNEL_HANGUP 后才 flush 完成。用户要求挂断后**间隔 3 秒**再上传（`recording_archive_delay_sec`，等 FS flush 完 wav）。`_archive_recording` 用 `asyncio.create_task` 异步执行，先 `await sleep(3)` 再读上传。MinIO 未配置时跳过上传（与 `save_turn_audio` 同样 `if not MINIO_ENDPOINT: return`）。
 
 ## 5. console 读侧（Drizzle 只读映射 + API + UI）
 

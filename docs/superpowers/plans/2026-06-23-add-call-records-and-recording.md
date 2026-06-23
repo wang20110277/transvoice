@@ -72,6 +72,8 @@ Modify `agent-flow/src/config.py`，在 Settings 类（参照现有 `media_sampl
     recordings_dir: str = "/Users/lindaw/freeswitch/var/lib/freeswitch/recordings"
     recording_notice_enabled: bool = True
     recording_archive_timeout: int = 30
+    # 挂断后间隔秒数再上传录音（等 FS flush 完 wav）；用户要求 3 秒
+    recording_archive_delay_sec: int = 3
     recording_notice_sound: str = "ivr/recording_notice.wav"
 ```
 
@@ -300,15 +302,13 @@ Modify `agent-flow/main.py`，模块级加（`_mask_phone` 附近）：
 
 ```python
 async def _archive_recording(fs_uuid: str, biz_type: str, tenant_id: str, user_key: str) -> None:
-    """读 FS 录音文件 → 上传 MinIO → 回写 call_artifact。文件未就绪短重试。"""
+    """挂断后间隔 3s → 读 FS 录音 → 上传 MinIO → insert_artifact(kind='recording')。"""
+    # 用户要求：挂断后间隔 3 秒再上传（等 FS flush 完 wav）
+    await asyncio.sleep(settings.recording_archive_delay_sec)
     path = os.path.join(settings.recordings_dir, f"{fs_uuid}.wav")
-    # FS flush 关闭 wav 有延迟，重试等待文件就绪
-    for _ in range(3):
-        if os.path.exists(path):
-            break
-        await asyncio.sleep(0.5)
-    else:
-        logger.warning("[%s] recording file not found: %s", fs_uuid, path)
+    if not os.path.exists(path):
+        logger.warning("[%s] recording file not found after %ds: %s",
+                       fs_uuid, settings.recording_archive_delay_sec, path)
         return
 
     try:
