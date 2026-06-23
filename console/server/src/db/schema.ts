@@ -7,6 +7,7 @@
  */
 import { sql } from 'drizzle-orm';
 import {
+  bigint,
   bigserial,
   boolean,
   integer,
@@ -91,6 +92,36 @@ export const inboundRoute = callbot.table(
 );
 
 export type InboundRoute = typeof inboundRoute.$inferSelect;
+
+/**
+ * 外呼任务定义表 — 仅定义层(promptId 绑定 + 策略参数),不含执行态。
+ *
+ * originate/调度/重拨属独立后续变更;本期策略字段为声明性存储,无执行器消费。
+ * 列名与 agent-flow SQLAlchemy (src/db/models.py CallTask) 严格一致。
+ */
+export const callTask = callbot.table(
+  'call_task',
+  {
+    id: bigserial('id', { mode: 'number' }).primaryKey(),
+    tenantId: text('tenant_id').notNull(),
+    name: text('name').notNull(),
+    promptId: bigint('prompt_id', { mode: 'number' }).notNull(),
+    kbIds: jsonb('kb_ids').notNull().default(sql`'[]'::jsonb`),
+    status: text('status').notNull().default('idle'),
+    concurrentLimit: integer('concurrent_limit').notNull().default(1),
+    allowedHours: text('allowed_hours'),
+    redialStrategy: jsonb('redial_strategy').notNull().default(sql`'{}'::jsonb`),
+    deptId: text('dept_id'),
+    description: text('description'),
+    createTime: timestamp('create_time', { withTimezone: true }).notNull().defaultNow(),
+    createUser: text('create_user').notNull().default('system'),
+    updateTime: timestamp('update_time', { withTimezone: true }).notNull().defaultNow(),
+    updateUser: text('update_user').notNull().default('system'),
+  },
+  (t) => [index('ix_call_task_tenant').on(t.tenantId)],
+);
+
+export type CallTask = typeof callTask.$inferSelect;
 
 // ── console_auth schema(Better Auth 自带) ───────────────────────────
 

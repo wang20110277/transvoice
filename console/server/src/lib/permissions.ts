@@ -16,6 +16,10 @@ export type PermissionCode =
   | 'route:create'
   | 'route:update'
   | 'route:delete'
+  | 'calltask:view'
+  | 'calltask:create'
+  | 'calltask:update'
+  | 'calltask:delete'
   | 'tenant:view'
   | 'tenant:create'
   | 'tenant:update'
@@ -27,12 +31,14 @@ const ROLE_PERMISSIONS: Record<string, PermissionCode[]> = {
   admin: [
     'menu:prompt', 'prompt:view', 'prompt:create', 'prompt:update', 'prompt:delete', 'prompt:test',
     'menu:route', 'route:view', 'route:create', 'route:update', 'route:delete',
+    'calltask:view', 'calltask:create', 'calltask:update', 'calltask:delete',
   ],
   editor: [
     'menu:prompt', 'prompt:view', 'prompt:create', 'prompt:update', 'prompt:test',
     'menu:route', 'route:view',
+    'calltask:view', 'calltask:create', 'calltask:update',
   ],
-  viewer: ['menu:prompt', 'prompt:view', 'menu:route', 'route:view'],
+  viewer: ['menu:prompt', 'prompt:view', 'menu:route', 'route:view', 'calltask:view'],
 };
 
 export function hasPermission(role: string, code: PermissionCode): boolean {
