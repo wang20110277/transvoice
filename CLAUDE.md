@@ -183,21 +183,39 @@ cd agent-flow && PYTHONPATH=$(pwd)/src alembic upgrade head
 
 ### Local (conda, all services)
 
-**启动顺序（必须严格遵守）**：`fs → asr → tts → flow`，每步等前一个服务就绪再启动下一个。FreeSWITCH 必须先于 agent-flow，否则 ESL 连接失败；ASR/TTS 必须先于 agent-flow，否则首轮通话 TTS/ASR 请求超时。
+**启动顺序（必须严格遵守）**：`基础设施(Docker) → fs → asr → tts → mcp → flow → console`，每步等前一个就绪再启动下一个。依赖链：
+
+- **Docker 基础服务（pg/redis/minio）最先** —— flow + console 依赖 PG + Redis，console 录音回放依赖 MinIO；`docker compose up -d` 后等 `callbot-postgres` healthcheck 转 healthy（~10s）。
+- **fs → flow**：FreeSWITCH 先于 agent-flow，否则 ESL 连接失败。
+- **asr/tts → flow**：ASR/TTS 先于 agent-flow，否则首轮通话 ASR/TTS 请求超时。
+- **mcp → flow**：flow 节点 ②/③ 调用 MCP 用户中心（`CALLBOT_MCP_SERVER_URL`）。
+- **console 最后**：依赖上述全部（DB/Redis/MinIO）。
 
 **FreeSWITCH 日志**：`/Users/lindaw/freeswitch/var/log/freeswitch/freeswitch.log`（mod_audio_fork 诊断、音频播放问题排查必查此日志）
 
 ```bash
-# 重启所有服务（按顺序逐个启动）
-./scripts/local.sh stop           # 先停全部
-./scripts/local.sh fs             # 1. FreeSWITCH (SIP/RTP)
-./scripts/local.sh asr            # 2. ASR (GPU 推理)
-./scripts/local.sh tts            # 3. TTS (GPU 推理)
-./scripts/local.sh flow           # 4. agent-flow (最后启动，依赖以上全部)
+# ── 第 0 步：Docker 基础服务（首次或重启机器后）──
+docker compose up -d                 # 启动 postgres + redis + minio
+docker compose ps                    # 等 callbot-postgres (healthy)
+
+# ── 一次性启动全部应用服务（推荐，脚本内部按顺序逐个启动并等待就绪）──
+./scripts/local.sh                   # = fs asr tts mcp flow console 全部
+
+# ── 或逐个启动（便于排查）──
+./scripts/local.sh stop              # 先停全部
+./scripts/local.sh fs                # 1. FreeSWITCH (SIP/RTP, 5060/8021)
+./scripts/local.sh asr               # 2. ASR (SenseVoice GPU, 8080)
+./scripts/local.sh tts               # 3. TTS (CosyVoice GPU, 8081)
+./scripts/local.sh mcp               # 4. MCP Server (Spring Boot, 9090)
+./scripts/local.sh flow              # 5. agent-flow (8000)
+./scripts/local.sh console           # 6. Console (Next.js pm2, 3001)
+
+# console 首次需先装 pm2（nvm 用户级 prefix，无需 sudo）
+npm install -g pm2 && pm2 install pm2-logrotate
 
 # 单独管理
-./scripts/local.sh status         # 检查运行状态
-./scripts/local.sh stop           # 停止全部
+./scripts/local.sh status            # 检查运行状态
+./scripts/local.sh stop              # 停止全部
 
 # 仅重启 agent-flow（其他服务不变）
 ./scripts/local.sh stop flow && ./scripts/local.sh flow
@@ -271,9 +289,9 @@ Data flow per turn (event-driven, dynamic uuid_audio_fork):
 
 **agent-flow** — FastAPI WebSocket service (uvloop event loop). **Event-driven audio fork**: ESL subscribes to `CHANNEL_ANSWER` + `CHANNEL_HANGUP`. On CHANNEL_ANSWER: parses DID via `_resolve_inbound_route()` → `(tenant_id, biz_type, scenario)`, registers call in `ActiveCallRegistry`, writes `call_session` row (`recording_notice_played`), calls `esl.audio_fork_start()` → FreeSWITCH connects WebSocket to `/media/{uuid}` for bidirectional 16kHz audio. On CHANNEL_HANGUP: calls `esl.audio_fork_stop()` + `cancel_call()` + fire-and-forget `_archive_recording` (delay 3s read FS wav → MinIO upload → `insert_artifact`). **Prompt loading**: three-dimension `get_system_prompt(tenant_id, biz_type, scenario)` — Redis cache `cb:prompt:{tenant_id}:{biz_type}:{scenario}` (5min TTL) → PostgreSQL `callbot.prompt_config` two-level fallback via `prompt_config.py`, then `render.py` variable substitution; prompt content logged per turn. **Call recording**: FreeSWITCH `uuid_record` records dual-channel PCM (L=caller, R=AI TTS) for the whole call — started by agent-flow right after `audio_fork_start` (`RECORD_STEREO=true`), the record bug is registered after mod_audio_fork's `WRITE_REPLACE` bug so it taps the dubbed AI downstream; `CALLBOT_RECORDINGS_DIR/{uuid}.wav` is read by `_archive_recording` on hangup. Streaming mode: LLM tokens streamed via `IncrementalJSONParser`, split into sentences by `SentenceSplitter`, each sentence synthesized by TTS in parallel (gRPC, HTTP, or WebSocket), resampled from 22050→16000 via `_resample_pcm()`, PCM audio paced through `TTSOutputBuffer` at steady 30ms frames (960B @ 16kHz). TTSOutputBuffer 无 TTS 数据时自动填充静音帧保活（silence_timeout=120s），与拨号计划 `silence_stream://-1` 双重保活。Barge-in: concurrent audio receive during AI speech with pluggable VAD detection (WebRTC/Silero + RMS energy gating), clears `TTSOutputBuffer` (not `uuid_break`) to avoid terminating dialplan playback, followed by cooldown period to prevent residual noise false positives. Input audio smoothed through `JitterBuffer`, pre-VAD audio processing via WebRTCAPM (AEC + NS + AGC, `audio_processing.py`) or configurable denoiser (highpass/noisereduce/rnnoise). Endpoints: `GET /healthz`, `WS /media/{uuid}`. ASR/TTS gRPC streaming optional via feature flags (`CALLBOT_ASR_USE_GRPC`, `CALLBOT_TTS_USE_GRPC`). WebSocket streaming as third transport via `asr_ws_client.py` and `tts_ws_client.py`.
 
-**java-mcp-server** — Spring Boot 4.0 + Spring AI 2.0 stateless MCP server (WebMVC transport). Serves as the user center backend for orchestrator nodes ② and ③. Uses `@McpTool`/`@McpToolParam` annotations (from `spring-ai-mcp-annotations`) with `annotation-scanner` auto-detection, no manual `ToolCallbackProvider` bean needed. Exposes two MCP tools: `user_identity_query` (phone + biz_type → user_id, phone_masked, id_card_last_four) and `user_credit_query` (user_id → credit_qualified, risk_level). Endpoint: `POST /mcp` on port 9090.
+**java-mcp-server** — Spring Boot 4.0 + Spring AI 2.0.0 (GA) stateless MCP server (WebMVC transport). Serves as the user center backend for orchestrator nodes ② and ③. Uses `@McpTool`/`@McpToolParam` annotations (from `spring-ai-mcp-annotations`) with `annotation-scanner` auto-detection, no manual `ToolCallbackProvider` bean needed. Exposes two MCP tools: `user_identity_query` (phone + biz_type → user_id, phone_masked, id_card_last_four) and `user_credit_query` (user_id → credit_qualified, risk_level). Endpoints: `POST /mcp` (MCP 协议) + `GET /healthz` (探活，供 scripts/local.sh 的 stop_svc 判活) on port 9090.
 
-**console** — Next.js 15 (App Router) + Drizzle ORM + Better Auth management console (port 3001, `console/server/`). Shares the same `callbot` PostgreSQL schema and Redis instance as agent-flow — publish/rollback directly deletes Redis key `cb:prompt:{tenant_id}:{biz_type}:{scenario}` for zero-latency config propagation. Capabilities: three-dimension prompt management (draft/publish/version-rollback/clone/variable-render test), DID inbound route CRUD (`callbot.inbound_route`), outbound call task definitions (`callbot.call_task`, definition layer only — no execution engine), read-only call records list + detail + recording replay (MinIO presigned URL), and multi-tenant + RBAC (`prompt:*` / `route:*` / `calltask:*` / `call:view` / `tenant:*`). Data model: Drizzle maps `callbot.*` tables read-only (same snake_case column names as agent-flow SQLAlchemy); `prompt_config` / `prompt_version` / `inbound_route` / `call_task` are built by agent-flow alembic, `console_auth.*` (Better Auth + tenant/user_tenant/session) built by console migrations. DID routing: triple `(tenant_id, biz_type, scenario)` resolved by agent-flow at CHANNEL_ANSWER (not hardcoded in dialplan), so adding DIDs/tenants/scenarios in console takes effect immediately without touching FreeSWITCH.
+**console** — Next.js 15 (App Router) + Drizzle ORM + Better Auth management console (port 3001, `console/server/`). Shares the same `callbot` PostgreSQL schema and Redis instance as agent-flow — publish/rollback directly deletes Redis key `cb:prompt:{tenant_id}:{biz_type}:{scenario}` for zero-latency config propagation. Capabilities: three-dimension prompt management (draft/publish/version-rollback/clone/variable-render test), DID inbound route CRUD (`callbot.inbound_route`), outbound call task definitions (`callbot.call_task`) — execution by agent-flow `OutboundExecutor` (tick 轮询 + 时段/并发控制 + CAS 认领 + originate + redial), read-only call records list + detail + recording replay (MinIO presigned URL), and multi-tenant + RBAC (`prompt:*` / `route:*` / `calltask:*` / `call:view` / `tenant:*`). Data model: Drizzle maps `callbot.*` tables read-only (same snake_case column names as agent-flow SQLAlchemy); `prompt_config` / `prompt_version` / `inbound_route` / `call_task` are built by agent-flow alembic, `console.*` (Better Auth + tenant/user_tenant/session) built by console migrations. DID routing: triple `(tenant_id, biz_type, scenario)` resolved by agent-flow at CHANNEL_ANSWER (not hardcoded in dialplan), so adding DIDs/tenants/scenarios in console takes effect immediately without touching FreeSWITCH.
 
 ### LangGraph 7-Node Pipeline
 
@@ -312,7 +330,7 @@ Isolation key is the `(tenant_id, biz_type, scenario)` triple (plus `user_key` f
 - PostgreSQL: `tenant_id` + `biz_type` columns on business tables; sharding strategy: 单表起步，后期 Citus/pgcat 水平扩展，分布键 `user_id`（非 biz_type / tenant_id）
 - Prompts: `callbot.prompt_config` keyed by `(tenant_id, biz_type, scenario)` UNIQUE; `prompt_version` snapshot for rollback; loaded via Redis→DB two-level fallback (`prompt_config.py`) + variable rendering (`render.py`); managed by console (`console/server`)
 - Inbound routing: `callbot.inbound_route` maps DID/号段 → `(tenant_id, biz_type, scenario)`, resolved by agent-flow at CHANNEL_ANSWER
-- Outbound tasks: `callbot.call_task` (definition layer only — no originate/scheduler/redial engine yet)
+- Outbound tasks: `callbot.call_task` (任务定义) + `call_target` (待拨号码队列) — agent-flow `OutboundExecutor` 已实现执行引擎：tick 轮询 (`outbound_scheduler_tick_sec`) + `allowed_hours` 时段调度 + per-task `concurrent_limit`/全局并发 + CAS 认领 (pending→dialing) + `originate` + `redial` (按 Hangup-Cause + `redial_strategy` 重拨)；originate 注入 ai_outbound 三元组 channel vars，摘机触发 CHANNEL_ANSWER 复用 inbound 管线
 - Credit query: only marketing biz_type
 - Console RBAC: `prompt:*` / `route:*` / `calltask:*` / `call:view` / `tenant:*`, scoped per `tenant_id` (cross-tenant returns 404 to avoid existence leakage); `session.active_tenant_id ?? user.tenant_id ?? 'default'`
 
@@ -334,6 +352,7 @@ Full adaptive + corrective RAG inside `rag_retrieve_node`:
 - **Remote engines**: `VIBEVOICE_ASR_API_URL`, `VIBEVOICE_TTS_API_URL`
 - **RAG**: `CALLBOT_RAG_TOP_K` (default 3), `CALLBOT_RAG_SIMILARITY_THRESHOLD` (default 0.7), `CALLBOT_RAG_MAX_RETRIES` (default 2)
 - **ESL**: `CALLBOT_ESL_HOST`, `CALLBOT_ESL_PORT` (default 8021), `CALLBOT_ESL_PASSWORD`, `CALLBOT_HANDOFF_EXT` (default 1001)
+- **Outbound 外呼执行器**: `CALLBOT_OUTBOUND_ENDPOINT_TEMPLATE` (default `user/{phone}@{domain}` — 本地注册分机直连；外呼真实号码需改 `sofia/gateway/<gw>/{phone}`), `CALLBOT_OUTBOUND_DOMAIN` (软电话注册域，= FS `local_ip_v4`), `CALLBOT_OUTBOUND_CODEC_STRING` (default `PCMA`), `CALLBOT_OUTBOUND_CALLER_ID` (主叫号，分机验证阶段可空), `CALLBOT_OUTBOUND_SCHEDULER_TICK_SEC` (default 10), `CALLBOT_OUTBOUND_GLOBAL_CONCURRENCY` (default 0 = 不限，仅 per-task `concurrent_limit` 生效)
 - **VAD engine**: `CALLBOT_VAD_TYPE` (default `webrtc`, optional `silero` — neural network, higher accuracy)
 - **VAD — WebRTC params**: `CALLBOT_VAD_AGGRESSIVENESS` (0-3), `CALLBOT_VAD_SILENCE_FRAMES` (default 15)
 - **VAD — Silero params**: `CALLBOT_VAD_SILERO_THRESHOLD` (default 0.3), `CALLBOT_VAD_SILERO_MIN_SILENCE_MS` (default 300)
@@ -396,10 +415,13 @@ Full adaptive + corrective RAG inside `rag_retrieve_node`:
 | `src/memory/store.py` | PG fact + vector data access |
 | `src/rag/retriever.py` | Agentic RAG: adaptive retrieval + document grading + query rewriting |
 | `src/graph/render.py` | `render(template, vars_context)` — prompt template variable substitution (MCP + memory + call_task vars) |
-| `src/db/models.py` | SQLAlchemy 2.0 ORM models (callbot schema, 12 tables: call_session, call_turn, call_event, call_artifact, config_snapshot, user_memory_fact, user_memory_vector, script_library, prompt_config, prompt_version, inbound_route, call_task) |
+| `src/db/models.py` | SQLAlchemy 2.0 ORM models (callbot schema, 13 tables: call_session, call_turn, call_event, call_artifact, config_snapshot, user_memory_fact, user_memory_vector, script_library, prompt_config, prompt_version, inbound_route, call_task, call_target) |
 | `src/storage/repository.py` | Async repository for sessions/turns/events/artifacts |
 | `src/storage/minio_storage.py` | MinIO object storage client — audio + recording upload (`upload_recording`) / download / presigned URL by tenant_id + biz_type |
 | `src/storage/persistence_helpers.py` | `fire_insert_turn` / `fire_insert_event` — fire-and-forget PG double-write (turns + events) alongside Redis save_turn |
+| `src/outbound/executor.py` | `OutboundExecutor` — 外呼调度单例 (lifespan 启停)：tick 轮询 `running` 任务 → `allowed_hours` 时段校验 → 并发槽位 → CAS 认领 `call_target` (pending→dialing) → `bgapi originate` (fire-and-forget) |
+| `src/outbound/originate.py` | `build_originate_command()` — 构造 originate 串，注入 ai_outbound 三元组 channel vars，endpoint `user/{phone}@{domain}` (B-leg `&playback(silence_stream://-1)`)，摘机触发 CHANNEL_ANSWER 复用 inbound 管线 |
+| `src/outbound/{schedule,redial}.py` | `is_within_allowed_hours()` 时段判定 / `decide_redial()` 按 Hangup-Cause + `redial_strategy` 判重拨或终态 (done/failed) |
 
 ### Project Structure
 
@@ -444,17 +466,17 @@ aiphone/
 │   │   ├── llm/         # service.py, json_stream.py, sentence_splitter.py
 │   │   ├── memory/      # assembler.py, chat_history.py, redis_memory.py, store.py
 │   │   ├── rag/         # retriever.py (Agentic RAG)
-│   │   ├── db/          # models.py (ORM, 12 tables)
+│   │   ├── db/          # models.py (ORM, 13 tables)
 │   │   └── storage/     # repository.py, minio_storage.py (upload_recording), persistence_helpers.py (fire-and-forget)
 │   ├── llm/             # Qwen LLM 推理引擎 Dockerfile (vLLM)
-│   ├── alembic/         # DB migrations (0001_initial_schema, 0002_prompt_config, 0003_prompt_pipeline_align)
+│   ├── alembic/         # DB migrations (0001_init_full_schema — 合并旧 0001-0005 全量初始化)
 │   ├── alembic.ini      # Alembic config
 │   ├── requirements.txt # Python dependencies
 │   ├── Dockerfile       # Application image (auto alembic upgrade head)
 │   ├── README.md        # Component docs
 │   └── tests/           # (empty, pending)
 ├── agent-mcp/                # MCP servers (user center backend)
-│   └── java-mcp-server/ # Spring Boot 4.0 + Spring AI 2.0 stateless MCP server
+│   └── java-mcp-server/ # Spring Boot 4.0 + Spring AI 2.0.0 (GA) stateless MCP server
 │       ├── src/main/java/com/trans/mcp/
 │       │   ├── McpApplication.java     # Entry point (annotation-scanner auto-registers tools)
 │       │   ├── model/                  # IdentityResult, CreditResult records
@@ -476,7 +498,7 @@ aiphone/
 │   └── server/
 │       ├── src/app/      # App Router pages (calls, call-tasks, inbound-routes, prompts, tenants, login) + route handlers (/api/prompts, /api/calls, /api/inbound-routes, /api/call-tasks, /api/tenants, /api/session)
 │       ├── src/lib/      # services (prompts/calls/routes/call-tasks) + minio/redis/llm/perms/auth-client
-│       ├── src/db/       # schema.ts (Drizzle 只读映射 callbot.*), migrations (0001_console_auth, 0002_tenant_management), seed
+│       ├── src/db/       # schema.ts (Drizzle 只读映射 callbot.*), migrations (0001_init_console.sql), seed
 │       ├── src/components/ # ConsoleShell, CallRecordsList, CallDetail, PromptManager, InboundRoutesManager, CallTasksManager, TenantsManager, TenantSwitcher
 │       ├── auth.ts / src/auth/session.ts  # Better Auth (本地账密 + active_tenant_id)
 │       ├── ecosystem.config.cjs  # PM2 部署
@@ -496,11 +518,11 @@ aiphone/
 
 ### Infrastructure
 
-- **PostgreSQL 17** with pgvector extension, schema `callbot`, 12 tables (call_session, call_turn, call_event, call_artifact, config_snapshot, user_memory_fact, user_memory_vector, script_library, prompt_config, prompt_version, inbound_route, call_task); Console adds `console_auth` schema (Better Auth: user/session/account/verification + tenant/user_tenant)
+- **PostgreSQL 17** with pgvector extension, schema `callbot`, 13 tables (call_session, call_turn, call_event, call_artifact, config_snapshot, user_memory_fact, user_memory_vector, script_library, prompt_config, prompt_version, inbound_route, call_task, call_target); Console adds `console` schema (Better Auth: user/session/account/verification + tenant/user_tenant)
 - **Redis** for hot memory, conversation history (langchain-redis), session state, prompt cache (5min TTL)
 - **MinIO** for audio archiving (optional, disabled when `MINIO_ENDPOINT` empty)
 - **FreeSWITCH 1.11.0** compiled from source with mod_audio_fork + mod_event_socket (ESL)
-- **Java MCP Server** Spring Boot 4.0 + Spring AI 2.0, Java 21, Maven build, `@McpTool` annotation-driven tool registration
+- **Java MCP Server** Spring Boot 4.0 + Spring AI 2.0.0 (GA), Java 21, Maven build, `@McpTool` annotation-driven tool registration
 - **GPU allocation**: ASR=GPU0 (agent-asr内置), TTS=GPU1 (agent-tts内置), LLM(Qwen3.5:9B)=GPU2(:8083)
 - **uvloop**: libuv C-based event loop replacing std asyncio in agent-flow (via `--loop uvloop`), reduces GC pauses under high concurrency
 - **gRPC**: ASR client-streaming (:50051), TTS unary (:50052), both optional feature-flagged alongside HTTP fallback
