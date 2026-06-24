@@ -29,7 +29,7 @@ export default function LoginPage() {
     <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-slate-100 to-indigo-50 p-4">
       <div className="w-full max-w-sm bg-white rounded-2xl border border-slate-100 shadow-sm p-8 space-y-6">
         <div className="space-y-1 text-center">
-          <h1 className="text-lg font-bold text-slate-800">智能外呼管理控制台</h1>
+          <h1 className="text-lg font-bold text-slate-800">智能外呼控制台</h1>
           <p className="text-xs text-slate-500">登录以管理提示词配置</p>
         </div>
 

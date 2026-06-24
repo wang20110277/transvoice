@@ -1,4 +1,4 @@
-# 智能外呼管理控制台 (console/server)
+# 智能外呼控制台 (console/server)
 
 Next.js 15 (App Router) + Drizzle ORM + Better Auth 后端,管理提示词配置。
 与 agent-flow 共用同一物理库(`callbot` schema)、同一 Redis 实例,发布即零延迟生效。

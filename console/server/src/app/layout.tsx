@@ -2,7 +2,7 @@ import type { Metadata } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: '智能外呼管理控制台',
+  title: '智能外呼控制台',
   description: '提示词配置管理 · 多租户 · 版本控制',
 };
 
