@@ -33,13 +33,20 @@ cd agent-flow && PYTHONPATH=$(pwd):$(pwd)/src uvicorn main:app --host 0.0.0.0 --
 
 - **Redis 缓存**: `cb:prompt:{biz_system}:{biz_type}`，TTL 5 分钟
 - **数据库降级**: Redis miss 时查询 `callbot.prompt_config` WHERE `is_active=true`
-- **初始化数据**: `alembic/versions/0002_prompt_config.py` 包含三种业务类型的默认提示词
+- **初始化数据**: `alembic/versions/0001_init_full_schema.py` 内置三种业务类型默认提示词（seed）
 
 修改提示词后调用 `invalidate_prompt_cache()` 清除 Redis 缓存。
 
 ## 数据库迁移
 
+单个全量初始化 migration `0001_init_full_schema.py`（13 表 + 全字段中文 COMMENT + seed）。
+
 ```bash
+# 全新库：直接 upgrade
+cd agent-flow && PYTHONPATH=$(pwd)/src alembic upgrade head
+
+# 已有库（alembic_version 记着旧版本）：须先手动清库再 upgrade（数据全丢）
+docker exec callbot-postgres psql -U postgres -d callbot -c 'DROP SCHEMA IF EXISTS callbot CASCADE;'
 cd agent-flow && PYTHONPATH=$(pwd)/src alembic upgrade head
 ```
 

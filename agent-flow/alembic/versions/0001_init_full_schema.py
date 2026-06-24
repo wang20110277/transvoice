@@ -1,8 +1,18 @@
-"""initial schema
+"""initial full schema (合并旧 0001-0005)
 
 Revision ID: 0001
 Revises:
-Create Date: 2026-05-16
+Create Date: 2026-06-24
+
+全量初始化 callbot schema —— 合并旧 0001-0005 五个增量 migration 为单个文件，
+所有表/字段补齐中文 COMMENT。
+
+⚠️ 已有库升级 SOP（不可省略）：
+   旧库的 callbot.alembic_version 记着 0001-0005，且 migration 不能在自身事务里 DROP schema
+   （会连 alembic_version 一起删，导致 stamp 失败）。必须先手动清库再 upgrade：
+       psql "$DATABASE_URL" -c 'DROP SCHEMA IF EXISTS callbot CASCADE;'
+       alembic upgrade head
+   全新库直接 alembic upgrade head 即可（本 migration 只在空 schema 上建表）。
 """
 from typing import Sequence, Union
 
@@ -23,7 +33,7 @@ def _comment(table: str, column: str, comment: str) -> None:
 
 
 def upgrade() -> None:
-    # --- extensions & schema ---
+    # ── 扩展 + schema（env.py 已 CREATE SCHEMA IF NOT EXISTS，此处幂等）──
     op.execute('CREATE EXTENSION IF NOT EXISTS vector')
     op.execute(f'CREATE SCHEMA IF NOT EXISTS {SCHEMA}')
 
@@ -48,6 +58,11 @@ def upgrade() -> None:
         sa.Column('identity_verified', sa.Boolean(), nullable=False, server_default='false'),
         sa.Column('verify_attempts', sa.Integer(), nullable=False, server_default='0'),
         sa.Column('recording_notice_played', sa.Boolean(), nullable=False, server_default='false'),
+        sa.Column('tenant_id', sa.Text(), nullable=True),
+        sa.Column('scenario', sa.Text(), nullable=True),
+        # 外呼关联：最终无外键约束（旧 0005 已 drop），由应用层维护关联删除
+        sa.Column('call_task_id', sa.BigInteger(), nullable=True),
+        sa.Column('call_target_id', sa.BigInteger(), nullable=True),
         sa.Column('create_time', sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.Column('create_user', sa.Text(), nullable=False, server_default="'system'"),
         sa.Column('update_time', sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
@@ -71,17 +86,21 @@ def upgrade() -> None:
     _comment('call_session', 'call_id', '通话唯一标识(UUID)')
     _comment('call_session', 'fs_uuid', 'FreeSWITCH 通道标识(UUID)')
     _comment('call_session', 'biz_type', '业务类型: customer_service/collection/marketing')
-    _comment('call_session', 'task_id', '外呼任务ID')
+    _comment('call_session', 'task_id', '外呼任务ID(业务串)')
     _comment('call_session', 'phone_hash', '手机号哈希')
     _comment('call_session', 'user_key', '用户唯一标识(脱敏手机号+身份证后四位)')
     _comment('call_session', 'phone_masked', '脱敏手机号(138****1234)')
     _comment('call_session', 'start_ts', '通话开始时间')
     _comment('call_session', 'end_ts', '通话结束时间')
     _comment('call_session', 'result_code', '通话结果编码')
-    _comment('call_session', 'hangup_cause', '挂机原因')
+    _comment('call_session', 'hangup_cause', '挂断原因')
     _comment('call_session', 'identity_verified', '是否已完成身份验证')
     _comment('call_session', 'verify_attempts', '身份验证尝试次数')
     _comment('call_session', 'recording_notice_played', '是否已播放录音告知')
+    _comment('call_session', 'tenant_id', '租户ID(多租户隔离)')
+    _comment('call_session', 'scenario', '话术场景(与 prompt_config.scenario 对齐)')
+    _comment('call_session', 'call_task_id', '外呼任务ID(关联 call_task.id，外呼通话非空，无外键约束)')
+    _comment('call_session', 'call_target_id', '外呼号码清单ID(关联 call_target.id，外呼通话非空)')
     _comment('call_session', 'create_time', '记录创建时间')
     _comment('call_session', 'create_user', '记录创建人')
     _comment('call_session', 'update_time', '记录更新时间')
@@ -398,7 +417,203 @@ def upgrade() -> None:
     _comment('script_library', 'update_user', '记录更新人')
 
     # ============================================================
-    # 向量索引 — IVFFlat 余弦相似度
+    # prompt_config — 提示词配置表（必须在 call_task 之前，后者外键引用）
+    # ============================================================
+    op.execute(f'''
+        CREATE TABLE {SCHEMA}.prompt_config (
+            id              BIGSERIAL    PRIMARY KEY,
+            tenant_id       TEXT         NOT NULL DEFAULT 'default',
+            biz_type        TEXT         NOT NULL,
+            scenario        TEXT         NOT NULL DEFAULT 'default',
+            system_prompt   TEXT         NOT NULL,
+            max_reply_length INTEGER     NOT NULL DEFAULT 80,
+            extra           JSONB        NOT NULL DEFAULT '{{}}'::jsonb,
+            is_active       BOOLEAN      NOT NULL DEFAULT TRUE,
+            version         INTEGER      NOT NULL DEFAULT 1,
+            description     TEXT,
+            create_time     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+            create_user     TEXT         NOT NULL DEFAULT 'system',
+            update_time     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+            update_user     TEXT         NOT NULL DEFAULT 'system',
+            CONSTRAINT uq_prompt_config_tenant_biz_scenario UNIQUE (tenant_id, biz_type, scenario)
+        )
+    ''')
+    op.execute(f'CREATE INDEX ix_prompt_config_biz_type ON {SCHEMA}.prompt_config (biz_type)')
+    op.execute(f'CREATE INDEX ix_prompt_config_tenant_biz ON {SCHEMA}.prompt_config (tenant_id, biz_type)')
+
+    op.execute(f"COMMENT ON TABLE {SCHEMA}.prompt_config IS '提示词配置表 — 按(租户,业务场景,话术场景)三维度管理系统提示词'")
+    _comment('prompt_config', 'id', '自增主键')
+    _comment('prompt_config', 'tenant_id', '租户ID(多租户隔离)')
+    _comment('prompt_config', 'biz_type', '业务类型: customer_service/collection/marketing')
+    _comment('prompt_config', 'scenario', '话术场景(同一业务下不同话术分支)')
+    _comment('prompt_config', 'system_prompt', '系统提示词全文')
+    _comment('prompt_config', 'max_reply_length', '单次回复最大字数')
+    _comment('prompt_config', 'extra', '扩展配置(JSON)')
+    _comment('prompt_config', 'is_active', '是否启用')
+    _comment('prompt_config', 'version', '当前版本号(每次编辑递增，对应 prompt_version 快照)')
+    _comment('prompt_config', 'description', '描述说明')
+    _comment('prompt_config', 'create_time', '记录创建时间')
+    _comment('prompt_config', 'create_user', '记录创建人')
+    _comment('prompt_config', 'update_time', '记录更新时间')
+    _comment('prompt_config', 'update_user', '记录更新人')
+
+    # ============================================================
+    # prompt_version — 提示词版本快照表
+    # ============================================================
+    op.execute(f'''
+        CREATE TABLE {SCHEMA}.prompt_version (
+            id            BIGSERIAL    PRIMARY KEY,
+            tenant_id     TEXT         NOT NULL,
+            biz_type      TEXT         NOT NULL,
+            scenario      TEXT         NOT NULL,
+            system_prompt TEXT         NOT NULL,
+            version       INTEGER      NOT NULL,
+            snapshot      JSONB        NOT NULL DEFAULT '{{}}'::jsonb,
+            update_user   TEXT         NOT NULL DEFAULT 'system',
+            update_time   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+        )
+    ''')
+    op.execute(
+        f'CREATE INDEX ix_prompt_version_lookup '
+        f'ON {SCHEMA}.prompt_version (tenant_id, biz_type, scenario, version)'
+    )
+
+    op.execute(f"COMMENT ON TABLE {SCHEMA}.prompt_version IS '提示词版本快照表 — 支撑版本历史查看与回滚'")
+    _comment('prompt_version', 'id', '自增主键')
+    _comment('prompt_version', 'tenant_id', '租户ID')
+    _comment('prompt_version', 'biz_type', '业务类型: customer_service/collection/marketing')
+    _comment('prompt_version', 'scenario', '话术场景')
+    _comment('prompt_version', 'system_prompt', '该版本系统提示词全文')
+    _comment('prompt_version', 'version', '版本号')
+    _comment('prompt_version', 'snapshot', '版本快照(JSON，含编辑人/时间/变更说明等)')
+    _comment('prompt_version', 'update_user', '更新人(本表仅记更新审计，无 create_*)')
+    _comment('prompt_version', 'update_time', '更新时间')
+
+    # ============================================================
+    # inbound_route — 呼入 DID 路由表
+    # ============================================================
+    op.execute(f'''
+        CREATE TABLE {SCHEMA}.inbound_route (
+            id          BIGSERIAL    PRIMARY KEY,
+            did         TEXT         NOT NULL,
+            did_pattern TEXT,
+            tenant_id   TEXT         NOT NULL,
+            biz_type    TEXT         NOT NULL,
+            scenario    TEXT         NOT NULL DEFAULT 'default',
+            is_active   BOOLEAN      NOT NULL DEFAULT TRUE,
+            description TEXT,
+            create_time TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+            create_user TEXT         NOT NULL DEFAULT 'system',
+            update_time TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+            update_user TEXT         NOT NULL DEFAULT 'system',
+            CONSTRAINT uq_inbound_route_did UNIQUE (did)
+        )
+    ''')
+
+    op.execute(f"COMMENT ON TABLE {SCHEMA}.inbound_route IS '呼入 DID 路由表 — 被叫号/号段→(租户,业务场景,话术场景)'")
+    _comment('inbound_route', 'id', '自增主键')
+    _comment('inbound_route', 'did', '被叫号码(如 8001)')
+    _comment('inbound_route', 'did_pattern', '被叫号段匹配模式(可空)')
+    _comment('inbound_route', 'tenant_id', '路由目标租户ID')
+    _comment('inbound_route', 'biz_type', '路由目标业务类型: customer_service/collection/marketing')
+    _comment('inbound_route', 'scenario', '路由目标话术场景')
+    _comment('inbound_route', 'is_active', '是否启用')
+    _comment('inbound_route', 'description', '描述说明(如 客服呼入线)')
+    _comment('inbound_route', 'create_time', '记录创建时间')
+    _comment('inbound_route', 'create_user', '记录创建人')
+    _comment('inbound_route', 'update_time', '记录更新时间')
+    _comment('inbound_route', 'update_user', '记录更新人')
+
+    # ============================================================
+    # call_task — 外呼任务定义表（prompt_id 外键 → prompt_config.id）
+    # ============================================================
+    op.execute(f'''
+        CREATE TABLE {SCHEMA}.call_task (
+            id                BIGSERIAL    PRIMARY KEY,
+            tenant_id         TEXT         NOT NULL,
+            name              TEXT         NOT NULL,
+            prompt_id         BIGINT       NOT NULL REFERENCES {SCHEMA}.prompt_config(id),
+            kb_ids            JSONB        NOT NULL DEFAULT '[]'::jsonb,
+            status            TEXT         NOT NULL DEFAULT 'idle',
+            concurrent_limit  INTEGER      NOT NULL DEFAULT 1,
+            allowed_hours     TEXT,
+            redial_strategy   JSONB        NOT NULL DEFAULT '{{}}'::jsonb,
+            dept_id           TEXT,
+            description       TEXT,
+            create_time       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+            create_user       TEXT         NOT NULL DEFAULT 'system',
+            update_time       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+            update_user       TEXT         NOT NULL DEFAULT 'system'
+        )
+    ''')
+    op.execute(f'CREATE INDEX ix_call_task_tenant ON {SCHEMA}.call_task (tenant_id)')
+
+    op.execute(f"COMMENT ON TABLE {SCHEMA}.call_task IS '外呼任务定义表 — 仅定义层(promptId绑定+策略参数)'")
+    _comment('call_task', 'id', '自增主键')
+    _comment('call_task', 'tenant_id', '租户ID')
+    _comment('call_task', 'name', '任务名称')
+    _comment('call_task', 'prompt_id', '关联的提示词配置ID(外键→prompt_config.id)')
+    _comment('call_task', 'kb_ids', '关联的话术知识库ID列表(JSON)')
+    _comment('call_task', 'status', '任务状态: idle/running/paused/completed/failed')
+    _comment('call_task', 'concurrent_limit', '并发呼叫上限')
+    _comment('call_task', 'allowed_hours', '允许外呼时段(如 09:00-21:00)')
+    _comment('call_task', 'redial_strategy', '重拨策略(JSON，含次数/退避等)')
+    _comment('call_task', 'dept_id', '所属部门ID')
+    _comment('call_task', 'description', '描述说明')
+    _comment('call_task', 'create_time', '记录创建时间')
+    _comment('call_task', 'create_user', '记录创建人')
+    _comment('call_task', 'update_time', '记录更新时间')
+    _comment('call_task', 'update_user', '记录更新人')
+
+    # ============================================================
+    # call_target — 外呼号码清单表（最终无外键约束，task_id 仅裸列）
+    # ============================================================
+    op.execute(f'''
+        CREATE TABLE {SCHEMA}.call_target (
+            id                  BIGSERIAL     PRIMARY KEY,
+            task_id             BIGINT        NOT NULL,
+            tenant_id           TEXT          NOT NULL,
+            phone_hash          TEXT          NOT NULL,
+            phone_masked        TEXT,
+            user_key            TEXT          NOT NULL,
+            status              TEXT          NOT NULL DEFAULT 'pending',
+            attempt_count       INTEGER       NOT NULL DEFAULT 0,
+            max_attempts        INTEGER       NOT NULL DEFAULT 1,
+            next_attempt_ts     TIMESTAMPTZ,
+            last_call_session_id BIGINT,
+            last_hangup_cause   TEXT,
+            create_time         TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+            create_user         TEXT          NOT NULL DEFAULT 'system',
+            update_time         TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+            update_user         TEXT          NOT NULL DEFAULT 'system',
+            CONSTRAINT uq_call_target_task_phone UNIQUE (task_id, phone_hash)
+        )
+    ''')
+    op.execute(
+        f'CREATE INDEX ix_call_target_task_status '
+        f'ON {SCHEMA}.call_target (task_id, status)'
+    )
+
+    op.execute(f"COMMENT ON TABLE {SCHEMA}.call_target IS '外呼号码清单表 — 每个(task_id,phone_hash)唯一'")
+    _comment('call_target', 'id', '自增主键')
+    _comment('call_target', 'task_id', '所属外呼任务ID(关联 call_task.id，无外键约束，应用层维护从属删除)')
+    _comment('call_target', 'tenant_id', '租户ID')
+    _comment('call_target', 'phone_hash', '手机号哈希(去重键，与 agent-flow _phone_hash sha256 对齐)')
+    _comment('call_target', 'phone_masked', '脱敏手机号(138****1234)')
+    _comment('call_target', 'user_key', '用户唯一标识(明文号码)')
+    _comment('call_target', 'status', '拨打状态: pending/dialing/answered/no_answer/failed/done')
+    _comment('call_target', 'attempt_count', '已尝试拨打次数')
+    _comment('call_target', 'max_attempts', '最大允许拨打次数')
+    _comment('call_target', 'next_attempt_ts', '下次可拨打时间(重拨退避用)')
+    _comment('call_target', 'last_call_session_id', '最近一次通话会话ID')
+    _comment('call_target', 'last_hangup_cause', '最近一次挂机原因')
+    _comment('call_target', 'create_time', '记录创建时间')
+    _comment('call_target', 'create_user', '记录创建人')
+    _comment('call_target', 'update_time', '记录更新时间')
+    _comment('call_target', 'update_user', '记录更新人')
+
+    # ============================================================
+    # 向量索引 — IVFFlat 余弦相似度（空表建索引才有效，放 seed 之前）
     # ============================================================
     op.execute(f'''
         CREATE INDEX ix_mem_vec_embedding
@@ -413,14 +628,52 @@ def upgrade() -> None:
         WITH (lists = 100)
     ''')
 
+    # ============================================================
+    # seed 数据
+    # ============================================================
+    # prompt_config 3 行（三维度 default/业务/default）
+    op.execute(f'''
+        INSERT INTO {SCHEMA}.prompt_config (tenant_id, biz_type, scenario, system_prompt, max_reply_length, description) VALUES
+        ('default', 'customer_service', 'default',
+         '你是一名电话客服AI助手。语气温柔、专业、有耐心。
+回答用户问题，必要时转接人工。始终使用中文回复。
+
+【语音对话规则】
+- 每次回复不超过80字，口语化表达，禁止使用 markdown 格式（不要用标题、列表、代码块、加粗等）
+- 一次只说一到两句话，说完后等待用户回应
+- 不要主动罗列多项内容，用户问什么答什么
+- 直接回复用户问题，不要自言自语或思考',
+         80, '客服场景默认提示词'),
+
+        ('default', 'collection', 'default',
+         '你是一名催收专员AI助手。语气专业、不威胁。
+严格规则：仅在身份核验通过后才能提及具体欠款金额。
+每次回复不超过50字。始终使用中文回复。
+
+【语音对话规则】
+- 口语化表达，禁止使用 markdown 格式
+- 直接回复用户问题，不要自言自语或思考',
+         50, '催收场景默认提示词'),
+
+        ('default', 'marketing', 'default',
+         '你是一名营销AI助手。语气热情、活力、有感染力。
+介绍产品优势，引导用户兴趣。每次回复不超过80字。始终使用中文回复。
+
+【语音对话规则】
+- 口语化表达，禁止使用 markdown 格式
+- 一次只说一到两句话，说完后等待用户回应
+- 直接回复用户问题，不要自言自语或思考',
+         80, '营销场景默认提示词')
+    ''')
+
+    # inbound_route 3 行（对齐 dialplan 8001/8002/8003）
+    op.execute(f'''
+        INSERT INTO {SCHEMA}.inbound_route (did, tenant_id, biz_type, scenario, description) VALUES
+        ('8001', 'default', 'customer_service', 'default', '客服呼入线'),
+        ('8002', 'default', 'collection', 'default', '催收呼入线'),
+        ('8003', 'default', 'marketing', 'default', '营销呼入线')
+    ''')
+
 
 def downgrade() -> None:
-    op.execute(f'DROP TABLE IF EXISTS {SCHEMA}.script_library')
-    op.execute(f'DROP TABLE IF EXISTS {SCHEMA}.user_memory_vector')
-    op.drop_table('user_memory_fact', schema=SCHEMA)
-    op.drop_table('config_snapshot', schema=SCHEMA)
-    op.drop_table('call_artifact', schema=SCHEMA)
-    op.drop_table('call_event', schema=SCHEMA)
-    op.drop_table('call_turn', schema=SCHEMA)
-    op.drop_table('call_session', schema=SCHEMA)
-    op.execute(f'DROP SCHEMA IF EXISTS {SCHEMA}')
+    op.execute(f'DROP SCHEMA IF EXISTS {SCHEMA} CASCADE')
