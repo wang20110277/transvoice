@@ -185,6 +185,29 @@ async def _init_ws_clients() -> tuple[ASRWebSocketClient | None, TTSWebSocketCli
 # ESL 事件处理
 # ═══════════════════════════════════════════════════════════════════
 
+def _parse_int_var(value: str | None) -> int | None:
+    """ESL channel vars 是字符串；把 None/空/非数字安全解析为 int（失败返回 None）。"""
+    if not value:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _hangup_cause_to_outbound_status(hangup_cause: str) -> str:
+    """外呼挂断原因 → call_target 状态。
+
+    NORMAL_CLEARING=被叫接通后挂断（接通成功）；NO_ANSWER/RECOVERY_ON_TIMER_EXPIRE=振铃未接；
+    其余按失败。重拨与否由 hangup 分支按 redial_strategy 再判。
+    """
+    if hangup_cause == "NORMAL_CLEARING":
+        return "answered"
+    if hangup_cause in ("NO_ANSWER", "RECOVERY_ON_TIMER_EXPIRE"):
+        return "no_answer"
+    return "failed"
+
+
 async def _resolve_inbound_dimensions(did: str) -> tuple[str, str, str] | None:
     """查 inbound_route 把 DID 解析为 (tenant_id, biz_type, scenario)。
 
@@ -252,6 +275,25 @@ def _create_esl_event_handlers(esl: ESLClient) -> None:
                 )
             )
 
+        # 外呼结果回写：按 Hangup-Cause 更新 call_target 状态
+        # （M1 仅回写终态/中间态；M3 在此基础上加重拨判定）
+        call_target_id = _parse_int_var(event.headers.get("variable_call_target_id"))
+        if call_target_id is not None:
+            target_status = _hangup_cause_to_outbound_status(hangup_cause)
+            session_id = None
+            try:
+                sess = await repository.get_call_session_by_fs_uuid(uuid)
+                if sess is not None:
+                    session_id = sess.id
+            except Exception as e:
+                logger.error("[%s] get_call_session for target outcome failed: %s", uuid, e)
+            try:
+                await repository.update_call_target_outcome(
+                    call_target_id, target_status, hangup_cause, session_id,
+                )
+            except Exception as e:
+                logger.error("[%s] update_call_target_outcome failed: %s", uuid, e)
+
         try:
             await esl.audio_fork_stop(uuid)
         except Exception:
@@ -274,33 +316,48 @@ def _create_esl_event_handlers(esl: ESLClient) -> None:
             return
         _audio_fork_started.add(uuid)
 
-        biz_type = event.headers.get("variable_biz_type", "marketing")
-        user_key = (
-            event.headers.get("variable_user_key", "")
-            or event.headers.get("Caller-Caller-ID-Number", "")
-        )
+        # 三维度来源分两路：外呼从 channel vars 注入读（originate 时塞），呼入走 DID 解析。
+        # downstream register/audio_fork/record/session 不区分呼入呼出，只认 uuid + 三元组。
+        call_task_id: int | None = None
+        call_target_id: int | None = None
 
-        # DID → (tenant_id, biz_type, scenario);失败回落 dialplan 静态 variable_biz_type
-        did = (
-            event.headers.get("variable_did")
-            or event.headers.get("Caller-Destination-Number")
-            or ""
-        )
-        resolved = await _resolve_inbound_dimensions(did)
-        if resolved:
-            tenant_id, biz_type, scenario = resolved
+        if event.headers.get("variable_ai_outbound"):
+            # 外呼：三元组 + task/target ID 全从 channel vars 读，跳过 DID 解析
+            tenant_id = event.headers.get("variable_tenant_id", "default")
+            biz_type = event.headers.get("variable_biz_type", "marketing")
+            scenario = event.headers.get("variable_scenario", "default")
+            user_key = event.headers.get("variable_user_key", "")
+            call_task_id = _parse_int_var(event.headers.get("variable_call_task_id"))
+            call_target_id = _parse_int_var(event.headers.get("variable_call_target_id"))
         else:
-            tenant_id = "default"
-            scenario = "default"
-            if did:
-                logger.warning(
-                    "[%s] no inbound_route match for did=%s, fallback biz_type=%s",
-                    uuid, did, biz_type,
-                )
+            # 呼入：DID → (tenant_id, biz_type, scenario)；失败回落 dialplan 静态 variable_biz_type
+            biz_type = event.headers.get("variable_biz_type", "marketing")
+            user_key = (
+                event.headers.get("variable_user_key", "")
+                or event.headers.get("Caller-Caller-ID-Number", "")
+            )
+            did = (
+                event.headers.get("variable_did")
+                or event.headers.get("Caller-Destination-Number")
+                or ""
+            )
+            resolved = await _resolve_inbound_dimensions(did)
+            if resolved:
+                tenant_id, biz_type, scenario = resolved
+            else:
+                tenant_id = "default"
+                scenario = "default"
+                if did:
+                    logger.warning(
+                        "[%s] no inbound_route match for did=%s, fallback biz_type=%s",
+                        uuid, did, biz_type,
+                    )
 
         logger.info(
-            "[%s] CHANNEL_ANSWER tenant=%s biz_type=%s scenario=%s user_key=%s",
+            "[%s] CHANNEL_ANSWER tenant=%s biz_type=%s scenario=%s user_key=%s "
+            "outbound=%s task=%s target=%s",
             uuid, tenant_id, biz_type, scenario, user_key,
+            bool(call_target_id), call_task_id, call_target_id,
         )
 
         _call_registry.register(uuid, biz_type, user_key, tenant_id=tenant_id, scenario=scenario)
@@ -315,6 +372,7 @@ def _create_esl_event_handlers(esl: ESLClient) -> None:
                 "phone_masked": _mask_phone(user_key),
                 "start_ts": datetime.now(),
                 "recording_notice_played": settings.recording_notice_enabled,
+                "call_task_id": call_task_id, "call_target_id": call_target_id,
             })
         except Exception as e:
             logger.error("[%s] insert_call_session failed: %s", uuid, e)

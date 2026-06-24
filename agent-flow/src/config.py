@@ -148,6 +148,19 @@ class Settings(BaseSettings):
     recording_archive_delay_sec: int = 3
     recording_notice_sound: str = "ivr/recording_notice.wav"
 
+    # 外呼执行引擎
+    # originate 端点模板：{phone}/{domain} 占位。验证结论：本地注册分机必须用 user/{phone}@{domain}
+    # 直连（sofia/internal/{phone} 会重新进 dialplan 导致循环），domain 取注册域（FS local_ip）。
+    # 后期换 SIP 网关：CALLBOT_OUTBOUND_ENDPOINT_TEMPLATE=sofia/gateway/<gw>/{phone}
+    outbound_endpoint_template: str = "user/{phone}@{domain}"
+    outbound_domain: str = "192.168.0.192"  # 软电话注册域（FS local_ip_v4）
+    # 强制音频编解码：实测 G.722 会让 mod_audio_fork 抓到的帧格式不对、ASR 收不到有效音频，
+    # 必须强制线性编解码 PCMA。空串=不强制（用 profile 默认）。
+    outbound_codec_string: str = "PCMA"
+    outbound_caller_id: str = ""  # 主叫号；分机验证阶段可空
+    outbound_scheduler_tick_sec: int = 10
+    outbound_global_concurrency: int = 0  # 0=不限，仅 per-task concurrent_limit 生效
+
     model_config = {"env_prefix": "CALLBOT_", "env_file": ".env", "extra": "ignore"}
 
 

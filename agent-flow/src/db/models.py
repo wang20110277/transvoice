@@ -48,6 +48,9 @@ class CallSession(Base):
     identity_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     verify_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     recording_notice_played: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # 外呼关联：外呼通话非空，inbound 为 NULL（与既有 task_id 区分；task_id 是 Text 业务串，call_task_id 是 FK）
+    call_task_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("callbot.call_task.id"), nullable=True)
+    call_target_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     create_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
     update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
@@ -343,6 +346,37 @@ class CallTask(Base):
     redial_strategy: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     dept_id: Mapped[str | None] = mapped_column(Text)
     description: Mapped[str | None] = mapped_column(Text)
+    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    create_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
+    update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    update_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
+
+
+class CallTarget(Base):
+    """外呼号码清单表 — 每个 (task_id, phone_hash) 唯一。
+
+    执行器消费：status pending→dialing→answered/no_answer/failed/done；
+    next_attempt_ts 控制重拨退避；attempt_count/max_attempts 限重拨次数。
+    """
+    __tablename__ = "call_target"
+    __table_args__ = (
+        UniqueConstraint("task_id", "phone_hash", name="uq_call_target_task_phone"),
+        Index("ix_call_target_task_status", "task_id", "status"),
+        {"schema": "callbot"},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    task_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("callbot.call_task.id"), nullable=False)
+    tenant_id: Mapped[str] = mapped_column(Text, nullable=False)
+    phone_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    phone_masked: Mapped[str | None] = mapped_column(Text)
+    user_key: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    next_attempt_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_call_session_id: Mapped[int | None] = mapped_column(BigInteger)
+    last_hangup_cause: Mapped[str | None] = mapped_column(Text)
     create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     create_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
     update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
