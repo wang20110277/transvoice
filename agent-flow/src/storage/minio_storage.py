@@ -3,7 +3,6 @@ import asyncio
 import io
 import logging
 import os
-import struct
 import uuid
 from datetime import datetime, timedelta
 
@@ -37,18 +36,6 @@ def build_object_key(prefix: str = "audio", call_id: str = "", suffix: str = "")
     if suffix:
         name = f"{name}_{suffix}"
     return f"{prefix}/{date_str}/{name}.wav"
-
-
-def wrap_wav_header(pcm: bytes, sample_rate: int = 8000, channels: int = 1, bits: int = 16) -> bytes:
-    """为原始 PCM 数据添加 44 字节 WAV 头。"""
-    data_size = len(pcm)
-    fmt_chunk = struct.pack('<4sIHHIIHH',
-        b'fmt ', 16, 1, channels, sample_rate,
-        sample_rate * channels * bits // 8,
-        channels * bits // 8, bits)
-    data_chunk = struct.pack('<4sI', b'data', data_size)
-    riff_header = struct.pack('<4sI', b'RIFF', 36 + data_size)
-    return riff_header + b'WAVE' + fmt_chunk + data_chunk + pcm
 
 
 def upload_audio(audio_bytes: bytes, object_name: str) -> None:

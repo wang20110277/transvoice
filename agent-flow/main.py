@@ -256,6 +256,11 @@ def _create_esl_event_handlers(esl: ESLClient) -> None:
             await esl.audio_fork_stop(uuid)
         except Exception:
             pass
+        # 停止 FS 录制并 flush（channel 可能已 hangup，失败忽略；FS 挂断本会自动落盘）
+        try:
+            await esl.record_stop(uuid)
+        except Exception:
+            pass
         _call_registry.cancel_call(uuid)
 
     async def _on_channel_answer(event):
@@ -318,6 +323,16 @@ def _create_esl_event_handlers(esl: ESLClient) -> None:
         try:
             result = await esl.audio_fork_start(uuid, ws_url, sample_rate=settings.media_sample_rate)
             logger.info("[%s] uuid_audio_fork start → %s: %s", uuid, ws_url, result)
+
+            # FS uuid_record 录整通双声道到标准 recordings 路径（与 _archive_recording 一致）。
+            # 顺序关键：必须在 audio_fork_start 之后发起，record bug 才排在 WRITE_REPLACE 之后，
+            # 从而 tap 到被 dub 后的 AI 下行音频（L=caller / R=AI）。失败 non-fatal，该通无录音。
+            fs_rec_path = os.path.join(settings.recordings_dir, f"{uuid}.wav")
+            try:
+                await esl.record_start(uuid, fs_rec_path)
+                logger.info("[%s] uuid_record start → %s", uuid, fs_rec_path)
+            except Exception as e:
+                logger.error("[%s] uuid_record start failed (non-fatal): %s", uuid, e)
         except Exception as e:
             logger.error("[%s] uuid_audio_fork start failed: %s", uuid, e)
             _call_registry.unregister(uuid)

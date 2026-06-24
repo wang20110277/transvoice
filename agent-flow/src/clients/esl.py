@@ -153,6 +153,22 @@ class ESLClient:
         """停止音频旁路。"""
         return await self.api(f"uuid_audio_fork {uuid} stop")
 
+    # ── Recording (uuid_record) ──
+    #
+    # 整通双声道录音由 FreeSWITCH 完成。必须在 audio_fork_start 之后发起 ——
+    # media_bug 按注册顺序串联，record bug 排在 audio_fork 的 WRITE_REPLACE bug 之后，
+    # 才能在 write 方向 tap 到被 dub_speech_frame 替换后的 AI 下行音频。
+    # RECORD_STEREO=true → 双声道落盘 (L=caller 上行 / R=AI 下行)。
+
+    async def record_start(self, uuid: str, path: str) -> str:
+        """启动 channel 录制 (uuid_record)。先设 RECORD_STEREO 再 start。"""
+        await self.set_var(uuid, "RECORD_STEREO", "true")
+        return await self.bgapi(f"uuid_record {uuid} start {path}")
+
+    async def record_stop(self, uuid: str) -> str:
+        """停止录制并 flush wav 落盘（CHANNEL_HANGUP 后 channel 可能已释放，失败属正常）。"""
+        return await self.api(f"uuid_record {uuid} stop")
+
     async def broadcast_silence(self, uuid: str) -> str:
         """向通话播放无限静音流，保持拨号计划活跃（barge-in打断后重播）。"""
         return await self.bgapi(f"uuid_broadcast {uuid} silence_stream://-1")

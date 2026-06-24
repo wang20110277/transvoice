@@ -16,8 +16,10 @@
           <action application="answer"/>
           <!-- 录音提示音（合规）。本地测试或 wav 不存在时注释此行；缺失文件 FS 仅记日志不影响通话 -->
           <!-- <action application="playback" data="ivr/recording_notice.wav"/> -->
-          <!-- 整通录音由 agent-flow 自录双声道（caller+AI TTS），FS 不再 record_session
-               （FS record_session 录不到 mod_audio_fork 注入的 AI 音频）。agent-flow 挂断后写入此目录并上传 MinIO -->
+          <!-- 整通录音由 FreeSWITCH uuid_record 录制双声道（L=caller / R=AI TTS）—— agent-flow 在
+               audio_fork_start 之后发起 uuid_record（record bug 排在 mod_audio_fork WRITE_REPLACE 之后，
+               方能录到 dub 后的 AI 下行）。dialplan 不用 record_session（会抢在 audio_fork 前注册，录不到
+               AI），仅 playback silence_stream://-1 保活。挂断后 agent-flow 读此目录 wav 上传 MinIO -->
           <action application="playback" data="silence_stream://-1"/>
         </condition>
       </extension>
