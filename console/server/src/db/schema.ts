@@ -3,7 +3,7 @@
  * 杜绝双词汇表。prompt_config / prompt_version 由 agent-flow alembic 建表,
  * Console 仅作类型映射,不改 DDL。
  *
- * Better Auth 自带表放 console_auth 独立 schema,不污染 callbot。
+ * Better Auth 自带表放 console 独立 schema,不污染 callbot。
  */
 import { sql } from 'drizzle-orm';
 import {
@@ -253,9 +253,9 @@ export type CallTurn = typeof callTurn.$inferSelect;
 export type CallEvent = typeof callEvent.$inferSelect;
 export type CallArtifact = typeof callArtifact.$inferSelect;
 
-// ── console_auth schema(Better Auth 自带) ───────────────────────────
+// ── console schema(Better Auth 自带) ────────────────────────────────
 
-export const consoleAuth = pgSchema('console_auth');
+export const consoleAuth = pgSchema('console');
 
 export const user = consoleAuth.table('user', {
   id: text('id').primaryKey(),
@@ -313,7 +313,7 @@ export const verification = consoleAuth.table('verification', {
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
 });
 
-/** 租户主表 — tenant_id 字符串升为一等公民,有元数据。放 console_auth,agent-flow 不引用。 */
+/** 租户主表 — tenant_id 字符串升为一等公民,有元数据。放 console schema,agent-flow 不引用。 */
 export const tenant = consoleAuth.table(
   'tenant',
   {

@@ -1,6 +1,6 @@
 /**
  * RBAC — 角色 → 权限码。服务端守卫(prompt:create/update/delete/test)。
- * 与前端 mockDb 的权限码体系一致;本期 role 写在 console_auth.user.role。
+ * 与前端 mockDb 的权限码体系一致;本期 role 写在 console.user.role。
  */
 
 export type PermissionCode =

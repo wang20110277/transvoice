@@ -15,9 +15,9 @@ Next.js 15 (App Router) + Drizzle ORM + Better Auth 后端,管理提示词配置
 - `callbot.prompt_config` — 主表,UNIQUE(tenant_id, biz_type, scenario),单行即当前内容
 - `callbot.prompt_version` — 版本快照(支撑回滚)
 - `callbot.inbound_route` — DID/号段 → (tenant_id, biz_type, scenario),呼入解析
-- `console_auth.*` — Better Auth 自带(user/session/account/verification)
+- `console.*` — Better Auth 自带(user/session/account/verification) + 租户管理(tenant/user_tenant)
 
-> `prompt_config`/`prompt_version`/`inbound_route` 由 **agent-flow alembic** 建表(0002/0003);`console_auth` 由 Console 自行建表(`src/db/migrations/0001_console_auth.sql`)。
+> `prompt_config`/`prompt_version`/`inbound_route` 由 **agent-flow alembic** 建表(0002/0003);`console` schema 由 Console 自行建表(`src/db/migrations/0001_init_console.sql`)。
 
 ## DID 呼入路由(与 FreeSWITCH dialplan 的关系)
 
@@ -56,7 +56,7 @@ Next.js 15 (App Router) + Drizzle ORM + Better Auth 后端,管理提示词配置
 cp .env.example .env.local   # 按需修改
 
 # 2. 建认证表 + seed 用户
-PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d callbot -f src/db/migrations/0001_console_auth.sql
+PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d callbot -f src/db/migrations/0001_init_console.sql
 npm run db:seed
 
 # 3. 前置:agent-flow 的 0003 迁移必须已应用(prompt_config 需有 tenant_id/scenario 列)
