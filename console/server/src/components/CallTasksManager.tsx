@@ -226,7 +226,7 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
         <button
           onClick={openCreate}
           disabled={prompts.length === 0}
-          title={prompts.length === 0 ? '先在「提示词管理」创建并发布至少一条提示词' : '新增任务'}
+          title={prompts.length === 0 ? '先在「提示词」创建并发布至少一条提示词' : '新增任务'}
           className="flex items-center gap-1 px-3.5 py-2 rounded-lg text-xs font-semibold bg-indigo-600 hover:bg-indigo-700 text-white disabled:opacity-40"
         >
           <Plus className="w-4 h-4" /> 新增任务
