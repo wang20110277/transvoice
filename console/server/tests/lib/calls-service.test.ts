@@ -9,6 +9,7 @@ describe('calls-service toSessionDTO', () => {
     startTs: new Date('2026-06-23T10:00:00Z'),
     endTs: null, resultCode: null, hangupCause: null,
     identityVerified: false, verifyAttempts: 0, recordingNoticePlayed: true,
+    callTaskId: null, callTargetId: null,
     createTime: new Date(), createUser: 'system', updateTime: new Date(), updateUser: 'system',
   };
 

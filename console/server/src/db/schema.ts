@@ -125,6 +125,38 @@ export const callTask = callbot.table(
 export type CallTask = typeof callTask.$inferSelect;
 
 /**
+ * 外呼号码清单表 — 与 agent-flow CallTarget (src/db/models.py) 严格 snake_case 对齐。
+ * DDL 由 agent-flow alembic 0004 维护。console 读写（录入/上传号码、读进度）。
+ */
+export const callTarget = callbot.table(
+  'call_target',
+  {
+    id: bigserial('id', { mode: 'number' }).primaryKey(),
+    taskId: bigint('task_id', { mode: 'number' }).notNull(),
+    tenantId: text('tenant_id').notNull(),
+    phoneHash: text('phone_hash').notNull(),
+    phoneMasked: text('phone_masked'),
+    userKey: text('user_key').notNull(),
+    status: text('status').notNull().default('pending'),
+    attemptCount: integer('attempt_count').notNull().default(0),
+    maxAttempts: integer('max_attempts').notNull().default(1),
+    nextAttemptTs: timestamp('next_attempt_ts', { withTimezone: true }),
+    lastCallSessionId: bigint('last_call_session_id', { mode: 'number' }),
+    lastHangupCause: text('last_hangup_cause'),
+    createTime: timestamp('create_time', { withTimezone: true }).notNull().defaultNow(),
+    createUser: text('create_user').notNull().default('system'),
+    updateTime: timestamp('update_time', { withTimezone: true }).notNull().defaultNow(),
+    updateUser: text('update_user').notNull().default('system'),
+  },
+  (t) => [
+    uniqueIndex('uq_call_target_task_phone').on(t.taskId, t.phoneHash),
+    index('ix_call_target_task_status').on(t.taskId, t.status),
+  ],
+);
+
+export type CallTarget = typeof callTarget.$inferSelect;
+
+/**
  * 通话四表 — 只读映射，DDL 由 agent-flow alembic 维护（0001_initial_schema）。
  * 列名与 agent-flow SQLAlchemy (src/db/models.py) 严格 snake_case 对齐，杜绝双词汇表。
  * console 仅 select，不写这四表（写入由 agent-flow 接线负责）。
@@ -150,6 +182,8 @@ export const callSession = callbot.table('call_session', {
   identityVerified: boolean('identity_verified').notNull().default(false),
   verifyAttempts: integer('verify_attempts').notNull().default(0),
   recordingNoticePlayed: boolean('recording_notice_played').notNull().default(false),
+  callTaskId: bigint('call_task_id', { mode: 'number' }),       // 外呼关联（外呼非空，呼入 NULL）
+  callTargetId: bigint('call_target_id', { mode: 'number' }),   // 外呼关联（同上）
   createTime: timestamp('create_time', { withTimezone: true }).notNull().defaultNow(),
   createUser: text('create_user').notNull().default('system'),
   updateTime: timestamp('update_time', { withTimezone: true }).notNull().defaultNow(),

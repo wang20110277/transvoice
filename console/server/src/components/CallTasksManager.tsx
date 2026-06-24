@@ -1,8 +1,9 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import { Plus, Edit3, Trash2, RefreshCw, CheckCircle2, AlertCircle, PhoneCall } from 'lucide-react';
+import { Plus, Edit3, Trash2, RefreshCw, CheckCircle2, AlertCircle, PhoneCall, Play, Pause, ChevronDown, ChevronRight, Upload } from 'lucide-react';
 import { callTasksApi, type CallTaskDTO, type CallTaskInput } from '@/lib/call-tasks-api';
+import { callTargetsApi, type CallTargetDTO, type CallTargetProgress } from '@/lib/call-targets-api';
 import { promptsApi, type PromptDTO } from '@/lib/prompts-api';
 
 const STATUSES = ['idle', 'running', 'paused', 'completed'];
@@ -114,6 +115,104 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
       setBusy(false);
     }
   };
+
+  // ── 启停（PATCH status：idle/paused → running 启动；running → paused 暂停）──
+  const toggleRun = async (t: CallTaskDTO) => {
+    const next = t.status === 'running' ? 'paused' : 'running';
+    setBusy(true);
+    try {
+      await callTasksApi.update(t.id, { status: next });
+      flash('ok', next === 'running' ? `已启动任务「${t.name}」，执行器将自动拨打 pending 号码` : `已暂停任务「${t.name}」`);
+      await reload();
+    } catch (e) {
+      flash('err', (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // ── 号码清单展开区 ──
+  const [expandedId, setExpandedId] = useState<number | null>(null);
+  const [targets, setTargets] = useState<CallTargetDTO[]>([]);
+  const [progress, setProgress] = useState<CallTargetProgress | null>(null);
+  const [newPhone, setNewPhone] = useState('');
+  const [csvText, setCsvText] = useState('');
+
+  const loadTargets = useCallback(async (taskId: number) => {
+    try {
+      const [tg, pg] = await Promise.all([
+        callTargetsApi.list(taskId),
+        callTargetsApi.progress(taskId).catch(() => null),
+      ]);
+      setTargets(tg);
+      setProgress(pg);
+    } catch (e) {
+      flash('err', (e as Error).message);
+    }
+  }, []);
+
+  const toggleExpand = async (t: CallTaskDTO) => {
+    if (expandedId === t.id) {
+      setExpandedId(null);
+      return;
+    }
+    setExpandedId(t.id);
+    setNewPhone('');
+    setCsvText('');
+    await loadTargets(t.id);
+  };
+
+  const addPhone = async (taskId: number) => {
+    const phone = newPhone.trim();
+    if (!phone) return;
+    setBusy(true);
+    try {
+      await callTargetsApi.create(taskId, phone);
+      setNewPhone('');
+      flash('ok', `已添加号码 ${phone}`);
+      await loadTargets(taskId);
+    } catch (e) {
+      flash('err', (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const uploadCsv = async (taskId: number) => {
+    if (!csvText.trim()) return;
+    setBusy(true);
+    try {
+      const r = await callTargetsApi.uploadCsv(taskId, csvText);
+      setCsvText('');
+      flash('ok', `已导入 ${r.inserted} 个号码${r.skipped ? `（跳过重复 ${r.skipped}）` : ''}`);
+      await loadTargets(taskId);
+    } catch (e) {
+      flash('err', (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const removeTarget = async (taskId: number, targetId: number) => {
+    setBusy(true);
+    try {
+      await callTargetsApi.remove(taskId, targetId);
+      await loadTargets(taskId);
+    } catch (e) {
+      flash('err', (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // running 任务轮询进度（M4 简版：展开时手动刷新 + 启停后 reload）
+  useEffect(() => {
+    if (expandedId === null) return;
+    const t = tasks.find((x) => x.id === expandedId);
+    if (!t || t.status !== 'running') return;
+    const iv = setInterval(() => loadTargets(expandedId), 5000);
+    return () => clearInterval(iv);
+  }, [expandedId, tasks, loadTargets]);
 
   return (
     <div className="space-y-4">
@@ -266,27 +365,124 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
             </thead>
             <tbody className="divide-y divide-slate-50">
               {tasks.map((t) => (
-                <tr key={t.id} className="hover:bg-slate-50/50">
-                  <td className="p-3 font-semibold text-slate-800">{t.name}</td>
-                  <td className="p-3 text-slate-600">{promptLabel(t.promptId)}</td>
-                  <td className="p-3">
-                    <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
-                      t.status === 'running' ? 'bg-emerald-100 text-emerald-700' :
-                      t.status === 'paused' ? 'bg-amber-100 text-amber-700' :
-                      t.status === 'completed' ? 'bg-slate-200 text-slate-600' :
-                      'bg-slate-100 text-slate-500'
-                    }`}>{t.status}</span>
-                  </td>
-                  <td className="p-3 text-slate-600">{t.concurrentLimit}</td>
-                  <td className="p-3 font-mono text-slate-500">{t.allowedHours ?? '—'}</td>
-                  <td className="p-3 text-slate-500 max-w-[200px] truncate">{t.description ?? '—'}</td>
-                  <td className="p-3">
-                    <div className="flex justify-end gap-1">
-                      <button onClick={() => openEdit(t)} disabled={busy} title="编辑" className="p-1.5 text-indigo-600 hover:bg-indigo-50 rounded disabled:opacity-40"><Edit3 className="w-3.5 h-3.5" /></button>
-                      <button onClick={() => doDelete(t)} disabled={busy} title="删除" className="p-1.5 text-rose-600 hover:bg-rose-50 rounded disabled:opacity-40"><Trash2 className="w-3.5 h-3.5" /></button>
-                    </div>
-                  </td>
-                </tr>
+                <>
+                  <tr key={t.id} className="hover:bg-slate-50/50">
+                    <td className="p-3 font-semibold text-slate-800">
+                      <button onClick={() => toggleExpand(t)} className="inline-flex items-center gap-1 hover:text-indigo-600">
+                        {expandedId === t.id ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+                        {t.name}
+                      </button>
+                    </td>
+                    <td className="p-3 text-slate-600">{promptLabel(t.promptId)}</td>
+                    <td className="p-3">
+                      <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
+                        t.status === 'running' ? 'bg-emerald-100 text-emerald-700' :
+                        t.status === 'paused' ? 'bg-amber-100 text-amber-700' :
+                        t.status === 'completed' ? 'bg-slate-200 text-slate-600' :
+                        'bg-slate-100 text-slate-500'
+                      }`}>{t.status}</span>
+                    </td>
+                    <td className="p-3 text-slate-600">{t.concurrentLimit}</td>
+                    <td className="p-3 font-mono text-slate-500">{t.allowedHours ?? '—'}</td>
+                    <td className="p-3 text-slate-500 max-w-[200px] truncate">{t.description ?? '—'}</td>
+                    <td className="p-3">
+                      <div className="flex justify-end gap-1">
+                        <button onClick={() => toggleRun(t)} disabled={busy || t.status === 'completed' || t.status === 'idle' && false} title={t.status === 'running' ? '暂停' : '启动外呼'} className={`p-1.5 rounded disabled:opacity-40 ${t.status === 'running' ? 'text-amber-600 hover:bg-amber-50' : 'text-emerald-600 hover:bg-emerald-50'}`}>
+                          {t.status === 'running' ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
+                        </button>
+                        <button onClick={() => openEdit(t)} disabled={busy} title="编辑" className="p-1.5 text-indigo-600 hover:bg-indigo-50 rounded disabled:opacity-40"><Edit3 className="w-3.5 h-3.5" /></button>
+                        <button onClick={() => doDelete(t)} disabled={busy} title="删除" className="p-1.5 text-rose-600 hover:bg-rose-50 rounded disabled:opacity-40"><Trash2 className="w-3.5 h-3.5" /></button>
+                      </div>
+                    </td>
+                  </tr>
+                  {expandedId === t.id && (
+                    <tr key={`${t.id}-exp`}>
+                      <td colSpan={7} className="p-4 bg-slate-50/40 border-t border-slate-100">
+                        <div className="space-y-3">
+                          {/* 进度条 */}
+                          {progress && (
+                            <div className="flex flex-wrap gap-3 text-[11px]">
+                              <span className="font-semibold text-slate-600">进度：</span>
+                              <span>总数 {progress.total}</span>
+                              <span className="text-slate-500">待呼 {progress.pending}</span>
+                              <span className="text-blue-600">呼叫中 {progress.dialing}</span>
+                              <span className="text-emerald-600">已接通 {progress.answered + progress.done}</span>
+                              <span className="text-amber-600">未接 {progress.noAnswer}</span>
+                              <span className="text-rose-600">失败 {progress.failed}</span>
+                            </div>
+                          )}
+                          {/* 录入区 */}
+                          <div className="flex flex-wrap items-end gap-2">
+                            <div className="space-y-1">
+                              <label className="text-[11px] text-slate-500 font-semibold">单条录入</label>
+                              <input
+                                value={newPhone}
+                                onChange={(e) => setNewPhone(e.target.value)}
+                                onKeyDown={(e) => e.key === 'Enter' && addPhone(t.id)}
+                                placeholder="号码，如 1000"
+                                className="text-xs p-2 bg-white border border-slate-200 rounded-lg w-40 focus:outline-none focus:border-indigo-600"
+                              />
+                            </div>
+                            <button onClick={() => addPhone(t.id)} disabled={busy || !newPhone.trim()} className="px-3 py-2 bg-indigo-600 text-white text-xs rounded-lg hover:bg-indigo-700 disabled:opacity-40 font-semibold">添加</button>
+                          </div>
+                          <div className="flex flex-col gap-2">
+                            <label className="text-[11px] text-slate-500 font-semibold flex items-center gap-1"><Upload className="w-3 h-3" /> 批量导入（每行一个号码）</label>
+                            <textarea
+                              value={csvText}
+                              onChange={(e) => setCsvText(e.target.value)}
+                              placeholder={'1000\n1001\n1002'}
+                              rows={3}
+                              className="text-xs p-2 bg-white border border-slate-200 rounded-lg font-mono focus:outline-none focus:border-indigo-600"
+                            />
+                            <button onClick={() => uploadCsv(t.id)} disabled={busy || !csvText.trim()} className="self-start px-3 py-2 bg-slate-700 text-white text-xs rounded-lg hover:bg-slate-800 disabled:opacity-40 font-semibold">批量导入</button>
+                          </div>
+                          {/* 号码列表 */}
+                          <div className="bg-white rounded-lg border border-slate-100 overflow-hidden">
+                            <div className="px-3 py-2 border-b border-slate-100 text-[11px] font-bold text-slate-600">号码清单 ({targets.length})</div>
+                            {targets.length === 0 ? (
+                              <p className="text-slate-400 text-xs text-center py-6">暂无号码，录入或批量导入</p>
+                            ) : (
+                              <div className="max-h-60 overflow-y-auto">
+                                <table className="w-full text-xs">
+                                  <thead className="bg-slate-50 text-slate-500 sticky top-0">
+                                    <tr>
+                                      <th className="text-left p-2 font-semibold">号码</th>
+                                      <th className="text-left p-2 font-semibold">状态</th>
+                                      <th className="text-left p-2 font-semibold">已拨</th>
+                                      <th className="text-left p-2 font-semibold">上次结果</th>
+                                      <th className="text-right p-2 font-semibold">操作</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody className="divide-y divide-slate-50">
+                                    {targets.map((tg) => (
+                                      <tr key={tg.id}>
+                                        <td className="p-2 font-mono text-slate-700">{tg.phoneMasked ?? tg.userKey}</td>
+                                        <td className="p-2">
+                                          <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                                            tg.status === 'answered' || tg.status === 'done' ? 'bg-emerald-100 text-emerald-700' :
+                                            tg.status === 'dialing' ? 'bg-blue-100 text-blue-700' :
+                                            tg.status === 'failed' ? 'bg-rose-100 text-rose-700' :
+                                            tg.status === 'no_answer' ? 'bg-amber-100 text-amber-700' :
+                                            'bg-slate-100 text-slate-500'
+                                          }`}>{tg.status}</span>
+                                        </td>
+                                        <td className="p-2 text-slate-600">{tg.attemptCount}/{tg.maxAttempts}</td>
+                                        <td className="p-2 text-slate-500 font-mono text-[10px]">{tg.lastHangupCause ?? '—'}</td>
+                                        <td className="p-2 text-right">
+                                          <button onClick={() => removeTarget(t.id, tg.id)} disabled={busy} className="p-1 text-rose-600 hover:bg-rose-50 rounded disabled:opacity-40"><Trash2 className="w-3 h-3" /></button>
+                                        </td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </>
               ))}
             </tbody>
           </table>
