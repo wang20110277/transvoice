@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { Fragment, useCallback, useEffect, useState } from 'react';
 import { Plus, Edit3, Trash2, RefreshCw, CheckCircle2, AlertCircle, PhoneCall, Play, Pause, ChevronDown, ChevronRight, Upload } from 'lucide-react';
 import { callTasksApi, type CallTaskDTO, type CallTaskInput } from '@/lib/call-tasks-api';
 import { callTargetsApi, type CallTargetDTO, type CallTargetProgress } from '@/lib/call-targets-api';
@@ -365,8 +365,8 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
             </thead>
             <tbody className="divide-y divide-slate-50">
               {tasks.map((t) => (
-                <>
-                  <tr key={t.id} className="hover:bg-slate-50/50">
+                <Fragment key={t.id}>
+                  <tr className="hover:bg-slate-50/50">
                     <td className="p-3 font-semibold text-slate-800">
                       <button onClick={() => toggleExpand(t)} className="inline-flex items-center gap-1 hover:text-indigo-600">
                         {expandedId === t.id ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
@@ -482,7 +482,7 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
                       </td>
                     </tr>
                   )}
-                </>
+                </Fragment>
               ))}
             </tbody>
           </table>
