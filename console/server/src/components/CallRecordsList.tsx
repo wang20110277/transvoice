@@ -66,6 +66,23 @@ export default function CallRecordsList({ tenantId }: { tenantId: string }) {
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
+  // 页码数组（含省略号）：首页 … 当前页±1 … 末页
+  const pageNumbers: (number | '...')[] = (() => {
+    const pages: (number | '...')[] = [];
+    const rangeStart = Math.max(1, page - 1);
+    const rangeEnd = Math.min(totalPages, page + 1);
+    if (rangeStart > 1) {
+      pages.push(1);
+      if (rangeStart > 2) pages.push('...');
+    }
+    for (let i = rangeStart; i <= rangeEnd; i++) pages.push(i);
+    if (rangeEnd < totalPages) {
+      if (rangeEnd < totalPages - 1) pages.push('...');
+      pages.push(totalPages);
+    }
+    return pages;
+  })();
+
   return (
     <div className="space-y-4">
       <div className="bg-white p-4 rounded-xl border border-slate-100 shadow-xs">
@@ -147,12 +164,12 @@ export default function CallRecordsList({ tenantId }: { tenantId: string }) {
                 <th className="text-left p-3 font-semibold">开始时间</th>
                 <th className="text-left p-3 font-semibold">时长</th>
                 <th className="text-left p-3 font-semibold">挂断原因</th>
+                <th className="text-left p-3 font-semibold">操作</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-50">
               {calls.map((c) => (
-                <tr key={c.id} onClick={() => router.push(`/calls/${c.id}`)}
-                  className="hover:bg-indigo-50/40 cursor-pointer">
+                <tr key={c.id} className="hover:bg-slate-50/60">
                   <td className="p-3 font-mono text-slate-500 truncate max-w-[180px]" title={c.callId}>
                     {c.callId.slice(0, 8)}…
                   </td>
@@ -161,6 +178,14 @@ export default function CallRecordsList({ tenantId }: { tenantId: string }) {
                   <td className="p-3 text-slate-600">{fmtTs(c.startTs)}</td>
                   <td className="p-3 text-slate-600">{fmtDuration(c.durationMs)}</td>
                   <td className="p-3 text-slate-500 truncate max-w-[150px]" title={c.hangupCause ?? ''}>{c.hangupCause ?? '—'}</td>
+                  <td className="p-3">
+                    <button
+                      onClick={() => router.push(`/calls/${c.id}`)}
+                      className="px-2.5 py-1 bg-indigo-50 text-indigo-600 text-[11px] rounded hover:bg-indigo-100 font-semibold"
+                    >
+                      查看详情
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -168,16 +193,26 @@ export default function CallRecordsList({ tenantId }: { tenantId: string }) {
         )}
       </div>
 
-      {/* 分页 */}
-      {total > pageSize && (
-        <div className="flex justify-center items-center gap-3 text-xs text-slate-600">
-          <button onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page <= 1}
-            className="px-3 py-1.5 bg-white border border-slate-200 rounded-lg disabled:opacity-40 hover:bg-slate-50">上一页</button>
-          <span>第 {page} / {totalPages} 页（共 {total} 条）</span>
-          <button onClick={() => setPage((p) => Math.min(totalPages, p + 1))} disabled={page >= totalPages}
-            className="px-3 py-1.5 bg-white border border-slate-200 rounded-lg disabled:opacity-40 hover:bg-slate-50">下一页</button>
-        </div>
-      )}
+      {/* 分页：始终显示 + 页码跳转 */}
+      <div className="flex justify-center items-center gap-1.5 text-xs text-slate-600">
+        <button onClick={() => setPage(1)} disabled={page <= 1}
+          className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg disabled:opacity-40 hover:bg-slate-50">首页</button>
+        <button onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page <= 1}
+          className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg disabled:opacity-40 hover:bg-slate-50">上一页</button>
+        {pageNumbers.map((p) =>
+          typeof p === 'number' ? (
+            <button key={p} onClick={() => setPage(p)}
+              className={`min-w-[28px] px-2 py-1.5 border rounded-lg font-semibold ${
+                p === page ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white border-slate-200 hover:bg-slate-50'
+              }`}>{p}</button>
+          ) : (
+            <span key={p} className="px-1 text-slate-400">…</span>
+          )
+        )}
+        <button onClick={() => setPage((p) => Math.min(totalPages, p + 1))} disabled={page >= totalPages}
+          className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg disabled:opacity-40 hover:bg-slate-50">下一页</button>
+        <span className="ml-2 text-slate-400">共 {total} 条 / {totalPages} 页</span>
+      </div>
     </div>
   );
 }

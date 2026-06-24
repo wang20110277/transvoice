@@ -1,7 +1,16 @@
 import { redirect } from 'next/navigation';
-import { getSession } from '@/auth/session';
+import { getSession, activeTenantIdOf } from '@/auth/session';
+import ConsoleShell from '@/components/ConsoleShell';
+import HomePage from '@/components/HomePage';
 
 export default async function Home() {
   const session = await getSession();
-  redirect(session ? '/prompts' : '/login');
+  if (!session) redirect('/login');
+  const user = session.user as { email: string; name: string; tenantId?: string; role?: string };
+  const tenantId = activeTenantIdOf(session) ?? user.tenantId ?? 'default';
+  return (
+    <ConsoleShell tenantId={tenantId} userEmail={user.email} userName={user.name} role={user.role ?? 'admin'}>
+      <HomePage tenantId={tenantId} />
+    </ConsoleShell>
+  );
 }
