@@ -2,11 +2,11 @@
 
 ## MODIFIED Requirements
 
-### Requirement: 外呼任务状态机（执行驱动）
+### Requirement: 执行边界声明
 
-系统 SHALL 将 `callbot.call_task.status` 作为执行引擎驱动的状态字段，流转 `idle → running → paused → completed`（失败终态 `failed`）。Console 启停操作（`PATCH /api/call-tasks/:id` 置 `running`/`paused`）SHALL 触发 agent-flow 执行器在下一调度 tick 感知并执行/暂停。
+系统 SHALL 提供外呼执行引擎：实现 originate 发起、调度器（tick）、重拨/并发/时段执行逻辑。`callbot.call_task.status` 作为执行引擎驱动的状态字段，流转 `idle → running → paused → completed`（失败终态 `failed`）。Console 启停操作（`PATCH /api/call-tasks/:id` 置 `running`/`paused`）SHALL 触发 agent-flow 执行器在下一调度 tick 感知并执行/暂停。`call_task` 策略字段（`concurrent_limit`/`allowed_hours`/`redial_strategy`）SHALL 被执行器消费。
 
-> 本条 **取代** 原稳定规格中「执行边界声明」（原条款声明本期不实现 originate/调度/重拨/并发/时段执行）。执行能力由本变更补齐。
+> 本条 **取代** 原稳定规格中的排除条款（原条款声明本期不实现 originate/调度/重拨/并发/时段执行）。执行能力由本变更补齐。
 
 #### Scenario: 手动启动任务
 - **WHEN** 管理员把任务 status 置为 `running`
