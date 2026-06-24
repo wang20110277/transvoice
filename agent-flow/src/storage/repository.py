@@ -267,3 +267,20 @@ async def get_prompt_dimensions(prompt_id: int) -> tuple[str, str, str] | None:
     except SQLAlchemyError as e:
         logger.error(f"get_prompt_dimensions 失败: {e}")
         return None
+
+
+async def get_redial_strategy(task_id: int) -> dict:
+    """查 call_task.redial_strategy JSONB（{max_retries, interval_min, retry_on_causes}）。
+
+    缺失/异常返回空 dict（decide_redial 据此不重拨，安全降级）。
+    """
+    try:
+        async with async_session() as session:
+            result = await session.execute(
+                select(CallTask.redial_strategy).where(CallTask.id == task_id)
+            )
+            row = result.scalar_one_or_none()
+            return dict(row) if row else {}
+    except SQLAlchemyError as e:
+        logger.error(f"get_redial_strategy 失败: {e}")
+        return {}

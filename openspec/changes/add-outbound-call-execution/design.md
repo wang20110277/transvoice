@@ -99,18 +99,17 @@ idle ──start──▶ running ──pause──▶ paused ──resume──
 - **并发**：`asyncio.Semaphore(task.concurrent_limit)` per task（可选全局上限）
 - **originate**：`esl.bgapi(originate_cmd)`，fire-and-forget；号码行先置 `dialing`
 
-### 4.2 结果回写（CHANNEL_HANGUP 分支）
+### 4.2 结果回写 + 重拨判定（CHANNEL_HANGUP 分支）
 
-`_on_channel_hangup` 加 outbound 分支：读 `Hangup-Cause` → 更新 `call_target` 行：
+`_on_channel_hangup` outbound 分支：查 `call_target`（attempt_count/max_attempts）+ `call_task.redial_strategy` → `decide_redial(hangup_cause, attempt_count, max_attempts, retry_on_causes)` 纯函数判定：
 
-| Hangup-Cause | call_target.status | 是否可重拨 |
-|--------------|--------------------|-----------|
-| `NORMAL_CLEARING` | `answered`→`done` | 否（接通成功） |
-| `NO_ANSWER` / `RECOVERY_ON_TIMER_EXPIRE`（振铃超时） | `no_answer` | 是 |
-| `USER_NOT_REGISTERED` / `SUBSCRIBER_ABSENT` | `failed` | 按 retry_on_causes |
-| `ORIGINATOR_CANCEL` / `NORMAL_TEMPORARY_FAILURE` | `failed` | 是 |
+- `NORMAL_CLEARING` → 终态 `done`（接通成功，不重拨）
+- 失败原因 ∈ `retry_on_causes` 且 `attempt_count < max_attempts` → 重拨：`reset_call_target_for_redial`（pending + attempt_count+1 + next_attempt_ts 退避 interval_min）
+- 否则 → 终态 `failed`
 
-重拨：`attempt_count < max_attempts` → 置 `pending` + `next_attempt_ts = now + interval_min`；否则终态 `failed`/`done`。
+`decide_redial` 是纯函数（`outbound/redial.py`，6 单测覆盖：接通终态/可重拨/不可重拨原因/达上限/空策略/未知原因）。
+
+> **已知限制（originate 失败路径）**：channel 建立失败（号码不存在/未注册，如 `SUBSCRIBER_ABSENT`/`USER_NOT_REGISTERED`）的 originate **不产生 CHANNEL_HANGUP 事件**（channel 从未建立），hangup 分支不触发，target 卡在 dialing。完整覆盖需订阅 ESL `BACKGROUND_JOB` 事件拿 originate 失败结果。本期 hangup 路径（接通后挂断的 NO_ANSWER/失败重拨，真实外呼主要场景）已完整；originate 失败路径的 BACKGROUND_JOB 订阅作为后续增强。真实号码清单应前置过滤无效号码降低此影响。
 
 ### 4.3 `redial_strategy` JSONB 结构（spec 定型）
 

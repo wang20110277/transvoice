@@ -276,11 +276,9 @@ def _create_esl_event_handlers(esl: ESLClient) -> None:
                 )
             )
 
-        # 外呼结果回写：按 Hangup-Cause 更新 call_target 状态
-        # （M1 仅回写终态/中间态；M3 在此基础上加重拨判定）
+        # 外呼结果回写 + 重拨判定：按 Hangup-Cause + redial_strategy 决定重拨 or 终态
         call_target_id = _parse_int_var(event.headers.get("variable_call_target_id"))
         if call_target_id is not None:
-            target_status = _hangup_cause_to_outbound_status(hangup_cause)
             session_id = None
             try:
                 sess = await repository.get_call_session_by_fs_uuid(uuid)
@@ -289,11 +287,28 @@ def _create_esl_event_handlers(esl: ESLClient) -> None:
             except Exception as e:
                 logger.error("[%s] get_call_session for target outcome failed: %s", uuid, e)
             try:
-                await repository.update_call_target_outcome(
-                    call_target_id, target_status, hangup_cause, session_id,
-                )
+                target = await repository.get_call_target(call_target_id)
+                if target is not None:
+                    redial_strategy = await repository.get_redial_strategy(target.task_id)
+                    from src.outbound.redial import decide_redial
+                    decision = decide_redial(
+                        hangup_cause, target.attempt_count, target.max_attempts,
+                        redial_strategy.get("retry_on_causes", []),
+                    )
+                    if decision.redial:
+                        interval = float(redial_strategy.get("interval_min", 1) or 1)
+                        await repository.reset_call_target_for_redial(call_target_id, interval)
+                        logger.info("[%s] target %s redial scheduled (cause=%s attempt=%s/%s)",
+                                    uuid, call_target_id, hangup_cause,
+                                    target.attempt_count + 1, target.max_attempts)
+                    else:
+                        await repository.update_call_target_outcome(
+                            call_target_id, decision.final_status, hangup_cause, session_id,
+                        )
+                        logger.info("[%s] target %s final=%s (cause=%s)",
+                                    uuid, call_target_id, decision.final_status, hangup_cause)
             except Exception as e:
-                logger.error("[%s] update_call_target_outcome failed: %s", uuid, e)
+                logger.error("[%s] call_target redial/outcome failed: %s", uuid, e)
 
         try:
             await esl.audio_fork_stop(uuid)
