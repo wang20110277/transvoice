@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timedelta
 from sqlalchemy import select, update
 from sqlalchemy.exc import SQLAlchemyError
-from db.models import CallSession, CallTarget, CallTurn, CallEvent, CallArtifact
+from db.models import CallSession, CallTarget, CallTask, CallTurn, CallEvent, CallArtifact, PromptConfig
 from database import async_session
 
 logger = logging.getLogger(__name__)
@@ -164,4 +164,106 @@ async def get_call_target(target_id: int) -> CallTarget | None:
             return result.scalar_one_or_none()
     except SQLAlchemyError as e:
         logger.error(f"get_call_target 失败: {e}")
+        return None
+
+
+# ── 外呼执行器查询 ──
+
+async def list_running_tasks() -> list[CallTask]:
+    """所有 status='running' 的任务（执行器每个 tick 扫描）。"""
+    try:
+        async with async_session() as session:
+            result = await session.execute(
+                select(CallTask).where(CallTask.status == "running")
+            )
+            return list(result.scalars().all())
+    except SQLAlchemyError as e:
+        logger.error(f"list_running_tasks 失败: {e}")
+        return []
+
+
+async def list_dialable_targets(task_id: int, limit: int) -> list[CallTarget]:
+    """可拨打的号码：status=pending 且到下次可拨时间。
+
+    next_attempt_ts 为 NULL（从未拨）或 <= now（重拨退避到期）。按 id 顺序取 limit 条。
+    """
+    try:
+        async with async_session() as session:
+            now = datetime.now()
+            result = await session.execute(
+                select(CallTarget).where(
+                    CallTarget.task_id == task_id,
+                    CallTarget.status == "pending",
+                    (CallTarget.next_attempt_ts.is_(None))
+                    | (CallTarget.next_attempt_ts <= now),
+                ).order_by(CallTarget.id).limit(limit)
+            )
+            return list(result.scalars().all())
+    except SQLAlchemyError as e:
+        logger.error(f"list_dialable_targets 失败: {e}")
+        return []
+
+
+async def has_pending_targets(task_id: int) -> bool:
+    """任务是否还有 pending 号码（任务完成判定用）。"""
+    try:
+        async with async_session() as session:
+            result = await session.execute(
+                select(CallTarget.id).where(
+                    CallTarget.task_id == task_id,
+                    CallTarget.status.in_(("pending", "dialing")),
+                ).limit(1)
+            )
+            return result.first() is not None
+    except SQLAlchemyError as e:
+        logger.error(f"has_pending_targets 失败: {e}")
+        return False
+
+
+async def mark_task_completed(task_id: int) -> None:
+    """所有号码终态且无 pending/dialing → call_task.status=completed。"""
+    try:
+        async with async_session() as session:
+            if await has_pending_targets(task_id):
+                return
+            await session.execute(
+                update(CallTask)
+                .where(CallTask.id == task_id, CallTask.status == "running")
+                .values(status="completed", update_time=datetime.now())
+            )
+            await session.commit()
+    except SQLAlchemyError as e:
+        logger.error(f"mark_task_completed 失败: {e}")
+
+
+async def revert_target_to_pending(target_id: int) -> None:
+    """未成功 originate 的号码从 dialing 回退为 pending（不增 attempt_count，下个 tick 重试）。"""
+    try:
+        async with async_session() as session:
+            await session.execute(
+                update(CallTarget)
+                .where(CallTarget.id == target_id, CallTarget.status == "dialing")
+                .values(status="pending", update_time=datetime.now())
+            )
+            await session.commit()
+    except SQLAlchemyError as e:
+        logger.error(f"revert_target_to_pending 失败: {e}")
+
+
+async def get_prompt_dimensions(prompt_id: int) -> tuple[str, str, str] | None:
+    """从 prompt_config 反查 (tenant_id, biz_type, scenario) — 外呼三元组来源。
+
+    外呼无 DID，三元组由 call_task.prompt_id 反查（区别于呼入的 DID→inbound_route）。
+    """
+    try:
+        async with async_session() as session:
+            result = await session.execute(
+                select(
+                    PromptConfig.tenant_id, PromptConfig.biz_type, PromptConfig.scenario,
+                ).where(PromptConfig.id == prompt_id)
+            )
+            row = result.first()
+            return (row[0], row[1], row[2]) if row else None
+    except SQLAlchemyError as e:
+        logger.error(f"get_prompt_dimensions 失败: {e}")
         return None

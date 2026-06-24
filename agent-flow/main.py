@@ -68,6 +68,7 @@ _streaming_handler = None
 _call_registry = ActiveCallRegistry()
 _audio_fork_started: set[str] = set()  # 防止 ESL 多连接重复触发 audio_fork_start
 _ongoing_archives: set = set()  # 强引用持有 _archive_recording task，防 fire-and-forget 被 GC
+_outbound_executor = None  # OutboundExecutor 单例，lifespan 启停
 
 
 def _mask_phone(s: str) -> str:
@@ -465,12 +466,21 @@ async def lifespan(app: FastAPI):
         tts_prebuffer_frames=settings.tts_prebuffer_frames,
     )
 
+    # ── ⑦ 外呼执行器（进程内 asyncio，tick 调度）──
+    global _outbound_executor
+    from src.outbound.executor import OutboundExecutor
+    _outbound_executor = OutboundExecutor(esl, settings)
+    _outbound_executor.start()
+
     _initialized = True
     _log_startup_summary()
 
     yield
 
     # ── 关闭 ──
+    if _outbound_executor is not None:
+        await _outbound_executor.stop()
+        _outbound_executor = None
     await _shutdown(mcp, asr_grpc, tts_grpc, asr_ws, tts_ws, asr, tts, esl)
     _initialized = False
 
