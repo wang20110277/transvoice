@@ -5,7 +5,7 @@
  * 录音链接存 call_artifact(kind='recording')（与 call_session 一对多），非 call_session 列。
  * phone_hash 不下发前端，只给 phone_masked。
  */
-import { and, asc, count, desc, eq, gte, like, lte } from 'drizzle-orm';
+import { and, asc, count, desc, eq, gte, isNotNull, isNull, like, lte } from 'drizzle-orm';
 import { db } from '@/db/client';
 import { callSession, callTurn, callEvent, callArtifact } from '@/db/schema';
 import { presignedRecordingUrl } from './minio-client';
@@ -19,6 +19,7 @@ export interface SessionDTO {
   scenario: string | null;
   phoneMasked: string | null;
   userKey: string;
+  direction: 'inbound' | 'outbound';   // 呼入 / 呼出（由 call_task_id 是否非空判定）
   startTs: Date;
   endTs: Date | null;
   hangupCause: string | null;
@@ -38,7 +39,8 @@ export function toSessionDTO(row: SessionRow): SessionDTO {
   return {
     id: row.id, callId: row.callId, fsUuid: row.fsUuid, bizType: row.bizType,
     tenantId: row.tenantId, scenario: row.scenario, phoneMasked: row.phoneMasked,
-    userKey: row.userKey, startTs: row.startTs, endTs: row.endTs,
+    userKey: row.userKey, direction: row.callTaskId ? 'outbound' : 'inbound',
+    startTs: row.startTs, endTs: row.endTs,
     hangupCause: row.hangupCause, resultCode: row.resultCode,
     identityVerified: row.identityVerified, recordingNoticePlayed: row.recordingNoticePlayed,
     durationMs,
@@ -49,6 +51,7 @@ export interface ListParams {
   tenantId: string;
   bizType?: string;
   phoneMasked?: string;
+  direction?: 'inbound' | 'outbound';   // 方向筛选
   startFrom?: Date;
   startTo?: Date;
   page: number;
@@ -59,6 +62,8 @@ export async function listCalls(p: ListParams): Promise<{ calls: SessionDTO[]; t
   const conds = [eq(callSession.tenantId, p.tenantId)];
   if (p.bizType) conds.push(eq(callSession.bizType, p.bizType));
   if (p.phoneMasked) conds.push(like(callSession.phoneMasked, `%${p.phoneMasked}%`));
+  if (p.direction === 'outbound') conds.push(isNotNull(callSession.callTaskId));
+  if (p.direction === 'inbound') conds.push(isNull(callSession.callTaskId));
   if (p.startFrom) conds.push(gte(callSession.startTs, p.startFrom));
   if (p.startTo) conds.push(lte(callSession.startTs, p.startTo));
   const where = and(...conds);

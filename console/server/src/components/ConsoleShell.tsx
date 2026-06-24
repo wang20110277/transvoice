@@ -29,7 +29,7 @@ interface MenuItem {
 // 侧栏:纯业务菜单。平台管理功能(租户管理)放顶栏,按权限显隐。
 const MENUS: MenuItem[] = [
   { key: 'home', label: '首页', icon: LayoutDashboard, href: '/', enabled: true },
-  { key: 'routes', label: 'DID 路由', icon: Route, href: '/inbound-routes', enabled: true },
+  { key: 'routes', label: '呼入路由', icon: Route, href: '/inbound-routes', enabled: true },
   { key: 'prompts', label: '提示词管理', icon: Layers, href: '/prompts', enabled: true },
   { key: 'callcenter', label: '外呼任务', icon: PhoneCall, href: '/call-tasks', enabled: true },
   { key: 'records', label: '通话记录', icon: FileSpreadsheet, href: '/calls', enabled: true },

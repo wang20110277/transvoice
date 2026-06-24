@@ -117,7 +117,7 @@ export default function InboundRoutesManager({ tenantId }: { tenantId: string })
     <div className="space-y-4">
       <div className="flex justify-between items-center bg-white p-4 rounded-xl border border-slate-100 shadow-xs">
         <div>
-          <h2 className="text-base font-bold text-slate-800">DID 呼入路由</h2>
+          <h2 className="text-base font-bold text-slate-800">呼入路由</h2>
           <p className="text-xs text-slate-500 mt-1">
             被叫号(DID)→ (tenant_id, biz_type, scenario)。dialplan 已 catch-all,新增/修改路由即时生效,无需改 FreeSWITCH。
           </p>
@@ -144,7 +144,7 @@ export default function InboundRoutesManager({ tenantId }: { tenantId: string })
       {showForm && (
         <form onSubmit={save} className="bg-white p-5 rounded-xl border border-slate-100 shadow-xs space-y-4">
           <div className="flex justify-between items-center border-b border-slate-100 pb-2">
-            <h3 className="text-sm font-bold text-slate-800">{editing ? `编辑 DID ${editing.did}` : '新增 DID 路由'}</h3>
+            <h3 className="text-sm font-bold text-slate-800">{editing ? `编辑 DID ${editing.did}` : '新增呼入路由'}</h3>
             <button type="button" onClick={() => setShowForm(false)} className="text-xs text-slate-500 hover:text-slate-800">取消</button>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -221,7 +221,7 @@ export default function InboundRoutesManager({ tenantId }: { tenantId: string })
         {loading ? (
           <p className="text-slate-400 text-xs text-center py-10">加载中…</p>
         ) : routes.length === 0 ? (
-          <p className="text-slate-400 text-xs text-center py-10">本租户暂无 DID 路由</p>
+          <p className="text-slate-400 text-xs text-center py-10">本租户暂无呼入路由</p>
         ) : (
           <table className="w-full text-xs">
             <thead className="bg-slate-50 text-slate-500">

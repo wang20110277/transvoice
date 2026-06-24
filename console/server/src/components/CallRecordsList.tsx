@@ -27,11 +27,12 @@ export default function CallRecordsList({ tenantId }: { tenantId: string }) {
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<{ kind: 'ok' | 'err'; msg: string } | null>(null);
   const [page, setPage] = useState(1);
-  const pageSize = 20;
+  const pageSize = 10;
 
   // 筛选
   const [fBiz, setFBiz] = useState('');
   const [fPhone, setFPhone] = useState('');
+  const [fDir, setFDir] = useState('');
   const [fFrom, setFFrom] = useState('');
   const [fTo, setFTo] = useState('');
 
@@ -46,6 +47,7 @@ export default function CallRecordsList({ tenantId }: { tenantId: string }) {
       const r = await callsApi.list({
         bizType: fBiz || undefined,
         phoneMasked: fPhone || undefined,
+        direction: (fDir === 'inbound' || fDir === 'outbound') ? fDir : undefined,
         startFrom: fFrom || undefined,
         startTo: fTo || undefined,
         page,
@@ -58,7 +60,7 @@ export default function CallRecordsList({ tenantId }: { tenantId: string }) {
     } finally {
       setLoading(false);
     }
-  }, [fBiz, fPhone, fFrom, fTo, page]);
+  }, [fBiz, fPhone, fDir, fFrom, fTo, page]);
 
   useEffect(() => {
     reload();
@@ -104,7 +106,16 @@ export default function CallRecordsList({ tenantId }: { tenantId: string }) {
 
       {/* 筛选区 */}
       <div className="bg-white p-4 rounded-xl border border-slate-100 shadow-xs">
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+        <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
+          <div className="space-y-1">
+            <label className="text-[11px] text-slate-500 font-semibold">方向</label>
+            <select value={fDir} onChange={(e) => { setFDir(e.target.value); setPage(1); }}
+              className="w-full text-xs p-2 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-600">
+              <option value="">全部</option>
+              <option value="inbound">呼入</option>
+              <option value="outbound">呼出</option>
+            </select>
+          </div>
           <div className="space-y-1">
             <label className="text-[11px] text-slate-500 font-semibold">业务类型</label>
             <select value={fBiz} onChange={(e) => { setFBiz(e.target.value); setPage(1); }}
@@ -130,7 +141,7 @@ export default function CallRecordsList({ tenantId }: { tenantId: string }) {
           </div>
         </div>
         <div className="flex justify-end gap-2 mt-3">
-          <button onClick={() => { setFBiz(''); setFPhone(''); setFFrom(''); setFTo(''); setPage(1); }}
+          <button onClick={() => { setFDir(''); setFBiz(''); setFPhone(''); setFFrom(''); setFTo(''); setPage(1); }}
             className="px-3 py-1.5 bg-slate-100 text-slate-600 text-xs rounded-lg hover:bg-slate-200 font-semibold">清空</button>
           <button onClick={reload}
             className="flex items-center gap-1 px-3 py-1.5 bg-indigo-600 text-white text-xs rounded-lg hover:bg-indigo-700 font-semibold">
@@ -160,6 +171,7 @@ export default function CallRecordsList({ tenantId }: { tenantId: string }) {
               <tr>
                 <th className="text-left p-3 font-semibold">call_id</th>
                 <th className="text-left p-3 font-semibold">手机号</th>
+                <th className="text-left p-3 font-semibold">方向</th>
                 <th className="text-left p-3 font-semibold">业务类型</th>
                 <th className="text-left p-3 font-semibold">开始时间</th>
                 <th className="text-left p-3 font-semibold">时长</th>
@@ -174,6 +186,11 @@ export default function CallRecordsList({ tenantId }: { tenantId: string }) {
                     {c.callId.slice(0, 8)}…
                   </td>
                   <td className="p-3 font-mono text-slate-700">{c.phoneMasked ?? '—'}</td>
+                  <td className="p-3">
+                    <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                      c.direction === 'outbound' ? 'bg-violet-100 text-violet-700' : 'bg-sky-100 text-sky-700'
+                    }`}>{c.direction === 'outbound' ? '呼出' : '呼入'}</span>
+                  </td>
                   <td className="p-3 text-slate-600">{c.bizType}</td>
                   <td className="p-3 text-slate-600">{fmtTs(c.startTs)}</td>
                   <td className="p-3 text-slate-600">{fmtDuration(c.durationMs)}</td>
