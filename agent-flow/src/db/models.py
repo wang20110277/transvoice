@@ -49,7 +49,7 @@ class CallSession(Base):
     verify_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     recording_notice_played: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # 外呼关联：外呼通话非空，inbound 为 NULL（与既有 task_id 区分；task_id 是 Text 业务串，call_task_id 是 FK）
-    call_task_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("callbot.call_task.id"), nullable=True)
+    call_task_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     call_target_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     create_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
@@ -366,7 +366,7 @@ class CallTarget(Base):
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    task_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("callbot.call_task.id"), nullable=False)
+    task_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     tenant_id: Mapped[str] = mapped_column(Text, nullable=False)
     phone_hash: Mapped[str] = mapped_column(Text, nullable=False)
     phone_masked: Mapped[str | None] = mapped_column(Text)

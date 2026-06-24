@@ -9,7 +9,7 @@
  */
 import { and, eq } from 'drizzle-orm';
 import { db } from '@/db/client';
-import { callTask, promptConfig } from '@/db/schema';
+import { callSession, callTarget, callTask, promptConfig } from '@/db/schema';
 
 export interface CallTaskDTO {
   id: number;
@@ -152,6 +152,17 @@ export async function update(
 export async function remove(id: number, tenantId: string): Promise<boolean> {
   const existing = await getById(id, tenantId);
   if (!existing) return false;
-  await db.delete(callTask).where(eq(callTask.id, id));
+  // 应用层关联删除（无 FK 约束，DB 不自动级联）：
+  //  - call_target（号码清单）：任务的从属数据，一并删除
+  //  - call_session.call_task_id：通话记录是历史，解除关联置 NULL（记录保留）
+  //  - call_task：最后删除
+  // 用事务保证原子。
+  await db.transaction(async (tx) => {
+    await tx.delete(callTarget).where(eq(callTarget.taskId, id));
+    await tx.update(callSession)
+      .set({ callTaskId: null })
+      .where(eq(callSession.callTaskId, id));
+    await tx.delete(callTask).where(eq(callTask.id, id));
+  });
   return true;
 }
