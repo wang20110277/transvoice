@@ -9,6 +9,7 @@ export interface CallTargetDTO {
   maxAttempts: number;
   nextAttemptTs: string | null;
   lastHangupCause: string | null;
+  customerId: string | null;
   updateTime: string;
 }
 
@@ -39,9 +40,14 @@ export const callTargetsApi = {
     req<CallTargetDTO>(`/api/call-tasks/${taskId}/targets`, {
       method: 'POST', body: JSON.stringify({ phone, maxAttempts }),
     }),
-  uploadCsv: (taskId: number, csv: string, maxAttempts = 1) =>
+  /** 结构化批量导入（手机号 + 客户id + 每号码变量）。 */
+  importStructured: (
+    taskId: number,
+    targets: { phone: string; customerId?: string; vars?: Record<string, string> }[],
+    maxAttempts = 1,
+  ) =>
     req<{ inserted: number; skipped: number }>(`/api/call-tasks/${taskId}/targets`, {
-      method: 'POST', body: JSON.stringify({ csv, maxAttempts }),
+      method: 'POST', body: JSON.stringify({ targets, maxAttempts }),
     }),
   remove: (taskId: number, targetId: number) =>
     req<{ ok: boolean }>(`/api/call-tasks/${taskId}/targets/${targetId}`, { method: 'DELETE' }),

@@ -96,6 +96,7 @@ class CallGraphState(TypedDict, total=False):
     memory_block: str
     rag_block: str
     chat_history: list[BaseMessage]
+    call_task_vars: dict
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -276,6 +277,7 @@ async def run_pre_llm_phase(
     precomputed_asr_result: dict | None = None,
     tenant_id: str = "default",
     scenario: str = "default",
+    call_task_vars: dict | None = None,
 ) -> CallGraphState:
     """Phase 1: ASR 识别 + 并行扇出（MCP 身份 + 记忆召回 + RAG 检索）。
 
@@ -287,6 +289,8 @@ async def run_pre_llm_phase(
         precomputed_asr_result: 已通过 gRPC/WS 流式获取的 ASR 结果（跳过 HTTP ASR）
         tenant_id: 租户/业务系统(提示词隔离维度)
         scenario: 话术场景(提示词选择维度)
+        call_task_vars: 外呼每号码 render 变量（call_target.vars），由 render() 替换 prompt 占位符；
+            呼入/无变量时 {} (flow.py 下游 state.get 已就绪消费)
 
     Returns:
         组装好的 CallGraphState，供 run_streaming_pipeline 使用
@@ -311,6 +315,7 @@ async def run_pre_llm_phase(
         "memory_block": "",
         "rag_block": "",
         "chat_history": [],
+        "call_task_vars": call_task_vars or {},
     }
 
     if precomputed_asr_result:

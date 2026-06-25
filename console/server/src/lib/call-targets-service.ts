@@ -20,6 +20,7 @@ export interface CallTargetDTO {
   maxAttempts: number;
   nextAttemptTs: Date | null;
   lastHangupCause: string | null;
+  customerId: string | null;
   updateTime: Date;
 }
 
@@ -58,6 +59,7 @@ function toDTO(row: Row): CallTargetDTO {
     maxAttempts: row.maxAttempts,
     nextAttemptTs: row.nextAttemptTs,
     lastHangupCause: row.lastHangupCause,
+    customerId: row.customerId,
     updateTime: row.updateTime,
   };
 }
@@ -107,31 +109,35 @@ export async function create(
 }
 
 /**
- * 批量录入（CSV 文本，每行一个号码）。返回 {inserted, skipped}。
- * 去重：任务内已存在的 phone_hash 跳过（onConflictDoNothing）。
+ * 结构化批量录入（手机号 + 客户id + 每号码变量）。返回 {inserted, skipped}。
+ *
+ * 去重：任务内已存在的 phone_hash 跳过（onConflictDoNothing），与单条录入一致。
+ * vars 强制 Record<string,string>：API 边界防御，拒对象/数组值，避免复杂类型污染 prompt。
  */
-export async function bulkCreateFromCsv(
+export async function bulkCreateStructured(
   taskId: number,
   tenantId: string,
-  csvText: string,
+  targets: { phone: string; customerId?: string; vars?: Record<string, string> }[],
   maxAttempts: number,
   userEmail: string,
 ): Promise<{ inserted: number; skipped: number }> {
   if (!(await taskInTenant(taskId, tenantId))) return { inserted: 0, skipped: 0 };
-  const phones = csvText
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0 && !/^phone|号码/i.test(l)); // 去表头/空行
-  if (phones.length === 0) return { inserted: 0, skipped: 0 };
+  // 客户端已解析+校验；服务端仅做边界防御（phone 去空白非空 + vars 强制扁平 string map）
+  const clean = targets
+    .map((t) => ({ phone: (t.phone ?? '').trim(), customerId: t.customerId, vars: sanitizeVars(t.vars) }))
+    .filter((t) => t.phone.length > 0);
+  if (clean.length === 0) return { inserted: 0, skipped: 0 };
 
-  const values = phones.map((p) => ({
+  const values = clean.map((t) => ({
     taskId,
     tenantId,
-    phoneHash: phoneHash(p),
-    phoneMasked: maskPhone(p),
-    userKey: p,
+    phoneHash: phoneHash(t.phone),
+    phoneMasked: maskPhone(t.phone),
+    userKey: t.phone,
     status: 'pending',
     maxAttempts,
+    customerId: t.customerId ?? null,
+    vars: t.vars,
     createUser: userEmail,
     updateUser: userEmail,
   }));
@@ -140,7 +146,18 @@ export async function bulkCreateFromCsv(
     .values(values)
     .onConflictDoNothing()
     .returning({ id: callTarget.id });
-  return { inserted: result.length, skipped: phones.length - result.length };
+  return { inserted: result.length, skipped: clean.length - result.length };
+}
+
+/** vars 边界规范化：非对象/数组 → {}；值强制 string；空对象保留 {}。 */
+function sanitizeVars(vars: unknown): Record<string, string> {
+  if (!vars || typeof vars !== 'object' || Array.isArray(vars)) return {};
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(vars as Record<string, unknown>)) {
+    if (typeof k !== 'string') continue;
+    out[k] = typeof v === 'string' ? v : v == null ? '' : JSON.stringify(v);
+  }
+  return out;
 }
 
 export async function remove(targetId: number, tenantId: string): Promise<boolean> {

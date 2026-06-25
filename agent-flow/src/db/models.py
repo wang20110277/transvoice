@@ -1,7 +1,7 @@
 """SQLAlchemy 2.0 ORM 模型 - 与 init_db.sql 精确对齐"""
 from datetime import datetime
 from sqlalchemy import (
-    BigInteger, Boolean, DateTime, Float, Integer, String, Text, func,
+    BigInteger, Boolean, DateTime, Float, Integer, String, Text, func, text,
     CheckConstraint, ForeignKey, Index, UniqueConstraint, PrimaryKeyConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -377,6 +377,9 @@ class CallTarget(Base):
     next_attempt_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_call_session_id: Mapped[int | None] = mapped_column(BigInteger)
     last_hangup_cause: Mapped[str | None] = mapped_column(Text)
+    # 结构化导入：每号码 render 变量（JSONB，摘机后透传进 graph state call_task_vars）+ 客户id（展示/审计）
+    vars: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    customer_id: Mapped[str | None] = mapped_column(Text)
     create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     create_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")
     update_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())

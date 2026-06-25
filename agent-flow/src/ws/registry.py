@@ -14,6 +14,9 @@ class ActiveCall:
     user_key: str = ""
     tenant_id: str = "default"
     scenario: str = "default"
+    # 外呼每号码 render 变量（call_target.vars，摘机加载）→ 透传进 graph state call_task_vars。
+    # 呼入恒 {}（无 call_target_id），零影响。
+    call_target_vars: dict = field(default_factory=dict)
     cancel: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -30,6 +33,7 @@ class ActiveCallRegistry:
         user_key: str = "",
         tenant_id: str = "default",
         scenario: str = "default",
+        call_target_vars: dict | None = None,
     ) -> ActiveCall:
         """注册一个新通话。"""
         call = ActiveCall(
@@ -38,11 +42,12 @@ class ActiveCallRegistry:
             user_key=user_key,
             tenant_id=tenant_id,
             scenario=scenario,
+            call_target_vars=call_target_vars or {},
         )
         self._calls[call_id] = call
         logger.debug(
-            "[%s] call registered tenant=%s biz_type=%s scenario=%s user_key=%s",
-            call_id, tenant_id, biz_type, scenario, user_key,
+            "[%s] call registered tenant=%s biz_type=%s scenario=%s user_key=%s vars=%d",
+            call_id, tenant_id, biz_type, scenario, user_key, len(call.call_target_vars),
         )
         return call
 

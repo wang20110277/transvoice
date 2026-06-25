@@ -1,10 +1,11 @@
 'use client';
 
-import { Fragment, useCallback, useEffect, useState } from 'react';
-import { Plus, Edit3, Trash2, RefreshCw, CheckCircle2, AlertCircle, Play, Pause, ChevronDown, ChevronRight, Upload } from 'lucide-react';
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
+import { Plus, Edit3, Trash2, RefreshCw, CheckCircle2, AlertCircle, Play, Pause, ChevronDown, ChevronRight, Upload, FileDown } from 'lucide-react';
 import { callTasksApi, type CallTaskDTO, type CallTaskInput } from '@/lib/call-tasks-api';
 import { callTargetsApi, type CallTargetDTO, type CallTargetProgress } from '@/lib/call-targets-api';
 import { promptsApi, type PromptDTO } from '@/lib/prompts-api';
+import { parseImportCsv, extractPlaceholders, IMPORT_TEMPLATE_CSV } from '@/lib/csv-import';
 
 const STATUSES = ['idle', 'running', 'paused', 'completed'];
 
@@ -136,7 +137,19 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
   const [targets, setTargets] = useState<CallTargetDTO[]>([]);
   const [progress, setProgress] = useState<CallTargetProgress | null>(null);
   const [newPhone, setNewPhone] = useState('');
-  const [csvText, setCsvText] = useState('');
+  // 结构化导入：粘贴文本 + 解析结果 + 绑定 prompt 占位符 + 单号码最大拨打次数
+  const [importText, setImportText] = useState('');
+  const [importPlaceholders, setImportPlaceholders] = useState<string[]>([]);
+  const [importTaskBizType, setImportTaskBizType] = useState<string | undefined>(undefined);
+  const [importMaxAttempts, setImportMaxAttempts] = useState(1);
+
+  // 即时预览：文本 / 占位符 / 任务 biz_type（取自绑定 prompt）任一变化即重解析
+  const importResult = useMemo(
+    () => (importText.trim()
+      ? parseImportCsv(importText, importPlaceholders, importTaskBizType)
+      : null),
+    [importText, importPlaceholders, importTaskBizType],
+  );
 
   const loadTargets = useCallback(async (taskId: number) => {
     try {
@@ -158,7 +171,13 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
     }
     setExpandedId(t.id);
     setNewPhone('');
-    setCsvText('');
+    setImportText('');
+    // 取绑定 prompt 占位符（systemPrompt {占位符} ∪ 显式 variables）+ biz_type 供导入预览比对
+    const p = await promptsApi.get(t.promptId).catch(() => null);
+    setImportPlaceholders(
+      p ? [...new Set([...extractPlaceholders(p.systemPrompt), ...p.variables])] : [],
+    );
+    setImportTaskBizType(p?.bizType);
     await loadTargets(t.id);
   };
 
@@ -178,12 +197,33 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
     }
   };
 
-  const uploadCsv = async (taskId: number) => {
-    if (!csvText.trim()) return;
+  const downloadTemplate = () => {
+    const blob = new Blob([IMPORT_TEMPLATE_CSV], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'call-targets-template.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const onImportFile = async (file: File) => {
+    try {
+      setImportText(await file.text());
+    } catch {
+      flash('err', '读取文件失败');
+    }
+  };
+
+  const submitImport = async (taskId: number) => {
+    if (!importResult || importResult.validCount === 0) return;
     setBusy(true);
     try {
-      const r = await callTargetsApi.uploadCsv(taskId, csvText);
-      setCsvText('');
+      const payload = importResult.rows
+        .filter((r) => !r.error)
+        .map((r) => ({ phone: r.phone, customerId: r.customerId, vars: r.vars }));
+      const r = await callTargetsApi.importStructured(taskId, payload, importMaxAttempts);
+      setImportText('');
       flash('ok', `已导入 ${r.inserted} 个号码${r.skipped ? `（跳过重复 ${r.skipped}）` : ''}`);
       await loadTargets(taskId);
     } catch (e) {
@@ -425,16 +465,112 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
                             </div>
                             <button onClick={() => addPhone(t.id)} disabled={busy || !newPhone.trim()} className="px-3 py-2 bg-indigo-600 text-white text-xs rounded-lg hover:bg-indigo-700 disabled:opacity-40 font-semibold">添加</button>
                           </div>
+                          {/* 结构化批量导入：固定 5 列模板，支持粘贴/上传 + 即时预览 */}
                           <div className="flex flex-col gap-2">
-                            <label className="text-[11px] text-slate-500 font-semibold flex items-center gap-1"><Upload className="w-3 h-3" /> 批量导入（每行一个号码）</label>
+                            <div className="flex items-center justify-between">
+                              <label className="text-[11px] text-slate-500 font-semibold flex items-center gap-1">
+                                <Upload className="w-3 h-3" /> 批量导入（序号｜业务类型｜手机号｜客户id｜json）
+                              </label>
+                              <button onClick={downloadTemplate} className="flex items-center gap-1 text-[11px] text-indigo-600 hover:text-indigo-700 font-semibold">
+                                <FileDown className="w-3 h-3" /> 下载模板
+                              </button>
+                            </div>
                             <textarea
-                              value={csvText}
-                              onChange={(e) => setCsvText(e.target.value)}
-                              placeholder={'1000\n1001\n1002'}
-                              rows={3}
+                              value={importText}
+                              onChange={(e) => setImportText(e.target.value)}
+                              placeholder={'序号,业务类型,手机号,客户id,json\n1,collection,138****5678,C10001,{"customer_name":"张三","amount":"1200"}'}
+                              rows={4}
                               className="text-xs p-2 bg-white border border-slate-200 rounded-lg font-mono focus:outline-none focus:border-indigo-600"
                             />
-                            <button onClick={() => uploadCsv(t.id)} disabled={busy || !csvText.trim()} className="self-start px-3 py-2 bg-slate-700 text-white text-xs rounded-lg hover:bg-slate-800 disabled:opacity-40 font-semibold">批量导入</button>
+                            <div className="flex items-center gap-2">
+                              <label className="flex items-center gap-1 text-[11px] text-slate-500 font-semibold cursor-pointer hover:text-slate-700">
+                                <Upload className="w-3 h-3" /> 上传 .csv
+                                <input
+                                  type="file" accept=".csv,text/csv" className="hidden"
+                                  onChange={(e) => { const f = e.target.files?.[0]; if (f) onImportFile(f); e.target.value = ''; }}
+                                />
+                              </label>
+                            </div>
+
+                            {importResult && (
+                              <div className="bg-white border border-slate-200 rounded-lg p-2.5 space-y-2">
+                                {/* 汇总条 */}
+                                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] font-semibold">
+                                  <span className="text-slate-600">共 {importResult.totalRows} 行</span>
+                                  <span className="text-emerald-600">有效 {importResult.validCount}</span>
+                                  {importResult.errorCount > 0 && <span className="text-rose-600">错误 {importResult.errorCount}</span>}
+                                  {importResult.warningCount > 0 && <span className="text-amber-600">biz_type 不一致 {importResult.warningCount}</span>}
+                                  {!importResult.hasPhoneColumn && <span className="text-rose-500">缺少「手机号」列</span>}
+                                </div>
+                                {/* 占位符比对 */}
+                                {importPlaceholders.length > 0 && (
+                                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px]">
+                                    <span className="text-slate-400">变量覆盖:</span>
+                                    {importResult.placeholders.hit.map((v) => (
+                                      <span key={`h-${v}`} className="px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200">{v}</span>
+                                    ))}
+                                    {importResult.placeholders.missing.map((v) => (
+                                      <span key={`m-${v}`} className="px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200" title="无任何行提供此变量">{v}（缺）</span>
+                                    ))}
+                                    {importResult.placeholders.extra.map((v) => (
+                                      <span key={`e-${v}`} className="px-1.5 py-0.5 rounded bg-slate-50 text-slate-400 border border-slate-200" title="prompt 无此占位符，多余">{v}</span>
+                                    ))}
+                                  </div>
+                                )}
+                                {/* 前 5 行预览 */}
+                                {importResult.rows.length > 0 && (
+                                  <div className="max-h-40 overflow-y-auto border-t border-slate-100">
+                                    <table className="w-full text-[10px]">
+                                      <thead className="bg-slate-50 text-slate-500 sticky top-0">
+                                        <tr>
+                                          <th className="text-left p-1.5 font-semibold">序号</th>
+                                          <th className="text-left p-1.5 font-semibold">手机号</th>
+                                          <th className="text-left p-1.5 font-semibold">客户id</th>
+                                          <th className="text-left p-1.5 font-semibold">json/错误</th>
+                                        </tr>
+                                      </thead>
+                                      <tbody className="divide-y divide-slate-50">
+                                        {importResult.rows.slice(0, 5).map((r, i) => (
+                                          <tr key={i} className={r.error ? 'bg-rose-50/40' : r.warning ? 'bg-amber-50/40' : ''}>
+                                            <td className="p-1.5 text-slate-400">{r.seq ?? i + 1}</td>
+                                            <td className="p-1.5 font-mono text-slate-700">{r.phone || '—'}</td>
+                                            <td className="p-1.5 font-mono text-slate-500">{r.customerId ?? '—'}</td>
+                                            <td className="p-1.5">
+                                              {r.error ? (
+                                                <span className="text-rose-600">{r.error}</span>
+                                              ) : (
+                                                <span className="font-mono text-slate-500 truncate block max-w-[220px]" title={JSON.stringify(r.vars)}>
+                                                  {Object.keys(r.vars).length ? JSON.stringify(r.vars) : '—'}
+                                                </span>
+                                              )}
+                                              {!r.error && r.warning && <span className="block text-amber-600">{r.warning}</span>}
+                                            </td>
+                                          </tr>
+                                        ))}
+                                      </tbody>
+                                    </table>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+
+                            <div className="flex items-center gap-2">
+                              <label className="flex items-center gap-1 text-[11px] text-slate-500 font-semibold">
+                                最大拨打
+                                <input
+                                  type="number" min={1} max={10} value={importMaxAttempts}
+                                  onChange={(e) => setImportMaxAttempts(Math.max(1, Number(e.target.value) || 1))}
+                                  className="w-14 text-xs p-1 bg-white border border-slate-200 rounded-lg text-center focus:outline-none focus:border-indigo-600"
+                                />
+                              </label>
+                              <button
+                                onClick={() => submitImport(t.id)}
+                                disabled={busy || !importResult || importResult.validCount === 0}
+                                className="px-3 py-2 bg-slate-700 text-white text-xs rounded-lg hover:bg-slate-800 disabled:opacity-40 font-semibold"
+                              >
+                                导入有效 {importResult?.validCount ?? 0} 行
+                              </button>
+                            </div>
                           </div>
                           {/* 号码列表 */}
                           <div className="bg-white rounded-lg border border-slate-100 overflow-hidden">
@@ -447,6 +583,7 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
                                   <thead className="bg-slate-50 text-slate-500 sticky top-0">
                                     <tr>
                                       <th className="text-left p-2 font-semibold">号码</th>
+                                      <th className="text-left p-2 font-semibold">客户id</th>
                                       <th className="text-left p-2 font-semibold">状态</th>
                                       <th className="text-left p-2 font-semibold">已拨</th>
                                       <th className="text-left p-2 font-semibold">上次结果</th>
@@ -457,6 +594,7 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
                                     {targets.map((tg) => (
                                       <tr key={tg.id}>
                                         <td className="p-2 font-mono text-slate-700">{tg.phoneMasked ?? tg.userKey}</td>
+                                        <td className="p-2 font-mono text-slate-500 text-[10px]">{tg.customerId ?? '—'}</td>
                                         <td className="p-2">
                                           <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
                                             tg.status === 'answered' || tg.status === 'done' ? 'bg-emerald-100 text-emerald-700' :

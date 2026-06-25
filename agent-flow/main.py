@@ -377,7 +377,20 @@ def _create_esl_event_handlers(esl: ESLClient) -> None:
             bool(call_target_id), call_task_id, call_target_id,
         )
 
-        _call_registry.register(uuid, biz_type, user_key, tenant_id=tenant_id, scenario=scenario)
+        # 外呼：摘机加载 call_target.vars（每号码 render 变量）透传进 registry → graph state。
+        # 呼入无 call_target_id，call_target_vars 恒 {}。get_call_target 失败/vars 非 dict → 降级 {}，记 WARNING。
+        call_target_vars: dict = {}
+        if call_target_id is not None:
+            t = await repository.get_call_target(call_target_id)
+            if t is not None and isinstance(t.vars, dict):
+                call_target_vars = t.vars
+            elif t is not None:
+                logger.warning("[%s] call_target %s vars 非 dict，降级为空变量", uuid, call_target_id)
+
+        _call_registry.register(
+            uuid, biz_type, user_key, tenant_id=tenant_id, scenario=scenario,
+            call_target_vars=call_target_vars,
+        )
 
         # session 写入 PG（fire-and-forget，DB 异常仅记日志不阻断通话）
         try:

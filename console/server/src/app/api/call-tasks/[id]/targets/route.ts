@@ -1,7 +1,7 @@
-/** GET / POST /api/call-tasks/:id/targets — 号码清单列表 + 录入（单条/CSV 批量）。 */
+/** GET / POST /api/call-tasks/:id/targets — 号码清单列表 + 录入（单条/结构化批量）。 */
 import { NextResponse } from 'next/server';
 import { requirePermission, isDenial } from '@/lib/guards';
-import { listByTask, create, bulkCreateFromCsv } from '@/lib/call-targets-service';
+import { listByTask, create, bulkCreateStructured } from '@/lib/call-targets-service';
 
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   const auth = await requirePermission('calltask:view');
@@ -17,14 +17,17 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
   const { id } = await params;
   const body = (await req.json()) as {
     phone?: string;          // 单条录入
-    csv?: string;            // CSV 批量（每行一个号码）
+    targets?: { phone: string; customerId?: string; vars?: Record<string, string> }[]; // 结构化批量
     maxAttempts?: number;    // 可选，默认 1
   };
   const maxAttempts = body.maxAttempts ?? 1;
 
-  if (body.csv !== undefined) {
-    const result = await bulkCreateFromCsv(
-      Number(id), auth.tenantId, body.csv, maxAttempts, auth.email,
+  if (Array.isArray(body.targets)) {
+    if (body.targets.length === 0) {
+      return NextResponse.json({ error: 'targets 不能为空' }, { status: 400 });
+    }
+    const result = await bulkCreateStructured(
+      Number(id), auth.tenantId, body.targets, maxAttempts, auth.email,
     );
     return NextResponse.json(result);
   }
@@ -35,5 +38,5 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     }
     return NextResponse.json(row);
   }
-  return NextResponse.json({ error: '需要 phone 或 csv 字段' }, { status: 400 });
+  return NextResponse.json({ error: '需要 phone 或 targets 字段' }, { status: 400 });
 }

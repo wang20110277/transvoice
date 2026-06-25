@@ -552,6 +552,7 @@ class StreamingCallHandler:
                 precomputed_asr_result=precomputed_asr_result,
                 tenant_id=tenant_id,
                 scenario=scenario,
+                call_task_vars=active_call.call_target_vars if active_call else None,
             )
 
             if barge_in_event and barge_in_event.is_set():
