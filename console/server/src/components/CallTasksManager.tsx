@@ -218,9 +218,9 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
     <div className="space-y-4">
       <div className="flex justify-between items-center bg-white p-4 rounded-xl border border-slate-100 shadow-xs">
         <div>
-          <h2 className="text-base font-bold text-slate-800">外呼任务（定义层）</h2>
+          <h2 className="text-base font-bold text-slate-800">外呼任务</h2>
           <p className="text-xs text-slate-500 mt-1">
-            绑定提示词 + 策略参数，落 call_task 表。本期仅定义，不发起 originate/调度/重拨（执行属后续变更）。
+            绑定提示词（三元组）+ 策略参数，落 call_task 表。执行引擎（originate / 调度 / 重拨 / 并发）代码已就绪，尚未接入主进程启用，故运行时暂不发起外呼。
           </p>
         </div>
         <button
@@ -297,7 +297,7 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
               <input
                 value={form.allowedHours ?? ''}
                 onChange={(e) => setForm({ ...form, allowedHours: e.target.value })}
-                placeholder="例：09:00-21:00（声明性，本期不执行）"
+                placeholder="例：09:00-21:00（策略参数，执行启用后生效）"
                 className="w-full text-xs p-2.5 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-600"
               />
             </div>
@@ -312,7 +312,7 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
             </div>
           </div>
           <div className="space-y-1">
-            <label className="text-xs text-slate-500 font-semibold">状态（本期仅存储，无执行器驱动流转）</label>
+            <label className="text-xs text-slate-500 font-semibold">状态（执行器未启用，仅存储不自动流转）</label>
             <select
               value={form.status}
               onChange={(e) => setForm({ ...form, status: e.target.value })}

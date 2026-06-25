@@ -212,7 +212,7 @@ export default function PromptManager() {
     <div className="space-y-4">
       <div className="flex justify-between items-center bg-white p-4 rounded-xl border border-slate-100 shadow-xs">
         <div>
-          <h2 className="text-base font-bold text-slate-800">提示词配置管理</h2>
+          <h2 className="text-base font-bold text-slate-800">提示词配置</h2>
           <p className="text-xs text-slate-500 mt-1">
             三维度 (tenant_id, biz_type, scenario) 唯一。发布后清 Redis 缓存零延迟生效,呼入 agent-flow 即时取用。
           </p>
