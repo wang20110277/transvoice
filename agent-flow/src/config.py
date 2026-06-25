@@ -1,6 +1,22 @@
 """应用配置 - pydantic-settings，环境变量覆盖"""
+import socket
+
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings
-from pydantic import Field
+
+
+def _detect_local_ip() -> str:
+    """探测本机默认路由出口 IP（agent-flow 与 FS 同机时即 FS local_ip_v4 / SIP 注册域）。
+
+    UDP connect 不实际发包，仅让内核依路由表选定源 IP——比 gethostbyname(gethostname())
+    可靠（后者常返回 127.0.0.1 或 hostname 解析失败）。多网卡机器返回默认路由那张。
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))  # 任意公网地址即可，无需可达
+        return sock.getsockname()[0]
+    finally:
+        sock.close()
 
 
 class Settings(BaseSettings):
@@ -18,6 +34,8 @@ class Settings(BaseSettings):
     minio_endpoint: str = "127.0.0.1:9000"
     minio_access_key: str = "admin"
     minio_secret_key: str = "changeme123"
+    minio_bucket: str = "audio-archive"
+    minio_secure: bool = False
 
     # ASR adapter
     asr_adapter_url: str = "http://127.0.0.1:8080"
@@ -148,18 +166,42 @@ class Settings(BaseSettings):
     recording_archive_delay_sec: int = 3
     recording_notice_sound: str = "ivr/recording_notice.wav"
 
-    # 外呼执行引擎
-    # originate 端点模板：{phone}/{domain} 占位。验证结论：本地注册分机必须用 user/{phone}@{domain}
-    # 直连（sofia/internal/{phone} 会重新进 dialplan 导致循环），domain 取注册域（FS local_ip）。
-    # 后期换 SIP 网关：CALLBOT_OUTBOUND_ENDPOINT_TEMPLATE=sofia/gateway/<gw>/{phone}
+    # ── 外呼执行引擎 — 测试模式(当前,呼内部分机) / 生产模式(呼真实手机号)切换 ──
+    # 【测试模式 · 当前】softphone 注册到 FS internal profile，直拨分机号
+    #   endpoint_template = user/{phone}@{domain}   {phone}=分机号(如1000)  {domain}=outbound_domain(本机IP)
+    #   caller_id 可空；前提：freeswitch/sip_profiles/internal.xml + 软电话已注册
+    # 【生产模式 · 呼真实号码】走运营商 SIP 中继(gateway)，改 4 处 + FS 侧加 external 网关：
+    #   1. endpoint_template → sofia/gateway/<gw_name>/{phone}   ← 模板不含 {domain}，outbound_domain 随之失效
+    #      <gw_name> 对应 FS external profile 里的 <gateway name>；当前 sip_profiles/ 无 external.xml，需新增
+    #   2. {phone} 含义：分机号 → 真实号码(国家码按网关要求)，值来自 call_target.user_key(console 录入)
+    #   3. caller_id 必填：运营商分配主叫号，未报备会被拒呼(本字段仅设 origination_caller_id_number；
+    #      若要主叫名/P-Asserted-Identity，需在 originate.py build_originate_command 扩展 channel vars)
+    #   4. codec 按运营商调整：G.711(PCMA/PCMU) 通用；省带宽可上 G.729(FS 需 mod_g729 授权或仅 passthru)
+    #   合规前置：主叫号报备、白名单、外呼时段(call_task.allowed_hours)、录音告知 —— 上线前必须就绪
+    #
+    # originate 端点模板 {phone}/{domain} 占位。验证结论：本地注册分机必须用 user/{phone}@{domain}
+    # 直连（sofia/internal/{phone} 会重新进 dialplan 导致循环）。
     outbound_endpoint_template: str = "user/{phone}@{domain}"
-    outbound_domain: str = "192.168.0.192"  # 软电话注册域（FS local_ip_v4）
-    # 强制音频编解码：实测 G.722 会让 mod_audio_fork 抓到的帧格式不对、ASR 收不到有效音频，
-    # 必须强制线性编解码 PCMA。空串=不强制（用 profile 默认）。
+    # 端点模板含 {domain}（测试模式 user/{phone}@{domain}）时必填：= FS local_ip_v4，每台机器不同。
+    # 不给默认值（避免把某台机器 IP 当通用配置）；留空则启动时自动取本机主网卡 IP——agent-flow 与
+    # FS 同机即 SIP 注册域，零配置可用；FS 在远端时须显式设 CALLBOT_OUTBOUND_DOMAIN=<FS主机IP>。
+    # 生产切 gateway 模板（sofia/gateway/<gw>/{phone}，无 {domain}）后此项失效。
+    outbound_domain: str = ""
+    # 强制编解码：实测 G.722 会让 mod_audio_fork 抓帧格式不对、ASR 收不到有效音频，必须强制线性 PCMA。空串=不强制。
     outbound_codec_string: str = "PCMA"
-    outbound_caller_id: str = ""  # 主叫号；分机验证阶段可空
+    # 主叫号：测试(内部分机)可空；生产走网关必填且需运营商报备，否则拒呼。
+    outbound_caller_id: str = ""
     outbound_scheduler_tick_sec: int = 10
     outbound_global_concurrency: int = 0  # 0=不限，仅 per-task concurrent_limit 生效
+
+    @model_validator(mode="after")
+    def _resolve_outbound_domain(self) -> "Settings":
+        # 端点模板含 {domain}（测试模式）且未显式配置时，自动取本机主网卡 IP——FS $${domain}=
+        # $${local_ip_v4}，agent-flow 与 FS 同机即 SIP 注册域，零配置可用。生产 gateway 模板（无 {domain}
+        # 占位）不触发，outbound_domain 留空也无妨（模板不渲染它）。
+        if "{domain}" in self.outbound_endpoint_template and not self.outbound_domain:
+            self.outbound_domain = _detect_local_ip()
+        return self
 
     model_config = {"env_prefix": "CALLBOT_", "env_file": ".env", "extra": "ignore"}
 

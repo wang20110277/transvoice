@@ -33,15 +33,16 @@ def build_originate_command(
     codec_string: str = "PCMA",
     caller_id: str = "",
 ) -> str:
-    """构造 originate 命令。
+    """构造 originate 命令（纯函数，端点模板/编解码/主叫号均可注入，便于单测）。
 
     channel vars 注入 ai_outbound 标记 + 三元组 + call_task_id/call_target_id/user_key；
     answer 处理器据此走 outbound 分支（跳过 DID 解析），复用 inbound 对话管线。
-    B-leg 用 &park()，靠 audio_fork + TTSOutputBuffer 静音帧保活。
 
     endpoint_template 默认 user/{phone}@{domain}：本地注册分机必须直连（sofia/internal/{phone}
     会重新进 dialplan 触发循环/deflect）。codec_string 默认 PCMA：实测 G.722 会让
     mod_audio_fork 抓到的帧格式不对、ASR 收不到有效音频，必须强制线性编解码。
+    本函数不感知被叫是分机还是真实号码 —— 测试(内部分机)→生产(真实号码,走
+    sofia/gateway/<gw>/{phone})的完整改造清单见 src/config.py「外呼执行引擎」注释。
     """
     vars_ = [
         "ai_outbound=true",
