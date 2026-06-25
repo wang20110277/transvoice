@@ -92,6 +92,20 @@ async def get_call_session_by_fs_uuid(fs_uuid: str) -> CallSession | None:
         return None
 
 
+async def get_artifact_by_call_kind(call_id: str, kind: str) -> CallArtifact | None:
+    """查某通话某 kind 的 artifact（手动归档幂等检查：已有 recording 则不重复上传）。"""
+    try:
+        async with async_session() as session:
+            stmt = select(CallArtifact).where(
+                CallArtifact.call_id == call_id, CallArtifact.kind == kind,
+            )
+            result = await session.execute(stmt)
+            return result.scalars().first()
+    except SQLAlchemyError as e:
+        logger.error(f"get_artifact_by_call_kind 失败: {e}")
+        return None
+
+
 # ── 外呼号码清单（call_target）──
 
 async def claim_call_target_for_dial(target_id: int) -> bool:

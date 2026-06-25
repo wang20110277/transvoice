@@ -41,10 +41,18 @@ export interface ListQuery {
   pageSize?: number;
 }
 
+/** 非 2xx 响应抛出携带 status 的错误，供调用方按状态码分支（如手动归档 409/410/502）。 */
+export class HttpError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+    this.name = 'HttpError';
+  }
+}
+
 async function req<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, { ...init, headers: { ...(init?.headers ?? {}) } });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error((data as { error?: string }).error ?? `HTTP ${res.status}`);
+  if (!res.ok) throw new HttpError(res.status, (data as { error?: string }).error ?? `HTTP ${res.status}`);
   return data as T;
 }
 
@@ -59,4 +67,6 @@ export const callsApi = {
   list: (q: ListQuery = {}) => req<{ calls: SessionDTO[]; total: number }>(`/api/calls${qs(q)}`),
   detail: (id: number) => req<CallDetailClient>(`/api/calls/${id}`),
   recordingUrl: (id: number) => req<{ url: string; expiresIn: number }>(`/api/calls/${id}/recording-url`),
+  archiveRecording: (id: number) =>
+    req<{ objectKey?: string; error?: string }>(`/api/calls/${id}/archive-recording`, { method: 'POST' }),
 };

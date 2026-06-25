@@ -10,6 +10,9 @@ import { db } from '@/db/client';
 import { callSession, callTurn, callEvent, callArtifact } from '@/db/schema';
 import { presignedRecordingUrl } from './minio-client';
 
+/** agent-flow 地址（console 手动归档转发目标）。默认本机部署。 */
+const flowBaseUrl = process.env.CALLBOT_FLOW_URL ?? 'http://127.0.0.1:8000';
+
 export interface SessionDTO {
   id: number;
   callId: string;
@@ -106,4 +109,20 @@ export async function getRecordingUrl(id: number, tenantId: string): Promise<str
     .where(and(eq(callArtifact.callId, sess[0].callId), eq(callArtifact.kind, 'recording')));
   if (arts.length === 0) return null;
   return await presignedRecordingUrl(arts[0].uri); // 1h presigned；MinIO 未配置返回 null
+}
+
+export async function archiveRecording(
+  id: number, tenantId: string,
+): Promise<{ status: number; body: unknown }> {
+  // 先按 tenantId 校验 session 归属（跨租户 → 404，不泄漏存在性），再取 fsUuid 转发 agent-flow。
+  // 透传 agent-flow 的状态码与 body（200/409/410/502），由前端按码给出对应提示。
+  const sess = await db.select({ fsUuid: callSession.fsUuid }).from(callSession)
+    .where(and(eq(callSession.id, id), eq(callSession.tenantId, tenantId)));
+  if (sess.length === 0) return { status: 404, body: { error: 'not found' } };
+  const resp = await fetch(
+    `${flowBaseUrl}/calls/${sess[0].fsUuid}/archive-recording`,
+    { method: 'POST' },
+  );
+  const body = await resp.json().catch(() => ({}));
+  return { status: resp.status, body };
 }

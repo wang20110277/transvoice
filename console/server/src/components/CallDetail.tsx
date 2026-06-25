@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { ArrowLeft, PlayCircle, AlertCircle, CheckCircle2 } from 'lucide-react';
-import { callsApi, type CallDetailClient } from '@/lib/calls-api';
+import { callsApi, HttpError, type CallDetailClient } from '@/lib/calls-api';
 
 function fmtTs(ts: Date | string): string {
   const d = typeof ts === 'string' ? new Date(ts) : ts;
@@ -22,6 +22,7 @@ export default function CallDetail({ id }: { id: number }) {
   const [recordingUrl, setRecordingUrl] = useState<string | null>(null);
   const [recordingChecked, setRecordingChecked] = useState(false);
   const [toast, setToast] = useState<{ kind: 'ok' | 'err'; msg: string } | null>(null);
+  const [archiving, setArchiving] = useState(false);
 
   const flash = (kind: 'ok' | 'err', msg: string) => {
     setToast({ kind, msg });
@@ -50,6 +51,24 @@ export default function CallDetail({ id }: { id: number }) {
       setLoading(false);
     }
   }, [id]);
+
+  const handleArchive = async () => {
+    setArchiving(true);
+    try {
+      await callsApi.archiveRecording(id);
+      flash('ok', '归档成功');
+      await load();  // 刷新 → artifact 出现 → recordingUrl → 播放器
+    } catch (e) {
+      const status = e instanceof HttpError ? e.status : 0;
+      if (status === 409) { flash('ok', '录音已归档'); await load(); }
+      else if (status === 410) flash('err', '录音文件已被清理，无法补归档');
+      else if (status === 502) flash('err', '归档服务暂不可用，请稍后重试');
+      else if (status === 404) flash('err', '通话记录不存在');
+      else flash('err', (e as Error).message || '归档失败');
+    } finally {
+      setArchiving(false);
+    }
+  };
 
   useEffect(() => {
     load();
@@ -97,9 +116,20 @@ export default function CallDetail({ id }: { id: number }) {
         {recordingUrl ? (
           <audio controls src={recordingUrl} className="w-full" />
         ) : recordingChecked ? (
-          <p className="text-xs text-slate-400">
-            {recording ? '录音存在但生成播放链接失败（MinIO 可能未配置）' : '录音未归档'}
-          </p>
+          recording ? (
+            <p className="text-xs text-slate-400">录音存在但生成播放链接失败（MinIO 可能未配置）</p>
+          ) : (
+            <div className="flex items-center gap-3">
+              <p className="text-xs text-slate-400">录音未归档</p>
+              <button
+                onClick={handleArchive}
+                disabled={archiving}
+                className="px-3 py-1 text-xs font-semibold rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {archiving ? '归档中…' : '手动归档'}
+              </button>
+            </div>
+          )
         ) : null}
         {recording && (
           <p className="text-[11px] text-slate-400 mt-1 font-mono">

@@ -34,6 +34,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 
 from fastapi import FastAPI, WebSocket
+from fastapi.responses import JSONResponse
 
 from src.config import settings
 from src.storage import minio_storage, repository
@@ -106,7 +107,7 @@ async def _archive_recording(fs_uuid: str, biz_type: str, tenant_id: str, user_k
     key = await minio_storage.upload_recording(fs_uuid, wav_bytes, biz_type, tenant_id)
     if key is None:
         logger.info("[%s] upload_recording returned None (MinIO 未配置或 endpoint=%s)，跳过归档",
-                    fs_uuid, os.environ.get("MINIO_ENDPOINT", ""))
+                    fs_uuid, settings.minio_endpoint)
         return  # MinIO 未配置，静默跳过
 
     try:
@@ -576,6 +577,54 @@ app = FastAPI(title="Agent Orchestrator", lifespan=lifespan)
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok" if _initialized else "initializing"}
+
+
+@app.post("/calls/{fs_uuid}/archive-recording")
+async def archive_recording(fs_uuid: str):
+    """手动归档整通录音（自动归档失败的兜底入口）。
+
+    自动归档 `_archive_recording`（CHANNEL_HANGUP 后 fire-and-forget）在 MinIO 不可用时静默
+    跳过；本接口提供事后补归档。链路与 _archive_recording 一致（读 FS 本地 wav → upload_recording
+    → insert_artifact），区别仅三元组来源：自动=ActiveCallRegistry（挂断后清空），手动=DB 反查
+    call_session。无鉴权（内网信任，与 /media 一致），租户隔离由调用方 console 转发前保证。
+    """
+    session = await repository.get_call_session_by_fs_uuid(fs_uuid)
+    if session is None:
+        return JSONResponse(status_code=404, content={"error": "call session not found"})
+
+    existing = await repository.get_artifact_by_call_kind(fs_uuid, "recording")
+    if existing is not None:
+        return JSONResponse(
+            status_code=409, content={"error": "already archived", "objectKey": existing.uri})
+
+    path = os.path.join(settings.recordings_dir, f"{fs_uuid}.wav")
+    if not os.path.exists(path):
+        return JSONResponse(status_code=410, content={"error": "recording file not found"})
+    try:
+        with open(path, "rb") as f:
+            wav_bytes = f.read()
+    except OSError as e:
+        logger.warning("[%s] manual archive read failed: %s", fs_uuid, e)
+        return JSONResponse(status_code=410, content={"error": "recording file not found"})
+
+    key = await minio_storage.upload_recording(
+        fs_uuid, wav_bytes, session.biz_type, session.tenant_id)
+    if key is None:
+        return JSONResponse(status_code=502, content={"error": "minio unavailable"})
+
+    try:
+        await repository.insert_artifact(
+            call_id=fs_uuid, fs_uuid=fs_uuid, biz_type=session.biz_type,
+            user_id=session.user_id, user_key=session.user_key,
+            kind="recording", storage="minio", uri=key,
+            size_bytes=len(wav_bytes), content_type="audio/wav",
+        )
+    except Exception as e:
+        logger.error("[%s] manual archive insert_artifact failed: %s", fs_uuid, e)
+        return JSONResponse(status_code=500, content={"error": "failed to persist artifact"})
+
+    logger.info("[%s] manual recording archived: %s (%d bytes)", fs_uuid, key, len(wav_bytes))
+    return JSONResponse(status_code=200, content={"objectKey": key})
 
 
 @app.websocket("/media/{call_id}")
