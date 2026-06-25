@@ -5,7 +5,7 @@
  * 录音链接存 call_artifact(kind='recording')（与 call_session 一对多），非 call_session 列。
  * phone_hash 不下发前端，只给 phone_masked。
  */
-import { and, asc, count, desc, eq, gte, isNotNull, isNull, like, lte } from 'drizzle-orm';
+import { and, asc, count, desc, eq, gte, isNotNull, isNull, like, lte, sql } from 'drizzle-orm';
 import { db } from '@/db/client';
 import { callSession, callTurn, callEvent, callArtifact } from '@/db/schema';
 import { presignedRecordingUrl } from './minio-client';
@@ -52,6 +52,7 @@ export function toSessionDTO(row: SessionRow): SessionDTO {
 
 export interface ListParams {
   tenantId: string;
+  callId?: string;                       // call_id 片段模糊筛选
   bizType?: string;
   phoneMasked?: string;
   direction?: 'inbound' | 'outbound';   // 方向筛选
@@ -63,6 +64,8 @@ export interface ListParams {
 
 export async function listCalls(p: ListParams): Promise<{ calls: SessionDTO[]; total: number }> {
   const conds = [eq(callSession.tenantId, p.tenantId)];
+  // call_id 在 DB 是 uuid 类型（schema 只读映射为 text），LIKE 不可用，需 ::text cast 后 ILIKE（大小写不敏感）
+  if (p.callId) conds.push(sql`${callSession.callId}::text ILIKE ${`%${p.callId}%`}`);
   if (p.bizType) conds.push(eq(callSession.bizType, p.bizType));
   if (p.phoneMasked) conds.push(like(callSession.phoneMasked, `%${p.phoneMasked}%`));
   if (p.direction === 'outbound') conds.push(isNotNull(callSession.callTaskId));

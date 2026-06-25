@@ -1,7 +1,7 @@
 'use client';
 
 import { Fragment, useCallback, useEffect, useState } from 'react';
-import { Plus, Edit3, Trash2, RefreshCw, CheckCircle2, AlertCircle, PhoneCall, Play, Pause, ChevronDown, ChevronRight, Upload } from 'lucide-react';
+import { Plus, Edit3, Trash2, RefreshCw, CheckCircle2, AlertCircle, Play, Pause, ChevronDown, ChevronRight, Upload } from 'lucide-react';
 import { callTasksApi, type CallTaskDTO, type CallTaskInput } from '@/lib/call-tasks-api';
 import { callTargetsApi, type CallTargetDTO, type CallTargetProgress } from '@/lib/call-targets-api';
 import { promptsApi, type PromptDTO } from '@/lib/prompts-api';
@@ -487,12 +487,6 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
             </tbody>
           </table>
         )}
-      </div>
-
-      <div className="bg-blue-50/40 border border-blue-100/60 rounded-lg p-3 text-[11px] text-blue-800 space-y-1">
-        <p className="flex items-center gap-1.5 font-semibold"><PhoneCall className="w-3.5 h-3.5" /> 外呼任务定义层（本期不含执行）</p>
-        <p>当前租户：<span className="font-mono">{tenantId}</span>。任务绑定的 promptId MUST 属于本租户（跨租户绑定会被拒绝）。</p>
-        <p>策略字段（并发/时段/重拨）仅为声明性存储，originate/调度/重拨执行器属独立后续变更。</p>
       </div>
     </div>
   );

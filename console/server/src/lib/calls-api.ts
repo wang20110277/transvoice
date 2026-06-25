@@ -32,6 +32,7 @@ export interface CallDetailClient {
 }
 
 export interface ListQuery {
+  callId?: string;
   bizType?: string;
   phoneMasked?: string;
   direction?: 'inbound' | 'outbound';

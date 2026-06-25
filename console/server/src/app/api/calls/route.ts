@@ -7,6 +7,7 @@ export async function GET(req: Request) {
   const auth = await requirePermission('call:view');
   if (isDenial(auth)) return auth;
   const url = new URL(req.url);
+  const callId = url.searchParams.get('callId') || undefined;
   const bizType = url.searchParams.get('bizType') || undefined;
   const phoneMasked = url.searchParams.get('phoneMasked') || undefined;
   const directionParam = url.searchParams.get('direction');
@@ -16,7 +17,7 @@ export async function GET(req: Request) {
   const page = Number(url.searchParams.get('page') ?? '1');
   const pageSize = Number(url.searchParams.get('pageSize') ?? '10');
   const result = await listCalls({
-    tenantId: auth.tenantId, bizType, phoneMasked, direction,
+    tenantId: auth.tenantId, callId, bizType, phoneMasked, direction,
     startFrom: startFrom ? new Date(startFrom) : undefined,
     startTo: startTo ? new Date(startTo) : undefined,
     page, pageSize,

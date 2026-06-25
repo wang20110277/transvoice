@@ -30,6 +30,7 @@ export default function CallRecordsList({ tenantId }: { tenantId: string }) {
   const pageSize = 10;
 
   // 筛选
+  const [fCallId, setFCallId] = useState('');
   const [fBiz, setFBiz] = useState('');
   const [fPhone, setFPhone] = useState('');
   const [fDir, setFDir] = useState('');
@@ -45,6 +46,7 @@ export default function CallRecordsList({ tenantId }: { tenantId: string }) {
     setLoading(true);
     try {
       const r = await callsApi.list({
+        callId: fCallId || undefined,
         bizType: fBiz || undefined,
         phoneMasked: fPhone || undefined,
         direction: (fDir === 'inbound' || fDir === 'outbound') ? fDir : undefined,
@@ -60,7 +62,7 @@ export default function CallRecordsList({ tenantId }: { tenantId: string }) {
     } finally {
       setLoading(false);
     }
-  }, [fBiz, fPhone, fDir, fFrom, fTo, page]);
+  }, [fCallId, fBiz, fPhone, fDir, fFrom, fTo, page]);
 
   useEffect(() => {
     reload();
@@ -106,7 +108,17 @@ export default function CallRecordsList({ tenantId }: { tenantId: string }) {
 
       {/* 筛选区 */}
       <div className="bg-white p-4 rounded-xl border border-slate-100 shadow-xs">
-        <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
+        <div className="grid grid-cols-1 md:grid-cols-6 gap-3">
+          <div className="space-y-1">
+            <label className="text-[11px] text-slate-500 font-semibold">call_id</label>
+            <input value={fCallId} onChange={(e) => { setFCallId(e.target.value); setPage(1); }}
+              placeholder="UUID 片段" className="w-full text-xs p-2 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-600 font-mono" />
+          </div>
+          <div className="space-y-1">
+            <label className="text-[11px] text-slate-500 font-semibold">手机号（掩码模糊）</label>
+            <input value={fPhone} onChange={(e) => { setFPhone(e.target.value); setPage(1); }}
+              placeholder="138 / 5678" className="w-full text-xs p-2 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-600 font-mono" />
+          </div>
           <div className="space-y-1">
             <label className="text-[11px] text-slate-500 font-semibold">方向</label>
             <select value={fDir} onChange={(e) => { setFDir(e.target.value); setPage(1); }}
@@ -125,11 +137,6 @@ export default function CallRecordsList({ tenantId }: { tenantId: string }) {
             </select>
           </div>
           <div className="space-y-1">
-            <label className="text-[11px] text-slate-500 font-semibold">手机号（掩码模糊）</label>
-            <input value={fPhone} onChange={(e) => { setFPhone(e.target.value); setPage(1); }}
-              placeholder="138 / 5678" className="w-full text-xs p-2 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-600 font-mono" />
-          </div>
-          <div className="space-y-1">
             <label className="text-[11px] text-slate-500 font-semibold">开始时间 ≥</label>
             <input type="datetime-local" value={fFrom} onChange={(e) => { setFFrom(e.target.value); setPage(1); }}
               className="w-full text-xs p-2 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-600" />
@@ -141,7 +148,7 @@ export default function CallRecordsList({ tenantId }: { tenantId: string }) {
           </div>
         </div>
         <div className="flex justify-end gap-2 mt-3">
-          <button onClick={() => { setFDir(''); setFBiz(''); setFPhone(''); setFFrom(''); setFTo(''); setPage(1); }}
+          <button onClick={() => { setFCallId(''); setFDir(''); setFBiz(''); setFPhone(''); setFFrom(''); setFTo(''); setPage(1); }}
             className="px-3 py-1.5 bg-slate-100 text-slate-600 text-xs rounded-lg hover:bg-slate-200 font-semibold">清空</button>
           <button onClick={reload}
             className="flex items-center gap-1 px-3 py-1.5 bg-indigo-600 text-white text-xs rounded-lg hover:bg-indigo-700 font-semibold">
