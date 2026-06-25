@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-智能外呼系统 (Smart Outbound Call System) — a telephony AI platform using FreeSWITCH for SIP/RTP with mod_audio_fork WebSocket audio streaming, built-in GPU ASR/TTS inference (SenseVoice + CosyVoice3) plus cloud-based EdgeTTS (no GPU), pluggable VAD (WebRTC/Silero), WebRTC APM (AEC + NS + AGC), and a LangGraph-orchestrated Python agent driving LLM-powered conversations with full streaming pipeline, barge-in support, gRPC streaming (ASR/TTS), uvloop event loop, pre-VAD audio denoising, ESL auto-reconnect + heartbeat, Docker Compose deployment, dual-channel call recording, multi-tenant `(tenant_id, biz_type, scenario)` isolation, and a Next.js management console (`console/`).
+智能外呼系统 (Smart Outbound Call System) — a telephony AI platform using FreeSWITCH for SIP/RTP with mod_audio_fork WebSocket audio streaming, built-in GPU ASR/TTS inference (SenseVoice + CosyVoice3) plus cloud-based EdgeTTS (no GPU), pluggable VAD (WebRTC/Silero), WebRTC APM (AEC +ANS + AGC), and a LangGraph-orchestrated Python agent driving LLM-powered conversations with full streaming pipeline, barge-in support, gRPC streaming (ASR/TTS), uvloop event loop, pre-VAD audio denoising, ESL auto-reconnect + heartbeat, Docker Compose deployment, dual-channel call recording, multi-tenant `(tenant_id, biz_type, scenario)` isolation, and a Next.js management console (`console/`).
 
 ## Coding Conventions
 
@@ -523,7 +523,7 @@ aiphone/
 - **MinIO** for audio archiving (optional, disabled when `MINIO_ENDPOINT` empty)
 - **FreeSWITCH 1.11.0** compiled from source with mod_audio_fork + mod_event_socket (ESL)
 - **Java MCP Server** Spring Boot 4.0 + Spring AI 2.0.0 (GA), Java 21, Maven build, `@McpTool` annotation-driven tool registration
-- **GPU allocation**: ASR=GPU0 (agent-asr内置), TTS=GPU1 (agent-tts内置), LLM(Qwen3.5:9B)=GPU2(:8083)
+- **GPU allocation**: ASR=GPU0 (agent-asr内置), TTS=GPU1 (agent-tts内置), LLM(Qwen3.5:4B-instruct)=GPU2(:8083)
 - **uvloop**: libuv C-based event loop replacing std asyncio in agent-flow (via `--loop uvloop`), reduces GC pauses under high concurrency
 - **gRPC**: ASR client-streaming (:50051), TTS unary (:50052), both optional feature-flagged alongside HTTP fallback
 - **WebSocket**: Third transport for ASR/TTS streaming (`ws_server.py` in agent-asr/agent-tts, `asr_ws_client.py`/`tts_ws_client.py` in agent-flow)

@@ -2,34 +2,33 @@
 import asyncio
 import io
 import logging
-import os
 import uuid
 from datetime import datetime, timedelta
 
+from config import settings
 from minio import Minio
 
 logger = logging.getLogger(__name__)
 
-MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "")
-MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "")
-MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "")
-MINIO_BUCKET = os.environ.get("MINIO_BUCKET", "audio-archive")
-MINIO_SECURE = os.environ.get("MINIO_SECURE", "false").lower() == "true"
-
 
 def _client() -> Minio | None:
-    if not MINIO_ENDPOINT:
+    if not settings.minio_endpoint:
         return None
-    return Minio(MINIO_ENDPOINT, access_key=MINIO_ACCESS_KEY, secret_key=MINIO_SECRET_KEY, secure=MINIO_SECURE)
+    return Minio(
+        settings.minio_endpoint,
+        access_key=settings.minio_access_key,
+        secret_key=settings.minio_secret_key,
+        secure=settings.minio_secure,
+    )
 
 
 def _ensure_bucket(client: Minio):
-    if not client.bucket_exists(MINIO_BUCKET):
-        client.make_bucket(MINIO_BUCKET)
+    if not client.bucket_exists(settings.minio_bucket):
+        client.make_bucket(settings.minio_bucket)
 
 
 def build_object_key(prefix: str = "audio", call_id: str = "", suffix: str = "") -> str | None:
-    if not MINIO_ENDPOINT:
+    if not settings.minio_endpoint:
         return None
     date_str = datetime.now().strftime("%Y%m%d")
     name = call_id or uuid.uuid4().hex
@@ -45,13 +44,13 @@ def upload_audio(audio_bytes: bytes, object_name: str) -> None:
     try:
         _ensure_bucket(client)
         client.put_object(
-            MINIO_BUCKET,
+            settings.minio_bucket,
             object_name,
             io.BytesIO(audio_bytes),
             length=len(audio_bytes),
             content_type="audio/wav",
         )
-        logger.info("Uploaded audio to MinIO: %s/%s", MINIO_BUCKET, object_name)
+        logger.info("Uploaded audio to MinIO: %s/%s", settings.minio_bucket, object_name)
     except Exception as e:
         logger.error("Failed to upload audio to MinIO: %s", e)
 
@@ -64,7 +63,7 @@ async def upload_recording(
     call_id: str, wav_bytes: bytes, biz_type: str, tenant_id: str,
 ) -> str | None:
     """上传整通录音 wav 到 MinIO。返回 object key；MinIO 未配置返回 None。"""
-    if not MINIO_ENDPOINT:
+    if not settings.minio_endpoint:
         return None
     key = build_object_key(prefix="recordings", call_id=call_id)
     if key is None:
@@ -80,7 +79,7 @@ def presigned_get_url(object_key: str, expiry: int = 3600) -> str | None:
         return None
     try:
         return client.presigned_get_object(
-            MINIO_BUCKET, object_key, expires=timedelta(seconds=expiry),
+            settings.minio_bucket, object_key, expires=timedelta(seconds=expiry),
         )
     except Exception as e:
         logger.error("presigned_get_url failed: %s", e)
