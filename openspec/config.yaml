@@ -1,0 +1,18 @@
+schema: spec-driven
+
+# Project context is injected into OpenSpec planning artifacts.
+# Keep this concise: Superpowers receives it later through plan-ready.md.
+context: |
+  TODO: Describe the project tech stack, architecture patterns, testing strategy,
+  code style, domain constraints, and external dependencies that AI implementers
+  must follow.
+
+
+rules:
+  specs:
+    - Reference existing specs before inventing new behavior.
+    - Every requirement must include concrete scenarios and acceptance checks.
+  design:
+    - Preserve project architecture patterns and explain any new dependency.
+  tasks:
+    - Include exact files, tests, verification commands, and rollback notes.
