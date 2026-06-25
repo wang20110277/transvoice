@@ -1,12 +1,12 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import { Plus, Edit3, Trash2, RefreshCw, CheckCircle2, AlertCircle, Route } from 'lucide-react';
+import { Plus, Edit3, Trash2, RefreshCw, CheckCircle2, AlertCircle } from 'lucide-react';
 import { routesApi, type RouteDTO, type RouteInput } from '@/lib/routes-api';
 
 const BIZ_TYPES = ['customer_service', 'collection', 'marketing'];
 
-export default function InboundRoutesManager({ tenantId }: { tenantId: string }) {
+export default function InboundRoutesManager() {
   const [routes, setRoutes] = useState<RouteDTO[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -265,12 +265,6 @@ export default function InboundRoutesManager({ tenantId }: { tenantId: string })
             </tbody>
           </table>
         )}
-      </div>
-
-      <div className="bg-blue-50/40 border border-blue-100/60 rounded-lg p-3 text-[11px] text-blue-800 space-y-1">
-        <p className="flex items-center gap-1.5 font-semibold"><Route className="w-3.5 h-3.5" /> 呼入解析链路(dialplan 已 catch-all,无需改 FS)</p>
-        <p className="font-mono text-[10px]">呼入 → FS 应答(catch-all) → agent-flow 读 Caller-Destination-Number=DID → 查本表(精确号优先,号段兜底) → (tenant_id, biz_type, scenario) → 命中对应 prompt_config</p>
-        <p>当前租户:<span className="font-mono">{tenantId}</span>。新增 DID 后,记得在「提示词」建一条同 (biz_type, scenario) 的提示词并发布。</p>
       </div>
     </div>
   );

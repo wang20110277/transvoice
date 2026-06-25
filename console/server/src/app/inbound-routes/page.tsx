@@ -12,7 +12,7 @@ export default async function InboundRoutesPage() {
 
   return (
     <ConsoleShell tenantId={tenantId} userEmail={user.email} userName={user.name} role={user.role ?? 'admin'}>
-      <InboundRoutesManager tenantId={tenantId} />
+      <InboundRoutesManager />
     </ConsoleShell>
   );
 }
