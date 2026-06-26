@@ -387,7 +387,6 @@ async def run_streaming_pipeline(
         "[%s] tenant=%s biz_type=%s scenario=%s prompt loaded: %d chars",
         call_id, tenant_id, biz_type, scenario, len(system_prompt),
     )
-    logger.info("[%s] system_prompt content:\n%s", call_id, system_prompt)
 
     # 聚合变量上下文:MCP 身份 ‖ 记忆 ‖ 外呼 call_task.vars(渲染 {占位符})
     vars_context: dict = {}
@@ -398,6 +397,7 @@ async def run_streaming_pipeline(
     if isinstance(call_task_vars, dict):
         vars_context.update(call_task_vars)
     rendered_prompt = render(system_prompt, vars_context)
+    logger.info("[%s] rendered system_prompt (vars=%s):\n%s", call_id, list(vars_context), rendered_prompt)
 
     messages = build_messages(
         biz_type=biz_type,

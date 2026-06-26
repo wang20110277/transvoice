@@ -7,7 +7,7 @@
  *
  * 列名/维度与 agent-flow SQLAlchemy (src/db/models.py CallTask) 严格一致。
  */
-import { and, eq } from 'drizzle-orm';
+import { and, count, desc, eq } from 'drizzle-orm';
 import { db } from '@/db/client';
 import { callSession, callTarget, callTask, promptConfig } from '@/db/schema';
 
@@ -78,9 +78,19 @@ async function assertPromptInTenant(promptId: number, tenantId: string): Promise
   if (rows.length === 0) throw new PromptTenantMismatchError();
 }
 
-export async function listByTenant(tenantId: string): Promise<CallTaskDTO[]> {
-  const rows = await db.select().from(callTask).where(eq(callTask.tenantId, tenantId));
-  return rows.map(toDTO);
+/** 列表（新建在前 + 分页）。返回 {items, total}，total 供前端算页数。 */
+export async function listByTenant(
+  tenantId: string,
+  page = 1,
+  pageSize = 10,
+): Promise<{ items: CallTaskDTO[]; total: number }> {
+  const [rows, countRows] = await Promise.all([
+    db.select().from(callTask).where(eq(callTask.tenantId, tenantId))
+      .orderBy(desc(callTask.createTime))
+      .limit(pageSize).offset((page - 1) * pageSize),
+    db.select({ n: count() }).from(callTask).where(eq(callTask.tenantId, tenantId)),
+  ]);
+  return { items: rows.map(toDTO), total: countRows[0]?.n ?? 0 };
 }
 
 export async function getById(id: number, tenantId: string): Promise<CallTaskDTO | null> {

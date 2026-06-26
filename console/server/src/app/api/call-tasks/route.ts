@@ -3,11 +3,12 @@ import { NextResponse } from 'next/server';
 import { requirePermission, isDenial } from '@/lib/guards';
 import { listByTenant, create, PromptTenantMismatchError, type CallTaskInput } from '@/lib/call-tasks-service';
 
-export async function GET() {
+export async function GET(req: Request) {
   const auth = await requirePermission('calltask:view');
   if (isDenial(auth)) return auth;
-  const rows = await listByTenant(auth.tenantId);
-  return NextResponse.json({ tasks: rows });
+  const page = Math.max(1, Number(new URL(req.url).searchParams.get('page') ?? '1') || 1);
+  const { items, total } = await listByTenant(auth.tenantId, page, 10);
+  return NextResponse.json({ tasks: items, total, page });
 }
 
 export async function POST(req: Request) {

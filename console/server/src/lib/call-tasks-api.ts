@@ -38,7 +38,8 @@ async function req<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export const callTasksApi = {
-  list: () => req<{ tasks: CallTaskDTO[] }>('/api/call-tasks').then((r) => r.tasks),
+  list: (page = 1) =>
+    req<{ tasks: CallTaskDTO[]; total: number; page: number }>(`/api/call-tasks?page=${page}`),
   create: (input: CallTaskInput) =>
     req<CallTaskDTO>('/api/call-tasks', { method: 'POST', body: JSON.stringify(input) }),
   update: (id: number, input: Partial<CallTaskInput>) =>

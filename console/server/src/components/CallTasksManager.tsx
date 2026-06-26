@@ -19,8 +19,52 @@ const emptyForm: CallTaskInput = {
   status: 'idle',
 };
 
+// 分页页码序列：首尾固定 + 中间窗口 + 省略号；窗口限定在开区间 (1, totalPages) 避免与首尾页码重复
+const buildPageNumbers = (current: number, totalPages: number): (number | '...')[] => {
+  const pages: (number | '...')[] = [];
+  const rangeStart = Math.max(2, current - 1);
+  const rangeEnd = Math.min(totalPages - 1, current + 1);
+  pages.push(1);
+  if (rangeStart > 2) pages.push('...');
+  for (let i = rangeStart; i <= rangeEnd; i++) pages.push(i);
+  if (rangeEnd < totalPages - 1) pages.push('...');
+  if (totalPages > 1) pages.push(totalPages);
+  return pages;
+};
+
+// 通用分页导航（首页 / 上一页 / 页码 / 下一页），页码序列由 buildPageNumbers 生成；省略号用 idx 作 key 以免两个 '...' 冲突
+function Pagination({ page, totalPages, onChange }: {
+  page: number;
+  totalPages: number;
+  onChange: (p: number) => void;
+}) {
+  return (
+    <>
+      <button onClick={() => onChange(1)} disabled={page <= 1}
+        className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg disabled:opacity-40 hover:bg-slate-50">首页</button>
+      <button onClick={() => onChange(Math.max(1, page - 1))} disabled={page <= 1}
+        className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg disabled:opacity-40 hover:bg-slate-50">上一页</button>
+      {buildPageNumbers(page, totalPages).map((p, idx) =>
+        typeof p === 'number' ? (
+          <button key={p} onClick={() => onChange(p)}
+            className={`min-w-[28px] px-2 py-1.5 border rounded-lg font-semibold ${
+              p === page ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white border-slate-200 hover:bg-slate-50'
+            }`}>{p}</button>
+        ) : (
+          <span key={`gap-${idx}`} className="px-1 text-slate-400">…</span>
+        ),
+      )}
+      <button onClick={() => onChange(Math.min(totalPages, page + 1))} disabled={page >= totalPages}
+        className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg disabled:opacity-40 hover:bg-slate-50">下一页</button>
+    </>
+  );
+}
+
 export default function CallTasksManager({ tenantId }: { tenantId: string }) {
   const [tasks, setTasks] = useState<CallTaskDTO[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  const pageSize = 10;
   const [prompts, setPrompts] = useState<PromptDTO[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -34,27 +78,37 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
     setTimeout(() => setToast(null), 3000);
   };
 
-  const reload = useCallback(async () => {
+  const reload = useCallback(async (p: number = page) => {
     setLoading(true);
     try {
-      const [t, p] = await Promise.all([callTasksApi.list(), promptsApi.list().catch(() => [] as PromptDTO[])]);
-      setTasks(t);
-      setPrompts(p);
+      const data = await callTasksApi.list(p);
+      setTasks(data.tasks);
+      setTotal(data.total);
     } catch (e) {
       flash('err', (e as Error).message);
     } finally {
       setLoading(false);
     }
+  }, [page]);
+
+  const loadPrompts = useCallback(async () => {
+    const p = await promptsApi.list().catch(() => [] as PromptDTO[]);
+    setPrompts(p);
   }, []);
 
   useEffect(() => {
     reload();
   }, [reload]);
+  useEffect(() => {
+    loadPrompts();
+  }, [loadPrompts]);
 
   const promptLabel = (id: number) => {
     const p = prompts.find((x) => x.id === id);
     return p ? `${p.title} (${p.bizType}/${p.scenario})` : `#${id}`;
   };
+
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
   const openCreate = () => {
     setEditing(null);
@@ -87,15 +141,17 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
         deptId: form.deptId?.trim() || null,
         description: form.description?.trim() || null,
       };
+      setShowForm(false);
       if (editing) {
         await callTasksApi.update(editing.id, payload);
         flash('ok', `已更新任务 ${form.name}`);
+        await reload();
       } else {
         await callTasksApi.create(payload);
         flash('ok', `已新增任务 ${form.name}（定义层，不发起外呼）`);
+        setPage(1); // 新建任务最新在前 → 回首页查看
+        await reload(1);
       }
-      setShowForm(false);
-      await reload();
     } catch (e) {
       flash('err', (e as Error).message);
     } finally {
@@ -135,8 +191,8 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
   // ── 号码清单展开区 ──
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [targets, setTargets] = useState<CallTargetDTO[]>([]);
+  const [targetPage, setTargetPage] = useState(1);
   const [progress, setProgress] = useState<CallTargetProgress | null>(null);
-  const [newPhone, setNewPhone] = useState('');
   // 结构化导入：粘贴文本 + 解析结果 + 绑定 prompt 占位符 + 单号码最大拨打次数
   const [importText, setImportText] = useState('');
   const [importPlaceholders, setImportPlaceholders] = useState<string[]>([]);
@@ -150,6 +206,11 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
       : null),
     [importText, importPlaceholders, importTaskBizType],
   );
+
+  // 号码清单分页：派生值。targetPage 仅在切换任务时重置（见 toggleExpand），5s 轮询不重置以避免浏览中跳页
+  const targetPageSize = 10;
+  const targetTotalPages = Math.max(1, Math.ceil(targets.length / targetPageSize));
+  const targetPageClamped = Math.min(targetPage, targetTotalPages);
 
   const loadTargets = useCallback(async (taskId: number) => {
     try {
@@ -170,8 +231,8 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
       return;
     }
     setExpandedId(t.id);
-    setNewPhone('');
     setImportText('');
+    setTargetPage(1);
     // 取绑定 prompt 占位符（systemPrompt {占位符} ∪ 显式 variables）+ biz_type 供导入预览比对
     const p = await promptsApi.get(t.promptId).catch(() => null);
     setImportPlaceholders(
@@ -179,22 +240,6 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
     );
     setImportTaskBizType(p?.bizType);
     await loadTargets(t.id);
-  };
-
-  const addPhone = async (taskId: number) => {
-    const phone = newPhone.trim();
-    if (!phone) return;
-    setBusy(true);
-    try {
-      await callTargetsApi.create(taskId, phone);
-      setNewPhone('');
-      flash('ok', `已添加号码 ${phone}`);
-      await loadTargets(taskId);
-    } catch (e) {
-      flash('err', (e as Error).message);
-    } finally {
-      setBusy(false);
-    }
   };
 
   const downloadTemplate = () => {
@@ -382,7 +427,7 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
       <div className="bg-white rounded-xl border border-slate-100 shadow-xs overflow-hidden">
         <div className="flex justify-between items-center px-4 py-3 border-b border-slate-100">
           <span className="text-xs font-bold text-slate-700">任务列表 ({tasks.length})</span>
-          <button onClick={reload} className="text-slate-400 hover:text-slate-700">
+          <button onClick={() => reload()} className="text-slate-400 hover:text-slate-700">
             <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
           </button>
         </div>
@@ -451,20 +496,6 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
                               <span className="text-rose-600">失败 {progress.failed}</span>
                             </div>
                           )}
-                          {/* 录入区 */}
-                          <div className="flex flex-wrap items-end gap-2">
-                            <div className="space-y-1">
-                              <label className="text-[11px] text-slate-500 font-semibold">单条录入</label>
-                              <input
-                                value={newPhone}
-                                onChange={(e) => setNewPhone(e.target.value)}
-                                onKeyDown={(e) => e.key === 'Enter' && addPhone(t.id)}
-                                placeholder="号码，如 1000"
-                                className="text-xs p-2 bg-white border border-slate-200 rounded-lg w-40 focus:outline-none focus:border-indigo-600"
-                              />
-                            </div>
-                            <button onClick={() => addPhone(t.id)} disabled={busy || !newPhone.trim()} className="px-3 py-2 bg-indigo-600 text-white text-xs rounded-lg hover:bg-indigo-700 disabled:opacity-40 font-semibold">添加</button>
-                          </div>
                           {/* 结构化批量导入：固定 5 列模板，支持粘贴/上传 + 即时预览 */}
                           <div className="flex flex-col gap-2">
                             <div className="flex items-center justify-between">
@@ -576,8 +607,9 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
                           <div className="bg-white rounded-lg border border-slate-100 overflow-hidden">
                             <div className="px-3 py-2 border-b border-slate-100 text-[11px] font-bold text-slate-600">号码清单 ({targets.length})</div>
                             {targets.length === 0 ? (
-                              <p className="text-slate-400 text-xs text-center py-6">暂无号码，录入或批量导入</p>
+                              <p className="text-slate-400 text-xs text-center py-6">暂无号码，批量导入</p>
                             ) : (
+                              <>
                               <div className="max-h-60 overflow-y-auto">
                                 <table className="w-full text-xs">
                                   <thead className="bg-slate-50 text-slate-500 sticky top-0">
@@ -591,7 +623,9 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
                                     </tr>
                                   </thead>
                                   <tbody className="divide-y divide-slate-50">
-                                    {targets.map((tg) => (
+                                    {targets
+                                      .slice((targetPageClamped - 1) * targetPageSize, targetPageClamped * targetPageSize)
+                                      .map((tg) => (
                                       <tr key={tg.id}>
                                         <td className="p-2 font-mono text-slate-700">{tg.phoneMasked ?? tg.userKey}</td>
                                         <td className="p-2 font-mono text-slate-500 text-[10px]">{tg.customerId ?? '—'}</td>
@@ -614,6 +648,13 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
                                   </tbody>
                                 </table>
                               </div>
+                              {targetTotalPages > 1 && (
+                                <div className="flex justify-center items-center gap-1.5 text-xs text-slate-600 py-2 border-t border-slate-100">
+                                  <Pagination page={targetPageClamped} totalPages={targetTotalPages} onChange={setTargetPage} />
+                                  <span className="ml-1 text-slate-400">第 {targetPageClamped}/{targetTotalPages} 页</span>
+                                </div>
+                              )}
+                              </>
                             )}
                           </div>
                         </div>
@@ -624,6 +665,13 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
               ))}
             </tbody>
           </table>
+        )}
+        {/* 分页：10 条/页 + 页码跳转 */}
+        {total > 0 && (
+          <div className="flex justify-center items-center gap-1.5 text-xs text-slate-600 pt-3">
+            <Pagination page={page} totalPages={totalPages} onChange={setPage} />
+            <span className="ml-2 text-slate-400">共 {total} 条 / {totalPages} 页</span>
+          </div>
         )}
       </div>
     </div>
