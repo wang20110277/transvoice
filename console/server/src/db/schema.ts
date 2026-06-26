@@ -143,8 +143,8 @@ export const callTarget = callbot.table(
     nextAttemptTs: timestamp('next_attempt_ts', { withTimezone: true }),
     lastCallSessionId: bigint('last_call_session_id', { mode: 'number' }),
     lastHangupCause: text('last_hangup_cause'),
-    // 结构化导入：每号码 render 变量（JSONB）+ 客户id（展示/审计）。DDL 由 agent-flow 0002 迁移维护。
-    vars: jsonb('vars').notNull().default(sql`'{}'::jsonb`),
+    // 结构化导入：每号码 render 变量（TEXT，格式 key:value|key:value）+ 客户id（展示/审计）。DDL 由 agent-flow 0002+0003 迁移维护。
+    vars: text('vars').notNull().default(''),
     customerId: text('customer_id'),
     createTime: timestamp('create_time', { withTimezone: true }).notNull().defaultNow(),
     createUser: text('create_user').notNull().default('system'),

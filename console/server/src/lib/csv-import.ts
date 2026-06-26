@@ -1,19 +1,22 @@
 /**
  * 结构化号码清单导入解析（纯函数，无副作用，可单测）。
  *
- * 固定 5 列模板：序号 | 业务类型 | 手机号 | 客户id | json
+ * 固定 5 列模板：序号 | 业务类型 | 手机号 | 客户id | vars
  *   - 序号/业务类型：仅校验/展示，不入业务字段（biz_type=任务 biz_type，seq 不入库）
  *   - 手机号：去空白后非空 = 唯一硬错误判据（不格式强校验，兼容测试分机号 1000）
  *   - 客户id：可选，原样留存
- *   - json：JSON.parse 成 Record<string,string>，空串/缺省 → {}，解析失败 → 行级 error
+ *   - vars：key:value|key:value 字符串解析成 Record<string,string>，空串/缺省 → {}
+ *           按 '|' 拆对、每对按首个 ':' 拆 key/value（允许值含 ':'），trim，跳过空对/无 ':' 对
+ *           （不使用 JSON；坏对静默跳过，靠占位符覆盖面板反馈缺失）
  *
  * 占位符比对：单一真相源是任务绑定 prompt 的 {占位符} 集合（placeholders 入参）。
- *   - hit  = 占位符 ∩ json keys 并集
- *   - missing = 占位符 − json keys 并集（没有任何行提供的占位符）
- *   - extra  = json keys 并集 − 占位符（json 里多余、prompt 用不上的 key）
- *   - perVarCoverage = 每个占位符在多少行 json 中命中
+ *   - hit  = 占位符 ∩ vars keys 并集
+ *   - missing = 占位符 − vars keys 并集（没有任何行提供的占位符）
+ *   - extra  = vars keys 并集 − 占位符（vars 里多余、prompt 用不上的 key）
+ *   - perVarCoverage = 每个占位符在多少行 vars 中命中
  *
- * CSV 引号处理：json 列必然含逗号，须容忍 "a,b" 内逗号 + 两端引号剥离（最小实现）。
+ * CSV 引号处理：vars 列一般不含逗号（key:value|key:value），但值若含逗号仍须整体引号包裹；
+ * splitCsvLine 容忍 "a,b" 内逗号 + 两端引号剥离（最小实现）。
  */
 
 /** 列名别名（兼容中英文表头），统一映射到规范列。 */
@@ -65,8 +68,8 @@ export function extractPlaceholders(promptText: string | undefined | null): stri
  * CSV 行切分（RFC 4180 子集）：仅当字段以 `"` 起始时才视为引号字段，
  * 字段内的 `"` 原样保留；引号字段内 `""` 转义为单个 `"`。
  *
- * 关键：json 列如 `{"name":"张三"}` 不以 `"` 起始 → 按字面字段处理，内部引号不动 → JSON 完整。
- * 含逗号的 json 须整体用引号包裹并转义内部引号：`"{""name"":""张三"",""amt"":""1,200""}"`。
+ * vars 列默认 key:value|key:value（不含逗号、不以 `"` 起始 → 按字面字段处理）；
+ * 仅当某 value 含逗号时才须整体引号包裹并转义内部引号：`"a:1,200|b:2"`。
  */
 function splitCsvLine(line: string): string[] {
   const fields: string[] = [];
@@ -119,22 +122,19 @@ function resolveColumnIndex(headers: string[]): {
   return out as { seq?: number; biz?: number; phone?: number; customer?: number; vars?: number };
 }
 
-/** 解析 json 列 → Record<string,string>；失败返回 [vars, errorMsg]。 */
+/** 解析 vars 列（key:value|key:value）→ Record<string,string>。空串/缺省 → {}。
+ *  不使用 JSON；坏对（无 ':' / 空 key）静默跳过，第二返回值恒 undefined（无硬错误）。 */
 function parseVars(raw: string | undefined): [Record<string, string>, string?] {
   const text = (raw ?? '').trim();
   if (text === '') return [{}, undefined];
-  let obj: unknown;
-  try {
-    obj = JSON.parse(text);
-  } catch {
-    return [{}, 'json 格式错误'];
-  }
-  if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
-    return [{}, 'json 必须是对象'];
-  }
   const vars: Record<string, string> = {};
-  for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
-    vars[k] = typeof v === 'string' ? v : v == null ? '' : JSON.stringify(v);
+  for (const pair of text.split('|')) {
+    const p = pair.trim();
+    if (!p || !p.includes(':')) continue;
+    const idx = p.indexOf(':');
+    const key = p.slice(0, idx).trim();
+    if (!key) continue;
+    vars[key] = p.slice(idx + 1).trim();
   }
   return [vars, undefined];
 }
@@ -249,7 +249,7 @@ function k(vars: Record<string, string>, key: string): boolean {
 }
 
 /** 固定 5 列空表头模板 CSV（+ 一行示例），供「下载模板」按钮导出。
- *  json 列含逗号 → 整体引号包裹 + 内部 " 转义为 ""（RFC 4180）。 */
+ *  vars 列为 key:value|key:value 字符串（不含逗号，无需引号包裹）。 */
 export const IMPORT_TEMPLATE_CSV =
-  '序号,业务类型,手机号,客户id,json\n' +
-  '1,collection,138****5678,C10001,"{""customer_name"":""张三"",""amount"":""1200.50""}"\n';
+  '序号,业务类型,手机号,客户id,vars\n' +
+  '1,collection,138****5678,C10001,customer_name:张三|amount:1200.50\n';

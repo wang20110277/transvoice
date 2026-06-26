@@ -469,7 +469,7 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
                           <div className="flex flex-col gap-2">
                             <div className="flex items-center justify-between">
                               <label className="text-[11px] text-slate-500 font-semibold flex items-center gap-1">
-                                <Upload className="w-3 h-3" /> 批量导入（序号｜业务类型｜手机号｜客户id｜json）
+                                <Upload className="w-3 h-3" /> 批量导入（序号｜业务类型｜手机号｜客户id｜vars）
                               </label>
                               <button onClick={downloadTemplate} className="flex items-center gap-1 text-[11px] text-indigo-600 hover:text-indigo-700 font-semibold">
                                 <FileDown className="w-3 h-3" /> 下载模板
@@ -478,7 +478,7 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
                             <textarea
                               value={importText}
                               onChange={(e) => setImportText(e.target.value)}
-                              placeholder={'序号,业务类型,手机号,客户id,json\n1,collection,138****5678,C10001,{"customer_name":"张三","amount":"1200"}'}
+                              placeholder={'序号,业务类型,手机号,客户id,vars\n1,collection,138****5678,C10001,customer_name:张三|amount:1200'}
                               rows={4}
                               className="text-xs p-2 bg-white border border-slate-200 rounded-lg font-mono focus:outline-none focus:border-indigo-600"
                             />
@@ -526,7 +526,7 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
                                           <th className="text-left p-1.5 font-semibold">序号</th>
                                           <th className="text-left p-1.5 font-semibold">手机号</th>
                                           <th className="text-left p-1.5 font-semibold">客户id</th>
-                                          <th className="text-left p-1.5 font-semibold">json/错误</th>
+                                          <th className="text-left p-1.5 font-semibold">vars/错误</th>
                                         </tr>
                                       </thead>
                                       <tbody className="divide-y divide-slate-50">
@@ -539,8 +539,8 @@ export default function CallTasksManager({ tenantId }: { tenantId: string }) {
                                               {r.error ? (
                                                 <span className="text-rose-600">{r.error}</span>
                                               ) : (
-                                                <span className="font-mono text-slate-500 truncate block max-w-[220px]" title={JSON.stringify(r.vars)}>
-                                                  {Object.keys(r.vars).length ? JSON.stringify(r.vars) : '—'}
+                                                <span className="font-mono text-slate-500 truncate block max-w-[220px]" title={Object.entries(r.vars).map(([k, v]) => `${k}:${v}`).join('|')}>
+                                                  {Object.keys(r.vars).length ? Object.entries(r.vars).map(([k, v]) => `${k}:${v}`).join('|') : '—'}
                                                 </span>
                                               )}
                                               {!r.error && r.warning && <span className="block text-amber-600">{r.warning}</span>}

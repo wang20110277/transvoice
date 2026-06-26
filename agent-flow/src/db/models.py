@@ -377,8 +377,8 @@ class CallTarget(Base):
     next_attempt_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_call_session_id: Mapped[int | None] = mapped_column(BigInteger)
     last_hangup_cause: Mapped[str | None] = mapped_column(Text)
-    # 结构化导入：每号码 render 变量（JSONB，摘机后透传进 graph state call_task_vars）+ 客户id（展示/审计）
-    vars: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    # 结构化导入：每号码 render 变量（TEXT，格式 key:value|key:value，摘机后 parse_call_target_vars 解析进 graph state call_task_vars）+ 客户id（展示/审计）
+    vars: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
     customer_id: Mapped[str | None] = mapped_column(Text)
     create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     create_user: Mapped[str] = mapped_column(Text, nullable=False, default="system")

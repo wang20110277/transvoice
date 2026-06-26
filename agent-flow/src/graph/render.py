@@ -22,6 +22,30 @@ def _scan_placeholders(template: str) -> list[str]:
     return _PLACEHOLDER_RE.findall(template)
 
 
+def parse_call_target_vars(raw: str | None) -> dict[str, str]:
+    """解析 call_target.vars（key:value|key:value 字符串）为 render 用的 dict。
+
+    DB 列为 TEXT 纯字符串（不使用 JSON），由 console serializeVars 写入、此处解析。
+    规则：
+    - 按 '|' 拆对，每对按【首个】':' 拆 key/value（允许值含 ':'，如时间 09:30）
+    - trim key/value；跳过空对、无 ':' 的对、空 key
+    - 空串/None → {}；全程不抛异常（运行时容错）
+    """
+    if not raw:
+        return {}
+    out: dict[str, str] = {}
+    for pair in raw.split("|"):
+        pair = pair.strip()
+        if not pair or ":" not in pair:
+            continue
+        key, _, value = pair.partition(":")
+        key = key.strip()
+        if not key:
+            continue
+        out[key] = value.strip()
+    return out
+
+
 def render(template: str, vars_context: dict, declared: list[str] | None = None) -> str:
     """渲染模板占位符 {name}。
 

@@ -112,7 +112,8 @@ export async function create(
  * 结构化批量录入（手机号 + 客户id + 每号码变量）。返回 {inserted, skipped}。
  *
  * 去重：任务内已存在的 phone_hash 跳过（onConflictDoNothing），与单条录入一致。
- * vars 强制 Record<string,string>：API 边界防御，拒对象/数组值，避免复杂类型污染 prompt。
+ * vars 序列化为 key:value|key:value 字符串（TEXT 存储，不使用 JSON）入库；
+ * 客户端已解析校验，服务端仅做边界防御（phone 去空白非空 + vars 扁平 string map）。
  */
 export async function bulkCreateStructured(
   taskId: number,
@@ -122,9 +123,8 @@ export async function bulkCreateStructured(
   userEmail: string,
 ): Promise<{ inserted: number; skipped: number }> {
   if (!(await taskInTenant(taskId, tenantId))) return { inserted: 0, skipped: 0 };
-  // 客户端已解析+校验；服务端仅做边界防御（phone 去空白非空 + vars 强制扁平 string map）
   const clean = targets
-    .map((t) => ({ phone: (t.phone ?? '').trim(), customerId: t.customerId, vars: sanitizeVars(t.vars) }))
+    .map((t) => ({ phone: (t.phone ?? '').trim(), customerId: t.customerId, vars: serializeVars(t.vars) }))
     .filter((t) => t.phone.length > 0);
   if (clean.length === 0) return { inserted: 0, skipped: 0 };
 
@@ -149,15 +149,16 @@ export async function bulkCreateStructured(
   return { inserted: result.length, skipped: clean.length - result.length };
 }
 
-/** vars 边界规范化：非对象/数组 → {}；值强制 string；空对象保留 {}。 */
-function sanitizeVars(vars: unknown): Record<string, string> {
-  if (!vars || typeof vars !== 'object' || Array.isArray(vars)) return {};
-  const out: Record<string, string> = {};
+/** vars 序列化为 key:value|key:value 字符串（DB TEXT）：非对象/数组 → ''；值强制 string。 */
+function serializeVars(vars: unknown): string {
+  if (!vars || typeof vars !== 'object' || Array.isArray(vars)) return '';
+  const pairs: string[] = [];
   for (const [k, v] of Object.entries(vars as Record<string, unknown>)) {
-    if (typeof k !== 'string') continue;
-    out[k] = typeof v === 'string' ? v : v == null ? '' : JSON.stringify(v);
+    if (typeof k !== 'string' || !k) continue;
+    const val = typeof v === 'string' ? v : v == null ? '' : JSON.stringify(v);
+    pairs.push(`${k}:${val}`);
   }
-  return out;
+  return pairs.join('|');
 }
 
 export async function remove(targetId: number, tenantId: string): Promise<boolean> {

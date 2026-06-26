@@ -39,6 +39,7 @@ from fastapi.responses import JSONResponse
 from src.config import settings
 from src.storage import minio_storage, repository
 from src.graph.flow import set_services, run_pre_llm_phase, run_streaming_pipeline
+from src.graph.render import parse_call_target_vars
 from src.memory.assembler import MemoryAssembler
 from src.clients.mcp import MCPClient
 from src.clients.tts import TTSClient
@@ -377,15 +378,13 @@ def _create_esl_event_handlers(esl: ESLClient) -> None:
             bool(call_target_id), call_task_id, call_target_id,
         )
 
-        # 外呼：摘机加载 call_target.vars（每号码 render 变量）透传进 registry → graph state。
-        # 呼入无 call_target_id，call_target_vars 恒 {}。get_call_target 失败/vars 非 dict → 降级 {}，记 WARNING。
+        # 外呼：摘机加载 call_target.vars（key:value|key:value 字符串）解析为 dict，透传进 registry → graph state。
+        # 呼入无 call_target_id，call_target_vars 恒 {}。parse_call_target_vars 全程容错（空/坏 → {}）。
         call_target_vars: dict = {}
         if call_target_id is not None:
             t = await repository.get_call_target(call_target_id)
-            if t is not None and isinstance(t.vars, dict):
-                call_target_vars = t.vars
-            elif t is not None:
-                logger.warning("[%s] call_target %s vars 非 dict，降级为空变量", uuid, call_target_id)
+            if t is not None:
+                call_target_vars = parse_call_target_vars(t.vars)
 
         _call_registry.register(
             uuid, biz_type, user_key, tenant_id=tenant_id, scenario=scenario,

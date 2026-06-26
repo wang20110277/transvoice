@@ -1,6 +1,6 @@
 /**
  * csv-import 单测 — 固定 5 列结构化导入解析 + 占位符比对（纯函数）。
- * 对齐设计 §4.2.1 / §5。
+ * vars 列为 key:value|key:value 字符串格式（不使用 JSON）。
  */
 import { describe, it, expect } from 'vitest';
 import {
@@ -23,7 +23,7 @@ describe('extractPlaceholders', () => {
 
 describe('parseImportCsv — 表头与列别名', () => {
   it('中文表头 5 列', () => {
-    const csv = '序号,业务类型,手机号,客户id,json\n1,collection,13800138000,C1,{"name":"张三"}';
+    const csv = '序号,业务类型,手机号,客户id,vars\n1,collection,13800138000,C1,name:张三';
     const r = parseImportCsv(csv, ['name']);
     expect(r.hasHeader).toBe(true);
     expect(r.hasPhoneColumn).toBe(true);
@@ -33,61 +33,62 @@ describe('parseImportCsv — 表头与列别名', () => {
     expect(r.rows[0].vars).toEqual({ name: '张三' });
   });
   it('英文别名表头', () => {
-    const csv = 'seq,biz_type,phone,customer_id,vars\n1,collection,1000,C1,{"a":"1"}';
+    const csv = 'seq,biz_type,phone,customer_id,vars\n1,collection,1000,C1,a:1';
     const r = parseImportCsv(csv, ['a']);
     expect(r.rows[0].phone).toBe('1000');
     expect(r.rows[0].vars).toEqual({ a: '1' });
   });
   it('无表头按固定 5 列顺序', () => {
-    const csv = '1,collection,1000,C1,{"a":"1"}';
+    const csv = '1,collection,1000,C1,a:1';
     const r = parseImportCsv(csv);
     expect(r.hasHeader).toBe(false);
     expect(r.rows[0].phone).toBe('1000');
   });
 });
 
-describe('parseImportCsv — json 列引号与逗号', () => {
-  it('json 含逗号须整体引号包裹 + 内部 " 转义（RFC 4180）', () => {
-    // 单元格："{""name"":""张三"",""amount"":""1,200""}" → 内容 {"name":"张三","amount":"1,200"}
-    const csv = '序号,业务类型,手机号,客户id,json\n1,c,1000,C1,"{""name"":""张三"",""amount"":""1,200""}"';
+describe('parseImportCsv — vars 列引号与逗号', () => {
+  it('value 含逗号须整体引号包裹', () => {
+    // 单元格："name:张三|amount:1,200" → 逗号在引号内，整体为一个字段
+    const csv = '序号,业务类型,手机号,客户id,vars\n1,c,1000,C1,"name:张三|amount:1,200"';
     const r = parseImportCsv(csv);
     expect(r.rows[0].vars).toEqual({ name: '张三', amount: '1,200' });
     expect(r.errorCount).toBe(0);
   });
-  it('json 不含逗号可不引号（内部 " 原样保留）', () => {
-    const csv = '序号,业务类型,手机号,客户id,json\n1,c,1000,C1,{"name":"张三"}';
+  it('value 不含逗号无需引号', () => {
+    const csv = '序号,业务类型,手机号,客户id,vars\n1,c,1000,C1,name:张三';
     const r = parseImportCsv(csv);
     expect(r.rows[0].vars).toEqual({ name: '张三' });
   });
-  it('json 解析失败 → 行级 error', () => {
-    const csv = '序号,业务类型,手机号,客户id,json\n1,c,1000,C1,{bad json}';
+  it('坏对（无冒号 / 空 key）静默跳过，不报错', () => {
+    // badpair 无 ':' → 跳过；:only 空 key → 跳过；name:张三 保留
+    const csv = '序号,业务类型,手机号,客户id,vars\n1,c,1000,C1,name:张三|badpair|:only';
     const r = parseImportCsv(csv);
-    expect(r.rows[0].error).toMatch(/json/);
-    expect(r.errorCount).toBe(1);
-    expect(r.validCount).toBe(0);
+    expect(r.rows[0].vars).toEqual({ name: '张三' });
+    expect(r.rows[0].error).toBeUndefined();
+    expect(r.errorCount).toBe(0);
   });
-  it('json 空串 → {}', () => {
-    const csv = '序号,业务类型,手机号,客户id,json\n1,c,1000,C1,';
+  it('value 含冒号（按首个冒号拆，如时间 09:30）', () => {
+    const csv = '序号,业务类型,手机号,客户id,vars\n1,c,1000,C1,call_time:09:30';
+    const r = parseImportCsv(csv);
+    expect(r.rows[0].vars).toEqual({ call_time: '09:30' });
+  });
+  it('空串 → {}', () => {
+    const csv = '序号,业务类型,手机号,客户id,vars\n1,c,1000,C1,';
     const r = parseImportCsv(csv);
     expect(r.rows[0].vars).toEqual({});
     expect(r.rows[0].error).toBeUndefined();
-  });
-  it('json 值非字符串被 stringify', () => {
-    const csv = '序号,业务类型,手机号,客户id,json\n1,c,1000,C1,{"n":123}';
-    const r = parseImportCsv(csv);
-    expect(r.rows[0].vars.n).toBe('123');
   });
 });
 
 describe('parseImportCsv — 错误与警告', () => {
   it('手机号空行 → 行级 error', () => {
-    const csv = '序号,业务类型,手机号,客户id,json\n1,c,,C1,{"a":"1"}';
+    const csv = '序号,业务类型,手机号,客户id,vars\n1,c,,C1,a:1';
     const r = parseImportCsv(csv);
     expect(r.rows[0].error).toMatch(/手机号/);
     expect(r.validCount).toBe(0);
   });
   it('业务类型 ≠ 任务 biz_type → 警告不阻断', () => {
-    const csv = '序号,业务类型,手机号,客户id,json\n1,marketing,1000,C1,{"a":"1"}';
+    const csv = '序号,业务类型,手机号,客户id,vars\n1,marketing,1000,C1,a:1';
     const r = parseImportCsv(csv, [], 'collection');
     expect(r.rows[0].warning).toMatch(/marketing/);
     expect(r.rows[0].error).toBeUndefined();
@@ -95,7 +96,7 @@ describe('parseImportCsv — 错误与警告', () => {
     expect(r.validCount).toBe(1);
   });
   it('部分错误行 → 允许有效行', () => {
-    const csv = '序号,业务类型,手机号,客户id,json\n1,c,1000,C1,{"a":"1"}\n2,c,,C1,{bad}';
+    const csv = '序号,业务类型,手机号,客户id,vars\n1,c,1000,C1,a:1\n2,c,,C1,badpair';
     const r = parseImportCsv(csv);
     expect(r.totalRows).toBe(2);
     expect(r.validCount).toBe(1);
@@ -105,9 +106,9 @@ describe('parseImportCsv — 错误与警告', () => {
 
 describe('parseImportCsv — 占位符比对', () => {
   it('hit/missing/extra + 覆盖度', () => {
-    const csv = '序号,业务类型,手机号,客户id,json\n'
-      + '1,c,1000,C1,"{""name"":""张三"",""amount"":""100""}"\n'
-      + '2,c,1001,C2,{"name":"李四"}\n';
+    const csv = '序号,业务类型,手机号,客户id,vars\n'
+      + '1,c,1000,C1,name:张三|amount:100\n'
+      + '2,c,1001,C2,name:李四\n';
     const r = parseImportCsv(csv, ['name', 'amount', 'phone']);
     expect(r.placeholders.hit.sort()).toEqual(['amount', 'name']);
     expect(r.placeholders.missing).toEqual(['phone']); // 无任何行提供
@@ -117,7 +118,7 @@ describe('parseImportCsv — 占位符比对', () => {
     expect(r.placeholders.perVarCoverage.phone).toBe(0);
   });
   it('多余 key → extra', () => {
-    const csv = '序号,业务类型,手机号,客户id,json\n1,c,1000,C1,"{""name"":""张三"",""extra_key"":""x""}"';
+    const csv = '序号,业务类型,手机号,客户id,vars\n1,c,1000,C1,name:张三|extra_key:x';
     const r = parseImportCsv(csv, ['name']);
     expect(r.placeholders.extra).toEqual(['extra_key']);
   });

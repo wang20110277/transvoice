@@ -1,5 +1,5 @@
 """render.py 变量渲染单测 — 纯逻辑,无外部依赖。"""
-from graph.render import render
+from graph.render import render, parse_call_target_vars
 
 
 def test_render_basic_substitution():
@@ -31,6 +31,33 @@ def test_render_undeclared_placeholder_left_as_is():
 
 def test_render_non_string_value_coerced():
     assert render("amount={amount}", {"amount": 1200}, ["amount"]) == "amount=1200"
+
+
+# ── parse_call_target_vars：call_target.vars（key:value|key:value 字符串）解析 ──
+
+def test_parse_vars_basic():
+    assert parse_call_target_vars("name:张三|amount:1200.50") == {
+        "name": "张三", "amount": "1200.50",
+    }
+
+
+def test_parse_vars_empty_and_none():
+    assert parse_call_target_vars("") == {}
+    assert parse_call_target_vars(None) == {}
+    assert parse_call_target_vars("   ") == {}
+
+
+def test_parse_vars_value_may_contain_colon():
+    # 按首个 ':' 拆，允许值含 ':'（如时间 09:30）
+    assert parse_call_target_vars("call_time:09:30") == {"call_time": "09:30"}
+
+
+def test_parse_vars_trims_and_skips_bad_pairs():
+    # 空白 trim；无 ':' 的对 / 空 key 跳过；尾随 '|' 容忍
+    assert parse_call_target_vars(" name : 张三 || amount :100 | :noop ") == {
+        "name": "张三", "amount": "100",
+    }
+
 
 
 def _aggregate_vars_context(identity, call_task_vars):
