@@ -15,10 +15,6 @@ build/
 .venv/
 venv/
 
-# Claude / OMC
-.claude/
-.omc/
-
 # OS
 .DS_Store
 Thumbs.db
@@ -32,9 +28,4 @@ htmlcov/
 *.pyc
 
 models
-.codegraph
-.code-review-graph
 .cursor
-.openflow
-
-freeswitch/sofia-sip/

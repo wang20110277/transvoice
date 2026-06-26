@@ -70,10 +70,10 @@ aiphone/
 │   │   ├── llm/            # service.py, json_stream.py (增量JSON), sentence_splitter.py (句级切分)
 │   │   ├── memory/         # assembler.py, chat_history.py, redis_memory.py, store.py
 │   │   ├── rag/            # retriever.py (Agentic RAG: 自适应检索+文档评分+查询改写)
-│   │   ├── db/             # models.py (SQLAlchemy ORM, callbot schema, 12 表; 含 prompt_config/prompt_version/inbound_route/call_task)
+│   │   ├── db/             # models.py (SQLAlchemy ORM, callbot schema, 13 表; 含 prompt_config/prompt_version/inbound_route/call_task/call_target)
 │   │   └── storage/        # repository.py (异步仓储层), minio_storage.py (upload_recording 录音归档), persistence_helpers.py (fire-and-forget 双写)
 │   ├── llm/                # Qwen LLM 推理引擎 Dockerfile (vLLM)
-│   ├── alembic/            # 数据库迁移 (0001_initial_schema, 0002_prompt_config, 0003_prompt_pipeline_align)
+│   ├── alembic/            # 数据库迁移 (0001_init_full_schema 合并旧 0001-0005 全量初始化, 0002_call_target_vars_customer_id, 0003_call_target_vars_text)
 │   ├── alembic.ini         # Alembic 配置
 │   ├── requirements.txt    # Python 依赖
 │   ├── Dockerfile          # 应用镜像 (含 alembic 自动迁移)
@@ -94,7 +94,7 @@ aiphone/
 │   └── server/
 │       ├── src/app/        # App Router: pages (calls/call-tasks/inbound-routes/prompts/tenants/login) + route handlers (/api/prompts,/api/calls,/api/inbound-routes,/api/call-tasks,/api/tenants,/api/session)
 │       ├── src/lib/        # services (prompts/calls/routes/call-tasks) + minio/redis/llm/perms/auth-client
-│       ├── src/db/         # schema.ts (Drizzle 只读映射 callbot.*), migrations (0001_console_auth, 0002_tenant_management), seed
+│       ├── src/db/         # schema.ts (Drizzle 只读映射 callbot.*), migrations (0001_init_console 合并旧 console_auth + tenant_management), seed
 │       ├── src/components/ # ConsoleShell, CallRecordsList, CallDetail, PromptManager, InboundRoutesManager, CallTasksManager, TenantsManager, TenantSwitcher
 │       ├── auth.ts         # Better Auth (本地账密 + active_tenant_id)
 │       ├── ecosystem.config.cjs  # PM2 部署
@@ -281,11 +281,11 @@ aiphone/
 - `callbot.prompt_config` — 主表，`UNIQUE(tenant_id, biz_type, scenario)`，单行即当前内容
 - `callbot.prompt_version` — 版本快照（支撑回滚）
 - `callbot.inbound_route` — DID/号段 → `(tenant_id, biz_type, scenario)`，呼入解析
-- `callbot.call_task` — 外呼任务定义（仅定义层，无执行引擎）
+- `callbot.call_task` — 外呼任务定义（prompt 绑定 + 策略参数）；`callbot.call_target` — 号码清单 + 每号码 render 变量（vars）；由 agent-flow `OutboundExecutor` 执行（tick 轮询 + 时段/并发 + CAS 认领 + originate + redial）
 - `callbot.call_session/turn/event/artifact` — Drizzle 只读映射（Console 不写这四表）
-- `console_auth.*` — Better Auth 自带（user/session/account/verification）+ tenant/user_tenant（多租户）
+- `console.*` — Better Auth 自带（user/session/account/verification）+ tenant/user_tenant（多租户）
 
-> `prompt_config`/`prompt_version`/`inbound_route`/`call_task` 由 **agent-flow alembic** 建表（0002/0003）；`console_auth` 由 Console 自行建表（`src/db/migrations/`）。
+> `prompt_config`/`prompt_version`/`inbound_route`/`call_task`/`call_target` 由 **agent-flow alembic** 建表（0001 全量初始化 + 0002/0003 扩 call_target.vars）；`console` schema 由 Console 自行建表（`src/db/migrations/`）。
 
 ### DID 呼入路由（与 FreeSWITCH dialplan 的关系）
 三元组 `(tenant_id, biz_type, scenario)` **不在 dialplan 硬编码**：
@@ -303,7 +303,7 @@ aiphone/
 |------|------|------|
 | 提示词管理 | `/prompts` | 草稿/发布/版本回滚/克隆/变量渲染测试 |
 | DID 路由 | `/inbound-routes` | DID/号段 → 三元组 CRUD |
-| 外呼任务 | `/call-tasks` | 任务定义 CRUD（仅定义层，无执行） |
+| 外呼任务 | `/call-tasks` | 任务定义 CRUD + 号码清单管理/结构化 CSV 导入（5 列：序号\|业务类型\|手机号\|客户id\|vars）+ 启停 + 进度查询 |
 | 通话记录 | `/calls`, `/calls/[id]` | 只读列表+详情+录音回放（presigned URL） |
 | 租户管理 | `/tenants` | 租户 CRUD、用户多租户归属 |
 
@@ -352,7 +352,7 @@ CHANNEL_HANGUP
       → 读 ${recordings_dir}/{uuid}.wav
       → minio.upload_recording(uuid, wav, biz_type, tenant_id)
           → key = recordings/{YYYYMMDD}/{uuid}.wav, content_type=audio/wav
-          → MINIO_ENDPOINT 为空时静默返回 None（不写 artifact）
+          → CALLBOT_MINIO_ENDPOINT 为空或上传失败时返回 None（不写 artifact）
       → repository.insert_artifact(kind='recording', storage='minio', uri=key)
 ```
 
@@ -365,7 +365,8 @@ CHANNEL_HANGUP
 - `GET /api/calls/:id/recording-url` → MinIO presigned URL（按 tenant_id 隔离，跨租户 404）
 
 ### 关键约束
-- MINIO_* env 无 CALLBOT_ 前缀，pydantic 不加载；需 main.py 顶部 `load_dotenv()` 注入 os.environ，否则 `upload_recording` 静默跳过
+- MinIO 配置走 pydantic-settings（`CALLBOT_MINIO_*` 前缀），endpoint 为空时 `upload_recording` 静默跳过；上传失败返回 None（避免写指向空文件的 artifact）
+- 自动归档失败可调 `POST /calls/{fs_uuid}/archive-recording` 手动补归档（404/409/410/502 区分未找到/已归档/文件丢失/MinIO 不可用），Console 详情页有手动归档按钮
 - 录音写入 FS 的 `${recordings_dir}`（非 NAS 分轨），Console 读取 artifact.uri 的 MinIO 对象
 
 ---
@@ -433,13 +434,13 @@ CHANNEL_HANGUP
 - Orchestrator → java-mcp-server(:9090)：`user_credit_query`（user_id → credit_qualified, risk_level，仅 marketing）
 
 **运营流（console 控制台 :3001）**
-- console ⇄ PostgreSQL `callbot` schema（prompt_config/prompt_version/inbound_route/call_task + 只读 call_session/turn/event/artifact）+ `console_auth` schema（tenant/user/session）
+- console ⇄ PostgreSQL `callbot` schema（prompt_config/prompt_version/inbound_route/call_task/call_target + 只读 call_session/turn/event/artifact）+ `console` schema（tenant/user/session，Better Auth）
 - console ⇄ Redis（publish/rollback 直删 `cb:prompt:{tenant_id}:{biz_type}:{scenario}` 实现零延迟生效）
 - console ⇄ MinIO（presigned URL 回放录音）
 
 **数据/记忆/审计**
 - Redis：会话态、短期记忆、TTS缓存索引、prompt 三维缓存（5min TTL），key 前缀 `cb:{tenant_id}:{biz_type}:...`
-- PostgreSQL 17 + pgvector：12 张业务表（call_session/turn/event/artifact/config_snapshot/user_memory_fact/user_memory_vector/script_library/prompt_config/prompt_version/inbound_route/call_task）+ 向量召回；console_auth schema（Better Auth + tenant/user_tenant/session）
+- PostgreSQL 17 + pgvector：13 张业务表（call_session/turn/event/artifact/config_snapshot/user_memory_fact/user_memory_vector/script_library/prompt_config/prompt_version/inbound_route/call_task/call_target）+ 向量召回；console schema（Better Auth + tenant/user_tenant/session）
 - mem0：记忆抽取/更新/衰减，落地 PG/Redis
 - MinIO：整通双声道录音归档（key `recordings/{YYYYMMDD}/{uuid}.wav`，生命周期 1–3 年）
 
@@ -787,23 +788,55 @@ CREATE TABLE IF NOT EXISTS callbot.inbound_route (
 );
 ```
 
-### 10.2c 外呼任务定义（0003 迁移，定义层无执行引擎）
+### 10.2c 外呼任务 + 号码清单（0001 全量建表，0002/0003 扩 call_target.vars）
+> ⚠️ 执行引擎**已实现**（agent-flow `OutboundExecutor`，进程内单例，lifespan 启停）：tick 轮询 `running` 任务 → `allowed_hours` 时段校验 → 并发槽位（per-task `concurrent_limit` / 全局 `concurrent_global`）→ CAS 认领 `call_target`（pending→dialing）→ `bgapi originate` → 摘机触发 CHANNEL_ANSWER 复用 inbound 管线 → 挂机按 Hangup-Cause + `redial_strategy` 重拨或终态（done/failed）。下方 DDL 与 alembic 0001 实际建表对齐（早期文档误标「仅定义层无执行器」，已纠正）。
 ```sql
--- 仅定义层: prompt_id 外键引用 prompt_config.id; 策略字段声明性存储, 不被任何执行器消费
+-- call_task: 外呼任务定义。策略字段(concurrent_limit/allowed_hours/redial_strategy)
+-- 被 OutboundExecutor 消费，不再是声明性死字段。
 CREATE TABLE IF NOT EXISTS callbot.call_task (
-  id                BIGSERIAL PRIMARY KEY,
-  tenant_id         TEXT NOT NULL DEFAULT 'default',
-  name              TEXT NOT NULL,
-  prompt_id         BIGINT NOT NULL REFERENCES callbot.prompt_config(id),
-  kb_ids            JSONB NOT NULL DEFAULT '[]'::jsonb,
-  status            TEXT NOT NULL DEFAULT 'idle',  -- idle/running/paused/completed (仅定义)
-  concurrent_limit  INT,
-  allowed_hours     JSONB,
-  redial_strategy   JSONB,
-  dept_id           TEXT,                            -- 映射 biz_type
-  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+  id                BIGSERIAL    PRIMARY KEY,
+  tenant_id         TEXT         NOT NULL,
+  name              TEXT         NOT NULL,
+  prompt_id         BIGINT       NOT NULL REFERENCES callbot.prompt_config(id),
+  kb_ids            JSONB        NOT NULL DEFAULT '[]'::jsonb,
+  status            TEXT         NOT NULL DEFAULT 'idle',    -- idle/running/paused/completed/failed
+  concurrent_limit  INTEGER      NOT NULL DEFAULT 1,
+  allowed_hours     TEXT,                                     -- 如 "09:00-21:00"（TEXT 非 JSONB）
+  redial_strategy   JSONB        NOT NULL DEFAULT '{}'::jsonb,
+  dept_id           TEXT,                                     -- 映射 biz_type
+  description       TEXT,
+  create_time       TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  create_user       TEXT         NOT NULL DEFAULT 'system',
+  update_time       TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  update_user       TEXT         NOT NULL DEFAULT 'system'
 );
+CREATE INDEX ix_call_task_tenant ON callbot.call_task (tenant_id);
+
+-- call_target: 号码清单。task_id 裸列无外键（应用层关联删除）。
+-- vars = 每号码 render 变量（TEXT，key:value|key:value，摘机 parse_call_target_vars 解析进 graph state call_task_vars）；
+-- customer_id = 结构化 CSV 导入的客户id（仅展示/审计，不进渲染）。
+CREATE TABLE IF NOT EXISTS callbot.call_target (
+  id                    BIGSERIAL   PRIMARY KEY,
+  task_id               BIGINT      NOT NULL,                  -- 关联 call_task.id（无 FK，应用层从属删除）
+  tenant_id             TEXT        NOT NULL,
+  phone_hash            TEXT        NOT NULL,                  -- 去重键（sha256，与 agent-flow _phone_hash 对齐）
+  phone_masked         TEXT,                                  -- 138****1234
+  user_key             TEXT        NOT NULL,                  -- 明文号码（originate 被叫 {phone}）
+  status               TEXT        NOT NULL DEFAULT 'pending', -- pending/dialing/answered/no_answer/failed/done
+  attempt_count        INTEGER     NOT NULL DEFAULT 0,
+  max_attempts         INTEGER     NOT NULL DEFAULT 1,
+  next_attempt_ts      TIMESTAMPTZ,                            -- 重拨退避
+  last_call_session_id BIGINT,
+  last_hangup_cause   TEXT,
+  vars                 TEXT        NOT NULL DEFAULT '',        -- 每号码变量 key:value|key:value（0002 建 JSONB→0003 改 TEXT）
+  customer_id          TEXT,                                   -- 结构化导入客户id（审计）
+  create_time          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  create_user          TEXT        NOT NULL DEFAULT 'system',
+  update_time          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  update_user          TEXT        NOT NULL DEFAULT 'system',
+  CONSTRAINT uq_call_target_task_phone UNIQUE (task_id, phone_hash)
+);
+CREATE INDEX ix_call_target_task_status ON callbot.call_target (task_id, status);
 ```
 
 ### 10.3 逐轮对话表（按月分区）
@@ -1247,7 +1280,7 @@ FreeSWITCH 拨号计划为 catch-all，`answer` + `playback silence_stream://-1`
 
 **新增：console 服务**（依赖 PG/Redis，与 agent-flow 共库）
 - 端口 3001，Next.js + Drizzle + Better Auth
-- 部署后执行 console 自有迁移（`console/server/src/db/migrations/`）建 `console_auth` schema；`callbot` schema 表由 agent-flow alembic 维护
+- 部署后执行 console 自有迁移（`console/server/src/db/migrations/0001_init_console.sql`）建 `console` schema；`callbot` schema 表由 agent-flow alembic 维护
 
 ## 验收要点
 
@@ -1348,8 +1381,8 @@ FreeSWITCH 拨号计划为 catch-all，`answer` + `playback silence_stream://-1`
 
 ### 4. 录音文件不存在 / 录音归档失败
 - 检查 `CALLBOT_RECORDINGS_DIR` 下是否有 `${uuid}.wav`（CallRecorder 写入）
-- 检查 MinIO 配置：`MINIO_ENDPOINT` 为空时 `upload_recording` 静默跳过（不写 call_artifact）
-- 注意：MINIO_* 无 CALLBOT_ 前缀，靠 main.py 顶部 `load_dotenv()` 加载；pydantic 不加载无前缀的 env，漏配置会静默跳过
+- 检查 MinIO 配置：`CALLBOT_MINIO_ENDPOINT` 为空时 `upload_recording` 静默跳过（不写 call_artifact）；MinIO 已统一走 `CALLBOT_MINIO_*` 前缀（pydantic-settings 加载）
+- 自动归档漏归档时调 `POST /calls/{fs_uuid}/archive-recording` 手动补归档（Console 详情页有按钮）
 - 检查 `_archive_recording` 是否被 GC（强引用集 `_ongoing_archives`），挂断后延迟 `CALLBOT_RECORDING_ARCHIVE_DELAY_SEC`（默认3s）才读 wav
 - 检查 inbound_route 无 DID 匹配时回落 default（tenant_id/scenario = default）
 
