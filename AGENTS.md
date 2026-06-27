@@ -358,6 +358,7 @@ Full adaptive + corrective RAG inside `rag_retrieve_node`:
 - **VAD — Silero params**: `CALLBOT_VAD_SILERO_THRESHOLD` (default 0.3), `CALLBOT_VAD_SILERO_MIN_SILENCE_MS` (default 300)
 - **VAD — common**: `CALLBOT_VAD_MIN_AUDIO_BYTES` (default 3200)
 - **VAD — RMS threshold**: `CALLBOT_VAD_RMS_THRESHOLD` (default 300.0, frame energy below this treated as silence, filters SIP line noise)
+- **VAD — 自适应噪声底噪（noise floor tracking）**: 替代固定 RMS 门限在嘈杂环境失效（底噪 RMS 本身 >300，门限形同虚设）的问题。门限 = `noise_floor * snr_factor`，非语音帧用 EMA 更新 `noise_floor`，使门限随环境底噪自适应——安静时低、嘈杂时抬高。`CALLBOT_VAD_SNR_FACTOR` (default 3.0，<=0 关闭回退固定 `rms_threshold`)，`CALLBOT_VAD_NOISE_FLOOR_INIT` (default 300.0，warm-up 门限基线)，`CALLBOT_VAD_NOISE_ADAPT_RATE` (default 0.1，底噪 EMA 更新率，≈1s 收敛)
 - **VAD — cooldown**: `CALLBOT_VAD_COOLDOWN_AFTER_BARGEIN` (default 0.5s, discard residual audio after barge-in to prevent false positives)
 - **Barge-in**: `CALLBOT_BARGE_IN_MIN_AUDIO_BYTES` (default 1600, lower than VAD for faster reaction)
 - **Media**: `CALLBOT_MEDIA_SAMPLE_RATE` (default 16000), 全链路 16kHz，帧大小 960B (30ms @ 16kHz 16-bit)，TTS 输出 22050Hz 经 `_resample_pcm()` 降采样到 16kHz，FreeSWITCH 内部下采样到 G.711 8kHz

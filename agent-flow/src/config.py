@@ -97,6 +97,15 @@ class Settings(BaseSettings):
     # VAD RMS threshold: frame energy below this is treated as silence (filters SIP line noise)
     # 0 = disabled (WebRTC VAD only), 300 = match barge-in threshold
     vad_rms_threshold: float = 300.0
+    # VAD 自适应噪声底噪（noise floor tracking）— 解决固定 RMS 门限在嘈杂环境失效
+    # （底噪 RMS 本身 > 300，门限形同虚设）。门限 = noise_floor * snr_factor，非语音帧
+    # 用 EMA 更新 noise_floor，使门限随环境底噪自适应：安静时低、嘈杂时抬高。
+    # snr_factor <= 0 = 关闭（回退固定 rms_threshold）；典型值 3.0（要求 RMS 明显超出底噪）
+    vad_snr_factor: float = 3.0
+    # 初始噪声底噪估计（启动/换通话的 warm-up 门限基线）；与 rms_threshold 一致以平滑过渡
+    vad_noise_floor_init: float = 300.0
+    # 底噪 EMA 更新率（0-1，越大越快收敛）；0.1 ≈ 1s 内收敛到真实底噪
+    vad_noise_adapt_rate: float = 0.1
 
     # Barge-in
     barge_in_min_audio_bytes: int = 1600

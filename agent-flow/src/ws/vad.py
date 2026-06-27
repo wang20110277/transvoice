@@ -59,15 +59,21 @@ class WebRTCVAD(BaseVAD):
         silence_frames: int = 15,
         min_audio_bytes: int = 3200,
         rms_threshold: float = 0.0,
+        noise_floor_init: float = 0.0,
+        snr_factor: float = 0.0,
+        noise_adapt_rate: float = 0.1,
     ) -> None:
         import webrtcvad
 
         self._vad = webrtcvad.Vad(aggressiveness)
         self._silence_frames = silence_frames
         self._min_audio_bytes = min_audio_bytes
-        # RMS 能量门限：低于此值的帧视为静音/噪声，不参与语音判定
-        # 与 barge-in 的 _BARGE_IN_RMS_THRESHOLD 类似，过滤 SIP 线路噪声
         self._rms_threshold = rms_threshold
+        # 自适应噪声底噪：门限随环境底噪浮动，解决固定 RMS 门限在嘈杂环境失效
+        # （底噪 RMS 本身就 > 300，门限形同虚设）的问题。详见 _has_speech_energy。
+        self._noise_floor = noise_floor_init
+        self._snr_factor = snr_factor
+        self._noise_adapt_rate = noise_adapt_rate
         self._silent_count = 0
         self._speech_count = 0
         self._speech_detected = False
@@ -82,6 +88,8 @@ class WebRTCVAD(BaseVAD):
         self._speech_count = 0
         self._speech_detected = False
         self._frame_buffer.clear()
+        # noise_floor 不重置：一通通话内环境底噪相对稳定，跨轮次复用估计更准；
+        # 跨通话由 create_vad() 重建实例自然归零（避免每轮 warm-up 误判开头帧）
 
     def is_speech(self, frame: bytes) -> bool:
         if len(frame) != FRAME_BYTES:
@@ -92,11 +100,38 @@ class WebRTCVAD(BaseVAD):
             return False
 
     def _has_speech_energy(self, frame: bytes) -> bool:
-        """RMS 能量检查 — 过滤低能量噪声（SIP 线路底噪、呼吸声）。"""
-        if self._rms_threshold <= 0:
+        """能量门控：区分语音与噪声。
+
+        两种模式：
+        - 自适应 SNR（snr_factor > 0）：门限 = noise_floor * snr_factor。非语音帧用
+          EMA 更新 noise_floor，使门限随环境底噪自适应——安静时低（人声轻松通过），
+          嘈杂时抬高（要求明显超出底噪才判语音），避免固定门限在强噪声下失效。
+          rms_threshold 作为门限下限，保留对极低能量帧（纯静音/SIP 底噪）的过滤。
+        - 固定门限（snr_factor <= 0）：rms_threshold <= 0 时不做能量过滤（纯 WebRTC），
+          否则帧 RMS 须 > rms_threshold。向后兼容旧行为。
+        """
+        if self._rms_threshold <= 0 and self._snr_factor <= 0:
             return True
         _f32 = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
-        return float(np.sqrt(np.mean(_f32**2))) > self._rms_threshold
+        rms = float(np.sqrt(np.mean(_f32**2)))
+        if self._snr_factor > 0:
+            # SNR 门限不低于 rms_threshold（默认 300），保留底噪过滤兜底
+            threshold = max(self._noise_floor * self._snr_factor, self._rms_threshold)
+            return rms > threshold
+        return rms > self._rms_threshold
+
+    def _update_noise_floor(self, frame: bytes) -> None:
+        """非语音帧用 EMA 平滑更新噪声底噪估计。
+
+        仅在 is_end_of_speech 判定为非语音（WebRTC + 能量都不认为是语音）的帧上调用，
+        避免语音帧拉高底噪。双向 EMA：环境变安静时门限随之下降，变嘈杂时上升。
+        """
+        if self._snr_factor <= 0:
+            return
+        _f32 = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
+        rms = float(np.sqrt(np.mean(_f32**2)))
+        a = self._noise_adapt_rate
+        self._noise_floor = self._noise_floor * (1 - a) + rms * a
 
     def is_end_of_speech(self, chunk: bytes, buffer_len: int) -> bool:
         self._frame_buffer.extend(chunk)
@@ -105,7 +140,9 @@ class WebRTCVAD(BaseVAD):
             frame = bytes(self._frame_buffer[:FRAME_BYTES])
             self._frame_buffer = self._frame_buffer[FRAME_BYTES:]
 
-            if self.is_speech(frame) and self._has_speech_energy(frame):
+            webrtc_speech = self.is_speech(frame)
+            energy_speech = self._has_speech_energy(frame)
+            if webrtc_speech and energy_speech:
                 self._silent_count = 0
                 self._speech_count += 1
                 if self._speech_count >= self._MIN_SPEECH_FRAMES:
@@ -114,6 +151,9 @@ class WebRTCVAD(BaseVAD):
                 self._silent_count += 1
                 if self._speech_count < self._MIN_SPEECH_FRAMES:
                     self._speech_count = 0
+                # 两个判定都为否 → 干净噪声帧，用于估计底噪
+                if not webrtc_speech and not energy_speech:
+                    self._update_noise_floor(frame)
 
         return (
             self._speech_detected
@@ -246,6 +286,9 @@ def create_vad(settings: "Settings") -> BaseVAD:
             silence_frames=settings.vad_silence_frames,
             min_audio_bytes=settings.vad_min_audio_bytes,
             rms_threshold=settings.vad_rms_threshold,
+            noise_floor_init=settings.vad_noise_floor_init,
+            snr_factor=settings.vad_snr_factor,
+            noise_adapt_rate=settings.vad_noise_adapt_rate,
         )
 
     logger.warning("Unknown VAD type '%s', falling back to webrtc", vad_type)
@@ -254,4 +297,7 @@ def create_vad(settings: "Settings") -> BaseVAD:
         silence_frames=settings.vad_silence_frames,
         min_audio_bytes=settings.vad_min_audio_bytes,
         rms_threshold=settings.vad_rms_threshold,
+        noise_floor_init=settings.vad_noise_floor_init,
+        snr_factor=settings.vad_snr_factor,
+        noise_adapt_rate=settings.vad_noise_adapt_rate,
     )
