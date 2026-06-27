@@ -513,7 +513,7 @@ aiphone/
 ├── docs/                # superpowers plans/specs (design records)
 ├── docker-compose.yml       # Base Docker Compose (infra + services, MCP in prod override only)
 ├── docker-compose.prod.yml  # Production overrides (GPU pinning, health checks, MCP server)
-└── .env                     # Environment variables (CALLBOT_ prefix, not checked in)
+└── .env                     # Environment variables (CALLBOT_ prefix)
 ```
 
 ### Infrastructure
