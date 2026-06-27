@@ -26,12 +26,13 @@ from ws.jitter_buffer import JitterBuffer, TTSOutputBuffer
 from ws.registry import ActiveCallRegistry
 from ws.denoise import BaseDenoiser, PassThroughDenoiser
 from ws.audio_processing import WebRTCAPM
+from ws.asr_streaming import AsrStreamingManager
 from storage import minio_storage
 from storage.persistence_helpers import fire_insert_event
 
 if TYPE_CHECKING:
     from clients.esl import ESLClient
-    from clients.asr_grpc_client import ASRGrpcClient, ASRStream
+    from clients.asr_grpc_client import ASRGrpcClient
     from clients.asr_ws_client import ASRWebSocketClient, ASRWsStream
     from ws.registry import ActiveCall
 
@@ -129,9 +130,13 @@ class StreamingCallHandler:
         turn_count = 0
 
         # ASR streaming state
-        asr_stream: ASRStream | None = None
-        speech_started = False
-        asr_partial_text = ""
+        asr = AsrStreamingManager(
+            asr_grpc_client=self._asr_grpc_client,
+            asr_ws_client=self._asr_ws_client,
+            use_grpc_streaming=self._use_grpc_streaming,
+            use_ws_streaming=self._use_ws_streaming,
+            use_streaming_asr=self._use_streaming_asr,
+        )
         precomputed_asr_result: dict | None = None
 
         # Barge-in state
@@ -185,7 +190,7 @@ class StreamingCallHandler:
                         )
                         # 不对 barge-in 音频做 ASR — 音频缓冲混入 AI 回声，ASR 无法识别
                         # 直接重置，让正常 VAD/ASR 路径处理用户下一轮语音
-                        asr_stream, speech_started = await self._cancel_asr_stream(asr_stream, speech_started)
+                        await asr.cancel()
                         self._reset_audio_state(audio_buffer, vad, jitter)
                         # 冷却期：丢弃残余音频，防止 VAD 误触发
                         vad_cooldown_until = time.monotonic() + _settings.vad_cooldown_after_bargein
@@ -235,11 +240,7 @@ class StreamingCallHandler:
 
                         audio_buffer.extend(denoised_frame)
 
-                        # 流式 ASR：实时发送 PCM
-                        asr_stream, speech_started = await self._feed_asr_stream(
-                            asr_stream, speech_started, denoised_frame,
-                            call_id, asr_partial_text,
-                        )
+                        await asr.feed(denoised_frame, call_id)
 
                         # VAD 端点检测
                         if vad.is_end_of_speech(denoised_frame, len(audio_buffer)):
@@ -247,12 +248,20 @@ class StreamingCallHandler:
                                 break
 
                             turn_count += 1
-                            # 获取 ASR 结果 + 应用增益
-                            raw_audio, precomputed_asr_result, asr_stream, speech_started, asr_partial_text = \
-                                await self._finalize_asr_and_gain(
-                                    audio_buffer, audio_gain, asr_stream,
-                                    speech_started, asr_partial_text, call_id, turn_count,
-                                )
+                            # ASR 收尾取结果 + 应用增益（AEC 开启时 AGC 已逐帧处理，不叠加固定增益）
+                            precomputed_asr_result = await asr.finalize(call_id)
+                            raw_audio = self._gain_audio(audio_buffer, audio_gain)
+                            asr_text = (precomputed_asr_result.get("text", "").strip()
+                                        if precomputed_asr_result else "")
+                            # ASR 空文本 → VAD 误触发；单字噪音（啊/嗯）不应触发完整轮次
+                            if len(asr_text) < 2:
+                                if asr_text:
+                                    logger.info("[%s] ASR too short ('%s'), skipping turn %d",
+                                                call_id, asr_text, turn_count)
+                                else:
+                                    logger.info("[%s] ASR empty, skipping turn %d (VAD false positive)",
+                                                call_id, turn_count)
+                                raw_audio = b""
 
                             if not raw_audio:
                                 # ASR 空文本 — VAD 误触发，跳过
@@ -296,7 +305,7 @@ class StreamingCallHandler:
         except Exception as e:
             logger.error("[%s] WS error: %s", call_id, e, exc_info=True)
         finally:
-            await self._cleanup(streaming_task, asr_stream, tts_buffer, call_id, turn_count)
+            await self._cleanup(streaming_task, asr, tts_buffer, call_id, turn_count)
 
     # ───────────────────────────────────────────────────────────────
     # 音频处理辅助
@@ -325,6 +334,16 @@ class StreamingCallHandler:
         samples *= gain
         return np.clip(samples, -32768, 32767).astype(np.int16).tobytes()
 
+    def _gain_audio(self, audio_buffer: bytearray, audio_gain: float) -> bytes:
+        """端点检测后对整轮音频应用增益（返回 raw_audio）。
+
+        AEC 开启时 WebRTCAPM 已逐帧 AGC，不再叠加固定增益（直接返回原始 PCM）；
+        AEC 关闭时走 _apply_gain 放大安静 SIP 音频。
+        """
+        if self._apm is not None:
+            return bytes(audio_buffer)
+        return self._apply_gain(bytes(audio_buffer), audio_gain)
+
     def _process_near_frame(self, smooth_frame: bytes, tts_buffer: "TTSOutputBuffer") -> bytes:
         """near 端帧处理：AEC 开启时走 WebRTCAPM（near + reverse），否则走原 denoiser。"""
         if self._apm is not None:
@@ -338,104 +357,6 @@ class StreamingCallHandler:
         jitter.reset()
         self._denoiser.reset()
 
-    # ───────────────────────────────────────────────────────────────
-    # ASR 流式传输
-    # ───────────────────────────────────────────────────────────────
-
-    def _get_asr_provider(self):
-        """返回 ASR 流式传输提供者（WS 或 gRPC）。"""
-        if self._use_ws_streaming and self._asr_ws_client:
-            return self._asr_ws_client
-        if self._use_grpc_streaming and self._asr_grpc_client:
-            return self._asr_grpc_client
-        return None
-
-    async def _feed_asr_stream(
-        self, asr_stream: "ASRStream | None", speech_started: bool,
-        frame: bytes, call_id: str, asr_partial_text: str,
-    ) -> tuple["ASRStream | None", bool]:
-        """向 ASR 流发送音频帧。首帧时创建流。"""
-        provider = self._get_asr_provider()
-        if not provider:
-            return asr_stream, speech_started
-
-        if not speech_started:
-            speech_started = True
-
-            def _on_asr_partial(text: str, stability: float) -> None:
-                nonlocal asr_partial_text
-                asr_partial_text = text
-                logger.debug("[%s] ASR partial: %s (stability=%.2f)", call_id, text, stability)
-
-            asr_stream = provider.create_stream(
-                call_id, streaming=self._use_streaming_asr,
-                on_partial=_on_asr_partial if self._use_streaming_asr else None,
-            )
-            if asr_stream:
-                await asr_stream.start()
-                logger.info("[%s] ASR stream created", call_id)
-
-        if asr_stream:
-            asr_stream.send_audio(frame)
-
-        return asr_stream, speech_started
-
-    async def _finalize_asr_and_gain(
-        self, audio_buffer: bytearray, audio_gain: float,
-        asr_stream: "ASRStream | None", speech_started: bool,
-        asr_partial_text: str, call_id: str, turn: int,
-    ) -> tuple[bytes, dict | None, "ASRStream | None", bool, str]:
-        """完成 ASR 流获取结果，应用音频增益。
-
-        Returns: (raw_audio, precomputed_asr_result, asr_stream, speech_started, asr_partial_text)
-        """
-        # AEC 开启时 AGC 已由 WebRTCAPM 逐帧处理，不再叠加固定增益
-        if self._apm is not None:
-            raw_audio = bytes(audio_buffer)
-        else:
-            raw_audio = self._apply_gain(bytes(audio_buffer), audio_gain)
-        if audio_gain != 1.0:
-            logger.debug("[%s] audio gain %.1fx applied", call_id, audio_gain)
-
-        # ASR 帧级别 amplitude 统计（debug）
-        if raw_audio:
-            _s = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32)
-            logger.debug("[%s] audio stats: rms=%.0f min=%.0f max=%.0f",
-                         call_id, float(np.sqrt(np.mean(_s**2))), float(_s.min()), float(_s.max()))
-
-        precomputed_asr_result = None
-        if asr_stream:
-            precomputed_asr_result = await asr_stream.finish()
-            asr_stream = None
-            speech_started = False
-            if not precomputed_asr_result and asr_partial_text:
-                precomputed_asr_result = {"text": asr_partial_text, "confidence": 0.8, "is_final": True}
-                logger.info("[%s] ASR partial fallback: %s", call_id, asr_partial_text[:50])
-            asr_partial_text = ""
-
-        # ASR 空文本 → VAD 误触发
-        asr_text = precomputed_asr_result.get("text", "").strip() if precomputed_asr_result else ""
-        if not asr_text:
-            logger.info("[%s] ASR empty, skipping turn %d (VAD false positive)", call_id, turn)
-            return b"", precomputed_asr_result, asr_stream, speech_started, asr_partial_text
-        # 单字噪音过滤 — "啊"/"嗯"/"哦" 等附和音不应触发完整对话轮次
-        if len(asr_text) < 2:
-            logger.info("[%s] ASR too short ('%s'), skipping turn %d", call_id, asr_text, turn)
-            return b"", precomputed_asr_result, asr_stream, speech_started, asr_partial_text
-
-        return raw_audio, precomputed_asr_result, asr_stream, speech_started, asr_partial_text
-
-    @staticmethod
-    async def _cancel_asr_stream(asr_stream: "ASRStream | None", speech_started: bool):
-        """取消 ASR 流。"""
-        if asr_stream is not None:
-            try:
-                await asr_stream.cancel()
-            except Exception:
-                pass
-        return None, False
-
-    # ───────────────────────────────────────────────────────────────
     # Barge-in 检测
     # ───────────────────────────────────────────────────────────────
 
@@ -651,7 +572,7 @@ class StreamingCallHandler:
     # ───────────────────────────────────────────────────────────────
 
     async def _cleanup(
-        self, streaming_task: asyncio.Task | None, asr_stream: "ASRStream | None",
+        self, streaming_task: asyncio.Task | None, asr: AsrStreamingManager,
         tts_buffer: TTSOutputBuffer, call_id: str, turn_count: int,
     ) -> None:
         """清理所有资源。"""
@@ -661,9 +582,9 @@ class StreamingCallHandler:
                 await streaming_task
             except (asyncio.CancelledError, Exception):
                 pass
-        if asr_stream is not None:
+        if asr.stream is not None:
             try:
-                await asr_stream.cancel()
+                await asr.cancel()
             except Exception:
                 pass
         await tts_buffer.stop()

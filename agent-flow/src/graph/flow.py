@@ -189,7 +189,11 @@ async def _mcp_identity_node(state: CallGraphState) -> dict:
     call_id = state.get("call_id", "?")
     try:
         result = await _mcp_client.query_user_identity(state["user_key"], state["biz_type"])
-        logger.info("[%s] MCP identity: user_id=%s phone=%s", call_id, result.user_id, result.phone_masked)
+        logger.info(
+            "[%s] MCP user_identity_query(phone=%s, biz_type=%s) → user_id=%s phone_masked=%s id_card_last_four=%s",
+            call_id, state["user_key"], state["biz_type"],
+            result.user_id, result.phone_masked, result.id_card_last_four,
+        )
         return {"identity": {
             "user_id": result.user_id,
             "phone_masked": result.phone_masked,
@@ -337,17 +341,12 @@ async def run_pre_llm_phase(
     logger.info("[%s] ASR done: user_input=%s", call_id, state.get("user_input", "")[:50])
 
     # ── 并行扇出: MCP 身份 + 记忆召回 + RAG ──
-    # TODO: re-enable after fixing MCP phone format + RedisSearch + Ollama structured_output
-    # identity, memory, rag = await asyncio.gather(
-    #     _mcp_identity_node(state),
-    #     _recall_memory_node(state),
-    #     _rag_retrieve_node(state),
-    # )
-    # state.update(identity)
-    # state.update(memory)
-    # state.update(rag)
-    # if biz_type == "marketing" and _mcp_client:
-    #     state.update(await _credit_query_node(state))
+    # MCP 身份查询已启用（含 mock 模式）；记忆召回 / RAG 仍待修复（RedisSearch /
+    # Ollama structured_output 依赖），暂保持禁用。
+    identity = await _mcp_identity_node(state)
+    state.update(identity)
+    if biz_type == "marketing" and _mcp_client:
+        state.update(await _credit_query_node(state))
 
     elapsed = (time.monotonic() - t0) * 1000
     logger.info("[%s] pre-llm phase done in %.0fms", call_id, elapsed)

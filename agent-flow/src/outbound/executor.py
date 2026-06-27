@@ -29,7 +29,11 @@ class OutboundExecutor:
     def __init__(self, esl: ESLClient, settings: Settings) -> None:
         self._esl = esl
         self._settings = settings
-        self._semaphores: dict[int, asyncio.Semaphore] = {}  # task_id → 并发信号量
+        # task_id → (并发信号量, 创建时的 limit)。
+        # 存 limit 原值而非靠 Semaphore._value 对比：_value 是剩余许可数，一旦有
+        # originate 在跑就会递减，会被误判成 limit 变更而重建全新满信号量，
+        # 导致 concurrent_limit 并发上限完全失效。
+        self._semaphores: dict[int, tuple[asyncio.Semaphore, int]] = {}
         self._tick_task: asyncio.Task | None = None
         self._stopping = False
 
@@ -52,12 +56,18 @@ class OutboundExecutor:
         logger.info("OutboundExecutor stopped")
 
     def _semaphore_for(self, task: CallTask) -> asyncio.Semaphore:
-        """每任务一个 Semaphore(concurrent_limit)；limit 变更后重建（简单策略）。"""
-        sem = self._semaphores.get(task.id)
-        if sem is None or sem._value != task.concurrent_limit:  # noqa: SLF001 — limit 变更检测
-            sem = asyncio.Semaphore(max(1, task.concurrent_limit))
-            self._semaphores[task.id] = sem
-        return sem
+        """每任务一个 Semaphore(concurrent_limit)；limit 变更后重建（简单策略）。
+
+        用记录的 limit 原值检测变更：运行中的 originate 会消耗许可 (_value 递减)，
+        若用 _value 对比会每 tick 都误重建满信号量，使并发上限形同虚设。
+        """
+        limit = max(1, task.concurrent_limit)
+        entry = self._semaphores.get(task.id)
+        if entry is None or entry[1] != limit:
+            sem = asyncio.Semaphore(limit)
+            self._semaphores[task.id] = (sem, limit)
+            return sem
+        return entry[0]
 
     async def _run_loop(self) -> None:
         """周期 tick，直到 stop。"""
