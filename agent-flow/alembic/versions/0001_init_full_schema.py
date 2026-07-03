@@ -1,18 +1,14 @@
-"""initial full schema (合并旧 0001-0005)
+"""initial full schema（合并旧 0001-0005 + call_target vars/customer_id 增量）
 
 Revision ID: 0001
 Revises:
-Create Date: 2026-06-24
+Create Date: 2026-07-03
 
-全量初始化 callbot schema —— 合并旧 0001-0005 五个增量 migration 为单个文件，
-所有表/字段补齐中文 COMMENT。
+全量初始化 callbot schema —— 合并历史全部增量（旧 0001-0005 + call_target 的
+vars/customer_id 两列）为单个初始 migration，所有表/字段补齐中文 COMMENT。
 
-⚠️ 已有库升级 SOP（不可省略）：
-   旧库的 callbot.alembic_version 记着 0001-0005，且 migration 不能在自身事务里 DROP schema
-   （会连 alembic_version 一起删，导致 stamp 失败）。必须先手动清库再 upgrade：
-       psql "$DATABASE_URL" -c 'DROP SCHEMA IF EXISTS callbot CASCADE;'
-       alembic upgrade head
-   全新库直接 alembic upgrade head 即可（本 migration 只在空 schema 上建表）。
+call_target.vars 直接以最终态 TEXT（key:value|key:value）建表，跳过历史 JSONB→TEXT 中间态。
+全新库直接 alembic upgrade head 即可（本 migration 只在空 schema 上建表）。
 """
 from typing import Sequence, Union
 
@@ -582,6 +578,8 @@ def upgrade() -> None:
             next_attempt_ts     TIMESTAMPTZ,
             last_call_session_id BIGINT,
             last_hangup_cause   TEXT,
+            vars                TEXT          NOT NULL DEFAULT '',
+            customer_id         TEXT,
             create_time         TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
             create_user         TEXT          NOT NULL DEFAULT 'system',
             update_time         TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
@@ -607,6 +605,8 @@ def upgrade() -> None:
     _comment('call_target', 'next_attempt_ts', '下次可拨打时间(重拨退避用)')
     _comment('call_target', 'last_call_session_id', '最近一次通话会话ID')
     _comment('call_target', 'last_hangup_cause', '最近一次挂机原因')
+    _comment('call_target', 'vars', '每号码 render 变量，格式 key:value|key:value（TEXT），摘机后 parse_call_target_vars 解析进 graph state call_task_vars')
+    _comment('call_target', 'customer_id', '结构化导入客户id，仅展示/审计，不进渲染')
     _comment('call_target', 'create_time', '记录创建时间')
     _comment('call_target', 'create_user', '记录创建人')
     _comment('call_target', 'update_time', '记录更新时间')
