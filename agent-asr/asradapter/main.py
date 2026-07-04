@@ -4,7 +4,6 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket
 from asradapter.config import load_asr_engine
-from asradapter.grpc_server import serve_grpc
 from asradapter.vad_segmenter import FsmnVadSegmenter, load_fsmn_vad_model
 from asradapter.ws_server import ASRWebSocketHandler
 
@@ -12,7 +11,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(nam
 logger = logging.getLogger(__name__)
 
 engine = None
-_grpc_server = None
 _vad_model = None
 
 
@@ -24,7 +22,7 @@ def _load_config():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global engine, _grpc_server, _vad_model
+    global engine, _vad_model
     config = _load_config()
     engine = load_asr_engine(config["engine"]["asr"])
     if hasattr(engine, "load_model"):
@@ -35,14 +33,7 @@ async def lifespan(app: FastAPI):
     _vad_model = load_fsmn_vad_model()
     logger.info("FSMN-VAD model loaded")
 
-    # Start gRPC server alongside FastAPI
-    _grpc_server = await serve_grpc(engine)
-
     yield
-
-    if _grpc_server:
-        await _grpc_server.stop(grace=2)
-        logger.info("gRPC ASR server stopped")
 
 
 app = FastAPI(title="ASR Adapter Service", lifespan=lifespan)
