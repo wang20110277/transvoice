@@ -13,47 +13,41 @@ from typing import TYPE_CHECKING
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from clients.asr_grpc_client import ASRStream
+    from clients.asr_ws_client import ASRWsStream
 
 
 class AsrStreamingManager:
     """单轮对话的 ASR 流管理器。
 
-    provider 选择（WS 优先于 gRPC）在首帧时确定；之后 feed 持续喂帧，finalize 收尾取结果。
+    provider 选择(WS)在首帧时确定;之后 feed 持续喂帧,finalize 收尾取结果。
     一轮结束后可 reset 复用于下一轮，或 cancel 后丢弃。
     """
 
     def __init__(
         self,
-        asr_grpc_client=None,
         asr_ws_client=None,
-        use_grpc_streaming: bool = False,
         use_ws_streaming: bool = False,
         use_streaming_asr: bool = False,
         on_final: Callable[[dict], Awaitable[None]] | None = None,
     ) -> None:
-        self._asr_grpc_client = asr_grpc_client
         self._asr_ws_client = asr_ws_client
-        self._use_grpc_streaming = use_grpc_streaming
         self._use_ws_streaming = use_ws_streaming
         self._use_streaming_asr = use_streaming_asr
         self._on_final = on_final  # WS 服务端驱动 final 回调(per-call)
         # 流生命周期三态
-        self._stream: "ASRStream | None" = None
+        self._stream: "ASRWsStream | None" = None
         self._speech_started = False
         self._partial_text = ""
 
     @property
-    def stream(self) -> "ASRStream | None":
+    def stream(self) -> "ASRWsStream | None":
         """暴露当前流，供挂断清理时统一 cancel。"""
         return self._stream
 
     def _provider(self):
-        """返回 ASR 流式提供者（WS 或 gRPC）；未配置返回 None。"""
+        """返回 ASR 流式提供者(WS);未配置返回 None。"""
         if self._use_ws_streaming and self._asr_ws_client:
             return self._asr_ws_client
-        if self._use_grpc_streaming and self._asr_grpc_client:
-            return self._asr_grpc_client
         return None
 
     async def feed(self, frame: bytes, call_id: str) -> None:

@@ -6,11 +6,10 @@
 
 服务启动顺序（lifespan）：
   ① 核心服务 (MCP, TTS, ASR, Memory)
-  ② 可选 gRPC 客户端
-  ③ 可选 WebSocket 客户端
-  ④ 注入 flow.py 服务单例
-  ⑤ ESL 连接 + 事件订阅
-  ⑥ 创建 StreamingCallHandler
+  ② 可选 WebSocket 客户端
+  ③ 注入 flow.py 服务单例
+  ④ ESL 连接 + 事件订阅
+  ⑤ 创建 StreamingCallHandler
 """
 import sys
 from pathlib import Path
@@ -46,8 +45,6 @@ from src.ws.registry import ActiveCallRegistry
 from src.ws.denoise import create_denoiser
 from src.ws.audio_processing import create_audio_processing
 from src.ws.rms_gate import RMSGate
-from src.clients.asr_grpc_client import ASRGrpcClient
-from src.clients.tts_grpc_client import TTSGrpcClient
 from src.clients.asr_ws_client import ASRWebSocketClient
 from src.clients.tts_ws_client import TTSWebSocketClient
 
@@ -92,23 +89,6 @@ async def _init_core_services() -> tuple[MemoryAssembler, MCPClient, TTSClient, 
     return assembler, mcp, tts, asr
 
 
-async def _init_grpc_clients() -> tuple[ASRGrpcClient | None, TTSGrpcClient | None]:
-    """初始化可选 gRPC 客户端（ASR + TTS）。"""
-    asr_grpc = None
-    if settings.asr_use_grpc:
-        asr_grpc = ASRGrpcClient(settings.asr_grpc_target)
-        await asr_grpc.start()
-        logger.info("ASR gRPC client → %s", settings.asr_grpc_target)
-
-    tts_grpc = None
-    if settings.tts_use_grpc:
-        tts_grpc = TTSGrpcClient(settings.tts_grpc_target)
-        await tts_grpc.start()
-        logger.info("TTS gRPC client → %s", settings.tts_grpc_target)
-
-    return asr_grpc, tts_grpc
-
-
 async def _init_ws_clients() -> tuple[ASRWebSocketClient | None, TTSWebSocketClient | None]:
     """初始化可选 WebSocket 客户端（ASR + TTS）。"""
     asr_ws = None
@@ -142,15 +122,11 @@ async def lifespan(app: FastAPI):
     # ── ① 核心服务 ──
     assembler, mcp, tts, asr = await _init_core_services()
 
-    # ── ② 可选 gRPC 客户端 ──
-    asr_grpc, tts_grpc = await _init_grpc_clients()
-
-    # ── ③ 可选 WebSocket 客户端 ──
+    # ── ② 可选 WebSocket 客户端 ──
     asr_ws, tts_ws = await _init_ws_clients()
 
-    # ── ④ 注入 flow.py 服务单例 ──
-    set_services(assembler, mcp, tts, asr, tts_grpc=tts_grpc, asr_grpc=asr_grpc,
-                 tts_ws=tts_ws, asr_ws=asr_ws)
+    # ── ③ 注入 flow.py 服务单例 ──
+    set_services(assembler, mcp, tts, asr, tts_ws=tts_ws, asr_ws=asr_ws)
 
     # ── ⑤ ESL 连接 + 事件订阅 ──
     esl = ESLClient(host=settings.esl_host, port=settings.esl_port, password=settings.esl_password)
@@ -190,8 +166,6 @@ async def lifespan(app: FastAPI):
         jitter_max_depth=settings.jitter_max_depth,
         denoiser=denoiser,
         apm=apm,
-        asr_grpc_client=asr_grpc,
-        use_grpc_streaming=settings.asr_use_grpc,
         asr_ws_client=asr_ws,
         use_ws_streaming=settings.asr_use_ws,
         use_streaming_asr=settings.asr_streaming_enabled,
@@ -213,7 +187,7 @@ async def lifespan(app: FastAPI):
     if _outbound_executor is not None:
         await _outbound_executor.stop()
         _outbound_executor = None
-    await _shutdown(mcp, asr_grpc, tts_grpc, asr_ws, tts_ws, asr, tts, esl)
+    await _shutdown(mcp, asr_ws, tts_ws, asr, tts, esl)
     _initialized = False
 
 
@@ -225,10 +199,10 @@ def _log_startup_summary() -> None:
     logger.info("  AEC/APM: enabled=%s type=%d ns=%d agc=%d delay=%dms",
                 settings.aec_enabled, settings.aec_type,
                 settings.aec_ns_level, settings.aec_agc_type, settings.aec_system_delay_ms)
-    logger.info("  ASR transport: grpc=%s ws=%s streaming=%s",
-                settings.asr_use_grpc, settings.asr_use_ws, settings.asr_streaming_enabled)
-    logger.info("  TTS transport: grpc=%s ws=%s streaming=%s",
-                settings.tts_use_grpc, settings.tts_use_ws, settings.tts_streaming_enabled)
+    logger.info("  ASR transport: ws=%s streaming=%s",
+                settings.asr_use_ws, settings.asr_streaming_enabled)
+    logger.info("  TTS transport: ws=%s streaming=%s",
+                settings.tts_use_ws, settings.tts_streaming_enabled)
     logger.info("  Splitter: min=%d timeout=%.1fs eager_first=%s",
                 settings.splitter_min_length, settings.splitter_flush_timeout, settings.splitter_eager_first)
     logger.info("  Audio: sample_rate=%d gain=%.1fx jitter=%d-%d",
@@ -242,8 +216,6 @@ def _log_startup_summary() -> None:
 
 async def _shutdown(
     mcp: MCPClient,
-    asr_grpc: ASRGrpcClient | None,
-    tts_grpc: TTSGrpcClient | None,
     asr_ws: ASRWebSocketClient | None,
     tts_ws: TTSWebSocketClient | None,
     asr: ASRClient,
@@ -261,8 +233,7 @@ async def _shutdown(
         pass
 
     # 关闭可选客户端
-    for name, client in [("ASR gRPC", asr_grpc), ("TTS gRPC", tts_grpc),
-                          ("ASR WS", asr_ws), ("TTS WS", tts_ws)]:
+    for name, client in [("ASR WS", asr_ws), ("TTS WS", tts_ws)]:
         if client:
             try:
                 await client.close()

@@ -32,8 +32,6 @@ from memory.chat_history import load_chat_history, save_turn
 from clients.mcp import MCPClient
 from clients.tts import TTSClient
 from clients.asr import ASRClient
-from clients.tts_grpc_client import TTSGrpcClient
-from clients.asr_grpc_client import ASRGrpcClient
 from clients.tts_ws_client import TTSWebSocketClient
 from clients.asr_ws_client import ASRWebSocketClient
 from storage import minio_storage
@@ -49,8 +47,6 @@ _assembler: MemoryAssembler | None = None
 _mcp_client: MCPClient | None = None
 _tts_client: TTSClient | None = None
 _asr_client: ASRClient | None = None
-_tts_grpc_client: TTSGrpcClient | None = None
-_asr_grpc_client: ASRGrpcClient | None = None
 _tts_ws_client: TTSWebSocketClient | None = None
 _asr_ws_client: ASRWebSocketClient | None = None
 
@@ -60,24 +56,19 @@ def set_services(
     mcp: MCPClient,
     tts: TTSClient,
     asr: ASRClient | None = None,
-    tts_grpc: TTSGrpcClient | None = None,
-    asr_grpc: ASRGrpcClient | None = None,
     tts_ws: TTSWebSocketClient | None = None,
     asr_ws: ASRWebSocketClient | None = None,
 ) -> None:
     global _assembler, _mcp_client, _tts_client, _asr_client
-    global _tts_grpc_client, _asr_grpc_client, _tts_ws_client, _asr_ws_client
+    global _tts_ws_client, _asr_ws_client
     _assembler = assembler
     _mcp_client = mcp
     _tts_client = tts
     _asr_client = asr
-    _tts_grpc_client = tts_grpc
-    _asr_grpc_client = asr_grpc
     _tts_ws_client = tts_ws
     _asr_ws_client = asr_ws
-    logger.info("flow services injected: mcp=%s tts=%s asr=%s tts_grpc=%s asr_grpc=%s tts_ws=%s asr_ws=%s",
+    logger.info("flow services injected: mcp=%s tts=%s asr=%s tts_ws=%s asr_ws=%s",
                 mcp is not None, tts is not None, asr is not None,
-                tts_grpc is not None, asr_grpc is not None,
                 tts_ws is not None, asr_ws is not None)
 
 
@@ -104,9 +95,7 @@ class CallGraphState(TypedDict, total=False):
 # ═══════════════════════════════════════════════════════════════════
 
 def _get_asr_client() -> tuple[str, object]:
-    """返回 (传输方式, 客户端实例)，优先级: gRPC > WS > HTTP。"""
-    if _asr_grpc_client is not None:
-        return "gRPC", _asr_grpc_client
+    """返回 (传输方式, 客户端实例)，优先级: WS > HTTP。"""
     if _asr_ws_client is not None:
         return "WS", _asr_ws_client
     if _asr_client is not None:
@@ -115,11 +104,9 @@ def _get_asr_client() -> tuple[str, object]:
 
 
 def _get_tts_client() -> tuple[str, object]:
-    """返回 (传输方式, 客户端实例)，优先级: WS > gRPC > HTTP。"""
+    """返回 (传输方式, 客户端实例)，优先级: WS > HTTP。"""
     if _tts_ws_client is not None:
         return "WS", _tts_ws_client
-    if _tts_grpc_client is not None:
-        return "gRPC", _tts_grpc_client
     if _tts_client is not None:
         return "HTTP", _tts_client
     return "none", None
@@ -156,7 +143,7 @@ def _resample_pcm(pcm: bytes, orig_rate: int, target_rate: int) -> bytes:
 # ═══════════════════════════════════════════════════════════════════
 
 async def _asr_node(state: CallGraphState) -> dict:
-    """Node ①: ASR 语音识别。优先 gRPC/WS，回退 HTTP。"""
+    """Node ①: ASR 语音识别。优先 WS，回退 HTTP。"""
     call_id = state.get("call_id", "?")
     audio_bytes = state.get("audio_bytes")
 
@@ -290,7 +277,7 @@ async def run_pre_llm_phase(
         biz_type: 业务类型 (customer_service/collection/marketing)
         user_key: 用户标识
         audio_bytes: 用户音频 PCM
-        precomputed_asr_result: 已通过 gRPC/WS 流式获取的 ASR 结果（跳过 HTTP ASR）
+        precomputed_asr_result: 已通过 WS 流式获取的 ASR 结果（跳过 HTTP ASR）
         tenant_id: 租户/业务系统(提示词隔离维度)
         scenario: 话术场景(提示词选择维度)
         call_task_vars: 外呼每号码 render 变量（call_target.vars），由 render() 替换 prompt 占位符；
@@ -437,7 +424,7 @@ async def run_streaming_pipeline(
                 logger.error("[%s] streaming TTS sentence %d failed: %s", call_id, sentence.index, e)
                 return
 
-        # Batch TTS: WS > gRPC > HTTP
+        # Batch TTS: WS > HTTP
         transport, client = _get_tts_client()
         if client is None:
             logger.warning("[%s] no TTS client for sentence %d", call_id, sentence.index)

@@ -32,7 +32,6 @@ from storage.persistence_helpers import fire_insert_event
 
 if TYPE_CHECKING:
     from clients.esl import ESLClient
-    from clients.asr_grpc_client import ASRGrpcClient
     from clients.asr_ws_client import ASRWebSocketClient, ASRWsStream
     from ws.registry import ActiveCall
 
@@ -112,8 +111,6 @@ class StreamingCallHandler:
         jitter_max_depth: int = 10,
         denoiser: BaseDenoiser | None = None,
         apm: "WebRTCAPM | None" = None,
-        asr_grpc_client: "ASRGrpcClient | None" = None,
-        use_grpc_streaming: bool = False,
         asr_ws_client: "ASRWebSocketClient | None" = None,
         use_ws_streaming: bool = False,
         use_streaming_asr: bool = False,
@@ -132,8 +129,6 @@ class StreamingCallHandler:
         self._jitter_max_depth = jitter_max_depth
         self._denoiser = denoiser or PassThroughDenoiser()
         self._apm = apm
-        self._asr_grpc_client = asr_grpc_client
-        self._use_grpc_streaming = use_grpc_streaming
         self._asr_ws_client = asr_ws_client
         self._use_ws_streaming = use_ws_streaming
         self._use_streaming_asr = use_streaming_asr
@@ -172,7 +167,7 @@ class StreamingCallHandler:
         audio_buffer = bytearray()
         audio_gain = _settings.audio_gain
 
-        # 非 WS 路径无端点触发器:gRPC/HTTP ASR 已移除本地 VAD endpoint,关闭 WS 等于无轮次启动
+        # 非 WS 路径无端点触发器:HTTP ASR 已移除本地 VAD endpoint,关闭 WS 等于无轮次启动
         if not self._use_ws_streaming:
             logger.warning(
                 "[%s] ASR WS streaming disabled — endpoint detection needs WS-driven finals; no turns will launch",
@@ -204,9 +199,7 @@ class StreamingCallHandler:
 
         # ASR streaming state —— on_final=turn_ctrl.on_final 驱动轮次(WS 服务端分段)
         asr = AsrStreamingManager(
-            asr_grpc_client=self._asr_grpc_client,
             asr_ws_client=self._asr_ws_client,
-            use_grpc_streaming=self._use_grpc_streaming,
             use_ws_streaming=self._use_ws_streaming,
             use_streaming_asr=self._use_streaming_asr,
             on_final=turn_ctrl.on_final if self._use_ws_streaming else None,

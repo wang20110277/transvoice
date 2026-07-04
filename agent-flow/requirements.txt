@@ -47,11 +47,6 @@ scipy>=1.12.0
 # AEC + NS + AGC (WebRTC APM via livekit，预编译 wheel 免编译，macOS/Linux 均可装)
 livekit>=1.1.10  # 用 livekit.rtc.AudioProcessingModule 做 AEC/NS/AGC；CALLBOT_AEC_ENABLED=true 时启用
 
-# gRPC (ASR/TTS streaming)
-grpcio>=1.81.0
-grpcio-tools>=1.81.0
-protobuf>=5.0.0
-
 # Monitoring
 prometheus-client>=0.20.0
 

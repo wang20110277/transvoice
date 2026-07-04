@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 class ASRWebSocketClient:
     """ASR WebSocket 客户端 — 每次流式识别创建独立连接。
 
-    接口镜像 ASRGrpcClient: start/close/recognize/create_stream。
+    接口:start/close/recognize/create_stream。
     """
 
     def __init__(self, base_url: str):

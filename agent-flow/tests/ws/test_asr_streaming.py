@@ -1,7 +1,7 @@
 """AsrStreamingManager 单元测试 — 封装 ASR 流生命周期（feed→finalize/cancel）。
 
 注入 fake provider/stream，验证首帧建流、多帧喂送、partial fallback、cancel 丢弃。
-不依赖真实 gRPC/WS 客户端。
+不依赖真实 WS 客户端。
 """
 import sys
 from pathlib import Path
@@ -47,7 +47,7 @@ import pytest
 
 @pytest.mark.asyncio
 async def test_no_provider_is_noop():
-    """无 provider（gRPC/WS 都没配）时 feed/finalize 静默返回。"""
+    """无 provider(WS 没配)时 feed/finalize 静默返回。"""
     mgr = AsrStreamingManager()  # 全部默认 None/False
     await mgr.feed(b"\x00" * 960, "call1")
     assert mgr.stream is None
@@ -59,7 +59,7 @@ async def test_creates_stream_on_first_feed_only():
     """首帧创建并 start 流；后续帧只 send_audio，不重复建流。"""
     stream = _FakeStream()
     prov = _FakeProvider(stream)
-    mgr = AsrStreamingManager(asr_grpc_client=prov, use_grpc_streaming=True)
+    mgr = AsrStreamingManager(asr_ws_client=prov, use_ws_streaming=True)
 
     await mgr.feed(b"\x01" * 960, "call1")
     assert stream.started is True
@@ -71,25 +71,10 @@ async def test_creates_stream_on_first_feed_only():
 
 
 @pytest.mark.asyncio
-async def test_ws_provider_preferred_over_grpc():
-    """WS 和 gRPC 都配时优先 WS。"""
-    ws_stream, grpc_stream = _FakeStream(), _FakeStream()
-    ws_prov = _FakeProvider(ws_stream)
-    grpc_prov = _FakeProvider(grpc_stream)
-    mgr = AsrStreamingManager(
-        asr_grpc_client=grpc_prov, asr_ws_client=ws_prov,
-        use_grpc_streaming=True, use_ws_streaming=True,
-    )
-    await mgr.feed(b"\x00" * 960, "call1")
-    assert mgr.stream is ws_stream
-    assert grpc_stream.started is False
-
-
-@pytest.mark.asyncio
 async def test_finalize_returns_result_and_resets():
     """finalize 收尾取结果，重置流状态供下一轮复用。"""
     stream = _FakeStream()
-    mgr = AsrStreamingManager(asr_grpc_client=_FakeProvider(stream), use_grpc_streaming=True)
+    mgr = AsrStreamingManager(asr_ws_client=_FakeProvider(stream), use_ws_streaming=True)
     await mgr.feed(b"\x01" * 960, "call1")
 
     result = await mgr.finalize("call1")
@@ -122,7 +107,7 @@ async def test_finalize_partial_fallback_when_finish_empty():
 async def test_cancel_discards_stream():
     """cancel 取消并丢弃流，状态归零（barge-in 清理用）。"""
     stream = _FakeStream()
-    mgr = AsrStreamingManager(asr_grpc_client=_FakeProvider(stream), use_grpc_streaming=True)
+    mgr = AsrStreamingManager(asr_ws_client=_FakeProvider(stream), use_ws_streaming=True)
     await mgr.feed(b"\x01" * 960, "call1")
 
     await mgr.cancel()
@@ -133,5 +118,5 @@ async def test_cancel_discards_stream():
 @pytest.mark.asyncio
 async def test_finalize_without_feed_returns_none():
     """未喂过帧（流未启动）时 finalize 返回 None。"""
-    mgr = AsrStreamingManager(asr_grpc_client=_FakeProvider(_FakeStream()), use_grpc_streaming=True)
+    mgr = AsrStreamingManager(asr_ws_client=_FakeProvider(_FakeStream()), use_ws_streaming=True)
     assert await mgr.finalize("call1") is None
