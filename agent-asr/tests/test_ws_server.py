@@ -109,7 +109,7 @@ async def test_sample_rate_8000_triggers_resample(monkeypatch):
     handler = ASRWebSocketHandler(_FakeEngine(), seg)
     ws = _FakeWS([_config_msg(sample_rate=8000), b"\x01\x00" * 160, json.dumps({"type": "end"})])
     await asyncio.wait_for(handler.handle(ws), timeout=2.0)
-    # 160 samples @ 8k = 160ms;resample 到 16k = 320 samples = 640 bytes
+    # 160 samples @ 8k = 20ms;resample 到 16k = 320 samples = 640 bytes
     assert any(n == 640 for n in called_sr)
 
 
@@ -128,3 +128,35 @@ async def test_degrade_falls_back_to_end_batch(monkeypatch):
     results = [m for m in ws.sent if m.get("type") == "result"]
     assert len(results) == 1
     assert results[0]["text"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_after_degrade_stops_feeding_segmenter_and_accumulates():
+    """降级后:后续帧不再喂 segmenter(无重复 recognize),但仍累积进 end-batch。"""
+    feed_calls = []
+
+    class _BoomThenQuiet:
+        def __init__(self): self.resets = 0; self.flushed = False
+        def feed(self, pcm):
+            feed_calls.append(len(pcm))
+            if len(feed_calls) == 1:
+                raise RuntimeError("vad boom")  # first frame degrades
+            return []  # should NEVER be reached after degrade
+        def force_flush(self): self.flushed = True; return []
+        def reset(self): self.resets += 1
+
+    seg = _BoomThenQuiet()
+    handler = ASRWebSocketHandler(_FakeEngine("tail"), seg)
+    ws = _FakeWS([
+        _config_msg(),
+        b"frame-A",   # triggers degrade
+        b"frame-B",   # post-degrade: must NOT reach segmenter.feed; accumulates
+        b"frame-C",   # post-degrade: accumulates
+        json.dumps({"type": "end"}),  # batch-recognize accumulated
+    ])
+    await asyncio.wait_for(handler.handle(ws), timeout=2.0)
+    # segmenter.feed called exactly once (the frame that boomed); never again post-degrade
+    assert len(feed_calls) == 1
+    results = [m for m in ws.sent if m.get("type") == "result"]
+    assert len(results) == 1  # single end-batch result, no per-segment duplicates
+    assert results[0]["text"] == "tail"

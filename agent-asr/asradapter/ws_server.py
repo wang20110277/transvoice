@@ -87,12 +87,16 @@ class ASRWebSocketHandler:
 
                 elif "bytes" in data and data["bytes"]:
                     pcm16k = _resample_to_16k(data["bytes"], declared_sr)
-                    pending_audio.append(pcm16k)
+                    # 降级后不再喂 segmenter(避免恢复时重复 result),仅累积等 end 整段 batch
+                    if degraded:
+                        pending_audio.append(pcm16k)
+                        continue
                     try:
                         segments = self._segmenter.feed(pcm16k)
                     except Exception as e:
                         logger.warning("[WS-ASR] VAD degraded call_id=%s: %s — fallback to end-batch", call_id, e)
                         degraded = True
+                        pending_audio.append(pcm16k)  # 触发降级的帧保留进 batch
                         segments = []
                     for seg in segments:
                         await self._recognize_and_push(websocket, seg, call_id, language)
