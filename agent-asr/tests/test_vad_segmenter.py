@@ -121,3 +121,22 @@ def test_generate_exception_propagates(monkeypatch):
     seg = FsmnVadSegmenter(load_fsmn_vad_model("fake"))
     with pytest.raises(RuntimeError, match="model boom"):
         seg.feed(_pcm(600))
+
+
+def test_real_api_minus1_sentinel_assembles_segment_across_chunks(monkeypatch):
+    """真实 funasr FSMN-VAD 用 -1 sentinel 表示跨 chunk 起止(verified vs funasr 1.2.7):
+       [start, -1] = 段在 start ms 起、未结束;[-1, end] = 段在 end ms 结束(起已在先前 chunk 报)。
+    segmenter 的 max(start,consumed) clamp 应正确组装:跳过未结束的、吐出已结束的,不丢不重复。"""
+    _patch_funasr(monkeypatch, value_seq=[
+        [[70, -1]],     # chunk0: 段 70ms 起,未终 → skip
+        [],             # chunk1: 段持续,无边界
+        [[-1, 1800]],   # chunk2: 段 1800ms 终 → emit [consumed=0, 1800]
+    ])
+    seg = FsmnVadSegmenter(load_fsmn_vad_model("fake"))
+    assert seg.feed(_pcm(600)) == []    # chunk0: [70,-1] skipped(end=-1 ≤ consumed=0)
+    assert seg.feed(_pcm(600)) == []    # chunk1: 空
+    out = seg.feed(_pcm(600))           # chunk2: [-1,1800] → emit [0,1800]
+    assert len(out) == 1
+    assert len(out[0]) == 1800 * BYTES_PER_MS
+    # 再喂无新段,确认不重复吐
+    assert seg.feed(_pcm(600)) == []

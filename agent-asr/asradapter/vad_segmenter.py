@@ -24,11 +24,10 @@ DEFAULT_MODEL_DIR = os.environ.get(
     ),
 )
 
-# FunASR FSMN-VAD 流式 chunk 约定(60ms 单位 [0,10,5] = 600ms net chunk)
-CHUNK_SIZE = [0, 10, 5]
-ENCODER_CHUNK_LOOK_BACK = 4
-DECODER_CHUNK_LOOK_BACK = 1
-CHUNK_MS = CHUNK_SIZE[1] * 60  # 600ms 累积阈值
+# FunASR ≥1.2.7 FSMN-VAD 流式 chunk_size 接受 int(毫秒),非旧版 [0,10,5] list。
+# generate() 内部 chunk_stride_samples = chunk_size * fs / 1000;600ms 是流式分段步长。
+CHUNK_SIZE = 600
+CHUNK_MS = CHUNK_SIZE  # 累积阈值 = chunk 步长(ms)
 
 
 def load_fsmn_vad_model(model_dir: str = DEFAULT_MODEL_DIR):
@@ -91,8 +90,6 @@ class FsmnVadSegmenter:
                 input=chunk,
                 is_final=is_final,
                 chunk_size=self._chunk_size,
-                encoder_chunk_look_back=ENCODER_CHUNK_LOOK_BACK,
-                decoder_chunk_look_back=DECODER_CHUNK_LOOK_BACK,
                 cache=self._cache,
             )
         except Exception as e:
@@ -110,7 +107,9 @@ class FsmnVadSegmenter:
         for seg in value:
             start_ms, end_ms = int(seg[0]), int(seg[1])
             if end_ms <= self._consumed_ms:
-                continue  # 已吐过
+                # 已吐过;或 end==-1(FSMN 流式 sentinel:段未结束,起始已在先前 chunk 报过,等结束标记)
+                continue
+            # start==-1(段起始在先前 chunk 已报)时回落到 consumed,从上次吐段点切片
             start_ms = max(start_ms, self._consumed_ms)
             b0 = (start_ms - self._audio_offset_ms) * BYTES_PER_MS
             b1 = (end_ms - self._audio_offset_ms) * BYTES_PER_MS
