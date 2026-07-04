@@ -1,4 +1,4 @@
-"""ASR WebSocket 客户端 — 流式音频上传，接口与 gRPC ASRStream 一致。"""
+"""ASR WebSocket 客户端 — 流式音频上传(start/close/recognize/create_stream 接口)。"""
 import asyncio
 import json
 import logging
@@ -67,7 +67,7 @@ class ASRWebSocketClient:
         on_partial: Callable[[str, float], None] | None = None,
         on_final: Callable[[dict], Awaitable[None]] | None = None,
     ) -> "ASRWsStream | None":
-        """创建流式会话 — 返回与 gRPC ASRStream 接口一致的对象。"""
+        """创建流式会话 — 返回 ASRWsStream 对象。"""
         if not self._started:
             return None
         return ASRWsStream(self._base_url, call_id, streaming=streaming,
@@ -75,7 +75,7 @@ class ASRWebSocketClient:
 
 
 class ASRWsStream:
-    """WebSocket 流式 ASR 会话 — 接口与 gRPC ASRStream 完全一致。
+    """WebSocket 流式 ASR 会话(start/send_audio/finish/cancel 生命周期)。
 
     send_audio() 为同步方法（内部用 asyncio.Queue + 后台 sender task），
     与 handler.py 中不 await 的调用方式兼容。
