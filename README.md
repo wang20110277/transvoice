@@ -6,15 +6,15 @@
 1. **接入层**：SIP User发起外呼通话，通话媒体流、通话唯一标识 CallID/fs_uuid、主叫/被叫用户手机号同步上行传输
 2. **语音交换层**：通话接入 FreeSWITCH 软交换，拨号计划为 **catch-all `^(\d+)$` → answer → playback silence_stream://-1**（无限静音保活）。`tenant_id/biz_type/scenario` **不在 dialplan 硬编码**，由 agent-flow 在 CHANNEL_ANSWER 读取被叫号(DID)后查 `callbot.inbound_route` 解析。全程携带 CallID+手机号
 3. **WebSocket音频流层（事件驱动）**：CHANNEL_ANSWER 事件 → agent-flow ESL handler 调用 `uuid_audio_fork start` → FreeSWITCH 建立与 agent-flow 的 WebSocket 双向音频流，**上行传输用户语音 PCM 流，下行接收 TTS 合成音频**，全程携带四维隔离键。agent-flow 运行在 **uvloop 事件循环**上（libuv C 实现），减少高并发下 GC 停顿
-4. **语音识别层**：agent-flow 首节点调用 agent-asr（内置 GPU 推理引擎），完成语音转文字。输入音频经 **WebRTCAPM（AEC+NS+AGC）或 Denoiser 降噪 → 可插拔 VAD（WebRTC/Silero）** 端点检测。支持**三种传输协议**：HTTP（默认）、gRPC client-streaming（`CALLBOT_ASR_USE_GRPC`开关）、WebSocket streaming（`asr_ws_client.py`），边收边传减少传输延迟
+4. **语音识别层**：agent-flow 首节点调用 agent-asr（内置 GPU 推理引擎），完成语音转文字。输入音频经 **WebRTCAPM（AEC+NS+AGC）或 Denoiser 降噪** 后全量喂入 agent-asr，由**服务端 FSMN-VAD 分段**做端点检测（无本地 VAD 引擎）。ASR 走 **WebSocket 流式传输**（`asr_ws_client.py`），服务端分段完成后主动回推 final 触发轮次
 5. **LangGraph第一业务节点（用户身份核验）**
 编排引擎内置 MCP Client，通过 HTTP Streamable 传输协议调用 java-mcp-server 用户中心 MCP 服务，**传入用户手机号**调用 `user_identity_query` 工具；查询获取用户ID、脱敏手机号、身份证后四位，流程全程保留 State 内 ASR 文本、四维隔离键
 6. **LangGraph第二业务节点（征信合规核验）**
 复用 MCP Client 调用 java-mcp-server，**使用用户ID**调用 `user_credit_query` 工具，获取用户征信档案数据，校验征信资质与风险等级（仅 marketing 业务类型触发），征信不合规直接触发风控预警，以上两个业务节点执行全程保留 LangGraph 状态内的 ASR 原始文本、四维隔离键
 7. **LangGraph第三业务节点（LLM智能应答 + TTS语音合成）**
-提示词按三维 `get_system_prompt(tenant_id, biz_type, scenario)` 加载（Redis 5min 缓存 → DB 降级）并经 `render.py` 渲染变量占位符；**从 LangGraph 全局 State 中提取完整 ASR 用户识别文本、四维隔离键、用户ID**，统一送入 LLM 大模型；LLM 解析用户语音文本语义，结合用户手机号绑定的历史用户数据，自主判定是否调取 RAG 知识库匹配业务标准话术，最终生成标准化外呼应答话术文本；**流式模式下 LLM 逐 token 输出，通过 IncrementalJSONParser 解析、SentenceSplitter 切分为完整句子，每句并行调用 agent-tts（内置 GPU 推理引擎，支持 gRPC unary 和 WebSocket streaming 调用）合成语音音频，PCM 音频经 TTSOutputBuffer 以稳态 30ms 帧率通过 WebSocket 回传 FreeSWITCH**；依托 LangChain Memory 记忆体系做分层数据存储：Redis 存储短期会话记忆、PostgreSQL(PG) 存储长期业务会话数据，每轮对话 fire-and-forget 双写 PG（call_turn），整通录音经 CallRecorder 双声道合并后归档 MinIO
+提示词按三维 `get_system_prompt(tenant_id, biz_type, scenario)` 加载（Redis 5min 缓存 → DB 降级）并经 `render.py` 渲染变量占位符；**从 LangGraph 全局 State 中提取完整 ASR 用户识别文本、四维隔离键、用户ID**，统一送入 LLM 大模型；LLM 解析用户语音文本语义，结合用户手机号绑定的历史用户数据，自主判定是否调取 RAG 知识库匹配业务标准话术，最终生成标准化外呼应答话术文本；**流式模式下 LLM 逐 token 输出，通过 IncrementalJSONParser 解析、SentenceSplitter 切分为完整句子，每句并行调用 agent-tts（内置 GPU 推理引擎，WebSocket 流式合成）合成语音音频，PCM 音频经 TTSOutputBuffer 以稳态 30ms 帧率通过 WebSocket 回传 FreeSWITCH**；依托 LangChain Memory 记忆体系做分层数据存储：Redis 存储短期会话记忆、PostgreSQL(PG) 存储长期业务会话数据，每轮对话 fire-and-forget 双写 PG（call_turn），整通录音经 CallRecorder 双声道合并后归档 MinIO
 8. **终端播放层**：agent-flow 通过 WebSocket 将 TTS 音频回传 FreeSWITCH，FreeSWITCH 下行推送至 SIP User 通话终端，完成整通智能外呼语音交互闭环
-9. **录音归档与打断/挂断控制层**：**录音**：CallRecorder 全程累加双声道 PCM（L=caller VAD前 / R=AI TTS），挂断时 `finalize_stereo_wav` 短边补静音，延迟 3s 读 FS 录音 wav → 上传 MinIO → insert_artifact(kind='recording')。**打断**：用户在 AI 说话过程中开口时，可插拔 VAD（WebRTC/Silero）实时检测 → **清空 TTSOutputBuffer（不调用 uuid_break，避免终止 dialplan playback）** → 冷却期防误触发 → 新一轮对话。**挂断**：ESL 订阅 CHANNEL_ANSWER（自动触发 uuid_audio_fork start）和 CHANNEL_HANGUP 事件（uuid_audio_fork stop → ActiveCallRegistry 取消活跃通话 → 录音归档 → 清理资源）
+9. **录音归档与打断/挂断控制层**：**录音**：CallRecorder 全程累加双声道 PCM（L=caller VAD前 / R=AI TTS），挂断时 `finalize_stereo_wav` 短边补静音，延迟 3s 读 FS 录音 wav → 上传 MinIO → insert_artifact(kind='recording')。**打断**：用户在 AI 说话过程中开口时，RMSGate（RMS+SNR 自适应门禁）实时检测 → **清空 TTSOutputBuffer（不调用 uuid_break，避免终止 dialplan playback）** → 冷却期防误触发 → 新一轮对话。**挂断**：ESL 订阅 CHANNEL_ANSWER（自动触发 uuid_audio_fork start）和 CHANNEL_HANGUP 事件（uuid_audio_fork stop → ActiveCallRegistry 取消活跃通话 → 录音归档 → 清理资源）
 
 ## 统一绘图强制规范
 1. 整体布局：数据流从左至右分层排布，层级从上至下划分清晰
@@ -32,24 +32,21 @@
 
 ```
 aiphone/
-├── agent-asr/              # ASR 服务 (FastAPI + gRPC + WebSocket, 内置 GPU 推理)
+├── agent-asr/              # ASR 服务 (FastAPI + WebSocket, 内置 GPU 推理)
 │   ├── asradapter/         # 服务核心: main.py, base.py, config.py, requirements.txt
 │   │   ├── engines/        # sensevoice/ (GPU), streaming/ (WebSocket), vibevoice/ (远程 HTTP)
-│   │   ├── grpc_server.py  # gRPC ASR 服务 (client-streaming, :50051)
-│   │   ├── ws_server.py    # WebSocket ASR 服务 (流式识别)
-│   │   └── proto/          # asr.proto + 生成代码 (asr_pb2, asr_pb2_grpc)
-│   ├── models/             # SenseVoiceSmall/ (本地模型权重)
+│   │   ├── vad_segmenter.py  # FSMN-VAD 流式分段层
+│   │   ├── ws_server.py    # WebSocket ASR 服务 (FSMN-VAD 分段 + 多 final 主动推)
+│   │   └── models/             # SenseVoiceSmall/ (本地模型权重)
 │   ├── deploy/             # systemd 部署单元
 │   ├── Dockerfile          # PyTorch GPU 镜像, 模型下载
 │   ├── README.md           # 组件文档
 │   └── tests/              # test_base, test_main, test_storage, engines/*/
-├── agent-tts/              # TTS 服务 (FastAPI + gRPC + WebSocket, 内置 GPU 推理)
+├── agent-tts/              # TTS 服务 (FastAPI + WebSocket, 内置 GPU 推理)
 │   ├── CosyVoice/          # CosyVoice 源码 (推理运行时)
 │   ├── ttsadapter/         # 服务核心: main.py, base.py, config.py, requirements.txt
 │   │   ├── engines/        # cosyvoice/ (CosyVoice3 GPU), edgetts/ (Edge 在线, 无需 GPU), vibevoice/ (远程 HTTP)
-│   │   ├── grpc_server.py  # gRPC TTS 服务 (unary, :50052)
-│   │   ├── ws_server.py    # WebSocket TTS 服务 (流式合成)
-│   │   └── proto/          # tts.proto + 生成代码 (tts_pb2, tts_pb2_grpc)
+│   │   └── ws_server.py    # WebSocket TTS 服务 (流式合成)
 │   ├── models/             # CosyVoice3-0.5B/ (本地模型权重)
 │   ├── deploy/             # systemd 部署单元
 │   ├── Dockerfile          # PyTorch GPU 镜像, 模型下载
@@ -58,12 +55,11 @@ aiphone/
 ├── agent-flow/     # LangGraph 7 节点编排 (FastAPI HTTP + WebSocket)
 │   ├── main.py             # FastAPI 入口: WS /media/{uuid} (事件驱动 audio_fork), GET /healthz, ESL生命周期
 │   ├── src/                # 核心源码 (PYTHONPATH includes src/)
-│   │   ├── config.py       # pydantic-settings, CALLBOT_ 环境变量前缀 (含ESL/VAD/JitterBuffer/gRPC/Denoise/AEC/Recording配置)
+│   │   ├── config.py       # pydantic-settings, CALLBOT_ 环境变量前缀 (含ESL/JitterBuffer/Barge-in/Denoise/AEC/Recording配置)
 │   │   ├── database.py     # SQLAlchemy 2.0 async engine
-│   │   ├── clients/        # mcp.py (用户中心), tts.py (TTS), asr.py (ASR), esl.py (Event Socket, 自动重连+心跳)
-│   │   │                    # tts_grpc_client.py, asr_grpc_client.py, asr_grpc/, tts_grpc/ (gRPC proto)
-│   │   │                    # tts_ws_client.py, asr_ws_client.py (WebSocket 第三传输)
-│   │   ├── ws/             # handler.py (StreamingCallHandler 流式+打断+录音+APM), vad.py (可插拔 VAD: WebRTC/Silero), jitter_buffer.py,
+│   │   ├── clients/        # mcp.py (用户中心), esl.py (Event Socket, 自动重连+心跳)
+│   │   │                    # asr_ws_client.py, tts_ws_client.py (ASR/TTS WebSocket 唯一传输)
+│   │   ├── ws/             # handler.py (StreamingCallHandler 流式+打断+录音+APM), rms_gate.py (RMS 门禁), asr_streaming.py, jitter_buffer.py,
 │   │   │                    # registry.py (ActiveCallRegistry 携带 tenant_id/scenario), denoise.py (前置降噪),
 │   │   │                    # audio_processing.py (WebRTCAPM AEC/NS/AGC), call_recorder.py (双声道录音)
 │   │   ├── graph/          # flow.py (7 节点 StateGraph + 流式管道), prompt.py, prompt_config.py (三维 Redis→DB 加载), render.py (变量渲染)
@@ -145,7 +141,7 @@ aiphone/
 
 **提示词三维加载**：`get_system_prompt(tenant_id, biz_type, scenario)` 以 `(tenant_id, biz_type, scenario)` 为键，Redis 缓存 `cb:prompt:{tenant_id}:{biz_type}:{scenario}`（TTL 5min）未命中回源 DB（`is_active=true`）回填；任一级失败降级返回空串 + 告警，不中断通话。加载后经 `render.py` 渲染 `extra.variables` 声明的占位符（vars_context = MCP 身份 + 记忆 + 外呼 call_task.vars）。`(tenant_id, biz_type, scenario, user_key)` 四元组全程透传：dialplan DID → ESL CHANNEL_ANSWER → ActiveCallRegistry → CallGraphState → run_streaming_pipeline。
 
-**流式模式** (WebSocket 生产路径): `run_pre_llm_phase()` 执行 ① + 并行扇出，`run_streaming_pipeline()` 流式输出 LLM token → `IncrementalJSONParser` → `SentenceSplitter` → 每句并行 TTS → `TTSOutputBuffer` 稳态30ms帧回传 FreeSWITCH；每轮 fire-and-forget 双写 PG（`call_turn` role=user + assistant）。支持 **Barge-in 打断**：用户说话时 VAD（WebRTC/Silero）检测 → **清空 TTSOutputBuffer（不调用 uuid_break，避免终止 dialplan playback）** → 冷却期防误触发 → 取消流式任务 → 新一轮。
+**流式模式** (WebSocket 生产路径): `run_pre_llm_phase()` 执行 ① + 并行扇出，`run_streaming_pipeline()` 流式输出 LLM token → `IncrementalJSONParser` → `SentenceSplitter` → 每句并行 TTS → `TTSOutputBuffer` 稳态30ms帧回传 FreeSWITCH；每轮 fire-and-forget 双写 PG（`call_turn` role=user + assistant）。支持 **Barge-in 打断**：用户说话时 RMSGate（RMS+SNR 自适应门禁）检测 → **清空 TTSOutputBuffer（不调用 uuid_break，避免终止 dialplan playback）** → 冷却期防误触发 → 取消流式任务 → 新一轮。
 
 
 ## 全链路数据流（事件驱动 uuid_audio_fork）
@@ -195,10 +191,10 @@ aiphone/
 │  │       ↓                                                                │ │
 │  │  audio_buffer.extend(processed)                                        │ │
 │  │       ↓                                                                │ │
-│  │  VAD.is_end_of_speech()  ← 可插拔 VAD 端点检测 (WebRTC/Silero)       │ │
-│  │       ↓ (静音 N帧 → 判定说完, 默认15帧=450ms, 生产建议40帧=1200ms)    │ │
+│  │  ASR WS 全量喂入 → 服务端 FSMN-VAD 分段 → on_final 回调触发轮次      │ │
+│  │       ↓ (服务端静音端点判定, 主动回推 result/is_final)                  │ │
 │  │  ┌──────────────────────────────────────────┐                          │ │
-│  │  │ ASR 识别 (三种传输，优先级: WS > gRPC > HTTP)                      │ │
+│  │  │ ASR 识别 (WebSocket 唯一传输)                                       │ │
 │  │  │  → {"text": "我想咨询贷款", "confidence": 0.95}                     │ │
 │  │  └──────────────────────────────────────────┘                          │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
@@ -224,7 +220,7 @@ aiphone/
 │  │       ↓ 每句独立 TTS 任务                                             │  │
 │  │ ┌─────────────────────────────────────────────────────────┐           │  │
 │  │ │ _tts_sentence(sentence)                                  │           │  │
-│  │ │   TTS 传输优先级: WS streaming > gRPC > HTTP            │           │  │
+│  │ │   TTS 传输: WebSocket (句级并发合成)                      │           │  │
 │  │ │   → audio_callback(pcm, idx)  ← recorder.feed_ai(pcm)   │ ← 录音 R │  │
 │  │ └─────────────────────────────────────────────────────────┘           │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
@@ -244,7 +240,7 @@ aiphone/
 │  │       ↓                                                               │  │
 │  │ tts_buffer.clear()            ← 清空 TTS 输出缓冲 (不调 uuid_break!) │  │
 │  │ streaming_task.cancel()        ← 取消当前 LLM+TTS 流                │  │
-│  │ 冷却期 (CALLBOT_VAD_COOLDOWN_AFTER_BARGEIN) 防残留噪声误判           │  │
+│  │ 冷却期 (CALLBOT_COOLDOWN_AFTER_BARGEIN) 防残留噪声误判             │  │
 │  │       ↓ 开始新一轮对话                                                │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -404,8 +400,8 @@ CHANNEL_HANGUP
 **媒体流（WebSocket 双向音频）**
 - 被叫用户 ⇄ FreeSWITCH（SIP/RTP）
 - FreeSWITCH（`mod_audio_fork`）⇄ agent-flow（WebSocket :8000, uvloop）
-  - 上行：用户语音 PCM → JitterBuffer → WebRTCAPM(AEC/NS/AGC) 或 Denoiser降噪 → VAD(WebRTC/Silero) → agent-asr(:8080/gRPC:50051) 内置 GPU 推理
-  - 下行：agent-tts(:8081/gRPC:50052) 内置 GPU 推理 → TTSOutputBuffer 稳态30ms帧 → FreeSWITCH → 用户
+  - 上行：用户语音 PCM → JitterBuffer → WebRTCAPM(AEC/NS/AGC) 或 Denoiser降噪 → agent-asr(:8080 WebSocket) 内置 GPU 推理（服务端 FSMN-VAD 分段 → 回推 final）
+  - 下行：agent-tts(:8081 WebSocket) 内置 GPU 推理 → TTSOutputBuffer 稳态30ms帧 → FreeSWITCH → 用户
   - 录音：CallRecorder 双声道累加（L=caller / R=AI），挂断 finalize_stereo_wav → MinIO
 
 **控制流（agent-flow 统一调度）**
@@ -604,18 +600,15 @@ CHANNEL_HANGUP
 - `graph/flow.py`：LangGraph 7 节点 StateGraph（强流程）+ `run_pre_llm_phase` / `run_streaming_pipeline` 流式管道
 - `clients/mcp.py`：MCP Client 调用 java-mcp-server（身份查询 + 征信查询）
 - `clients/esl.py`：ESL Client 调用 FreeSWITCH Event Socket（自动重连+心跳检测，挂断/转接/打断/事件订阅）
-- `clients/tts.py`：TTS HTTP Client 调用 agent-tts adapter（全量 + 流式 WAV）
-- `clients/tts_grpc_client.py`：TTS gRPC Client — unary 合成，流式管线优先使用（`CALLBOT_TTS_USE_GRPC=true`）
-- `clients/asr.py`：ASR HTTP Client 调用 agent-asr adapter
-- `clients/asr_grpc_client.py`：ASR gRPC Client — client-streaming 流式传输音频帧，batch 回退（`CALLBOT_ASR_USE_GRPC=true`）
-- `clients/asr_ws_client.py`：ASR WebSocket Client — 流式音频识别（WebSocket 第三传输）
-- `clients/tts_ws_client.py`：TTS WebSocket Client — 流式语音合成（WebSocket 第三传输）
+- `clients/asr_ws_client.py`：ASR WebSocket Client — 流式音频识别（唯一传输，服务端 FSMN-VAD 分段回推 final）
+- `clients/tts_ws_client.py`：TTS WebSocket Client — 流式语音合成（唯一传输，句级并发）
 - `llm/service.py`：Qwen3.5-9B 调用 + JSON schema 校验 + 流式输出 + 超时重试 + 降级
 - `llm/json_stream.py`：IncrementalJSONParser 从 LLM token 流增量解析结构化字段
 - `llm/sentence_splitter.py`：SentenceSplitter 将流式 token 切分为 TTS 就绪句子
 - `ws/handler.py`：WebSocket 处理器（StreamingCallHandler 流式+打断）
-- `ws/vad.py`：可插拔 VAD 语音端点检测 + 打断语音检测（WebRTC / Silero，工厂函数 `create_vad()`）
-- `ws/denoise.py`：VAD 前置降噪（highpass/noisereduce/rnnoise），工厂函数读取 `CALLBOT_DENOISE_ENABLED`
+- `ws/asr_streaming.py`：AsrStreamingManager — 单轮 ASR WS 流生命周期（feed/finalize/reset/cancel）
+- `ws/rms_gate.py`：RMSGate — RMS+SNR 自适应门禁（barge-in 检测）
+- `ws/denoise.py`：前置降噪（highpass/noisereduce/rnnoise），工厂函数读取 `CALLBOT_DENOISE_ENABLED`
 - `ws/jitter_buffer.py`：JitterBuffer 输入平滑 + TTSOutputBuffer 稳态30ms帧输出
 - `ws/registry.py`：ActiveCallRegistry 活跃通话注册（CHANNEL_HANGUP 取消）
 - `rag/retriever.py`：Agentic RAG（自适应检索 + 文档评分 + 查询改写）
@@ -628,12 +621,12 @@ CHANNEL_HANGUP
 
 **流式模式** (WebSocket /media/{uuid}，生产路径，事件驱动)：
 - FreeSWITCH 通过 mod_audio_fork WebSocket 将用户音频流传至 agent-flow：
-  1) JitterBuffer 平滑输入音频 → Denoiser 降噪 → VAD（WebRTC/Silero）检测到用户说完 → 调用 agent-asr 识别（gRPC 流式或 HTTP）
+  1) JitterBuffer 平滑输入音频 → Denoiser 降噪 → 全量喂入 agent-asr WebSocket → 服务端 FSMN-VAD 分段，回推 final 触发本轮（识别文本随 final 到达）
   2) 落库 user turn（含置信度）
   3) 并行扇出：MCP 身份查询 ‖ 记忆召回 ‖ RAG 检索
   4) Qwen3.5-9B 流式输出 → IncrementalJSONParser → SentenceSplitter → 句级文本
-  5) 每句并行调用 agent-tts 合成语音（gRPC/HTTP/WebSocket 三传输） → WAV→PCM → TTSOutputBuffer 稳态30ms帧 → WebSocket 回传 FreeSWITCH
-  6) Barge-in：用户说话时 VAD（WebRTC/Silero）检测 → **清空 TTSOutputBuffer（不调 uuid_break）** → 冷却期防误触发 → 取消流式任务 → 新一轮
+  5) 每句并行调用 agent-tts 合成语音（WebSocket 唯一传输，句级并发） → WAV→PCM → TTSOutputBuffer 稳态30ms帧 → WebSocket 回传 FreeSWITCH
+  6) Barge-in：用户说话时 RMSGate 检测 → **清空 TTSOutputBuffer（不调 uuid_break）** → 冷却期防误触发 → 取消流式任务 → 新一轮
   7) CHANNEL_HANGUP：ESL 事件订阅 → update_session_end → CallRecorder.finalize_stereo_wav → `_archive_recording`(fire-and-forget) → ActiveCallRegistry 取消 → 清理资源
 - FreeSWITCH 播放 TTS 音频，完成一轮交互
 
@@ -1148,7 +1141,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 - ASR 识别文本为空：检查 VAD 参数（WebRTC/Silero）、音频格式、agent-asr 健康状态
 - orchestrator 超时：检查 LLM 响应时间、MCP Server 连通性、TTS 合成延迟
 - WebSocket 断连：检查 agent-flow 进程状态、FreeSWITCH mod_audio_fork 日志
-- Barge-in 失效：检查 ESL 连接、VAD 灵敏度（CALLBOT_BARGE_IN_MIN_AUDIO_BYTES）；打断靠清空 TTSOutputBuffer（**不调 uuid_break**），检查冷却期 CALLBOT_VAD_COOLDOWN_AFTER_BARGEIN 是否把残留噪声当说话
+- Barge-in 失效：检查 ESL 连接、RMSGate 门限（CALLBOT_BARGE_IN_MIN_AUDIO_BYTES / CALLBOT_RMS_GATE_*）；打断靠清空 TTSOutputBuffer（**不调 uuid_break**），检查冷却期 CALLBOT_COOLDOWN_AFTER_BARGEIN 是否把残留噪声当说话
 - TTS 音频断续：检查 JitterBuffer 深度配置（CALLBOT_JITTER_TARGET_DEPTH）、TTSOutputBuffer 帧率
 - CHANNEL_HANGUP 未触发：检查 ESL Event Socket 连接、event_socket.conf.xml 配置
 
@@ -1175,17 +1168,17 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 
 应用服务组件/
 ├── agent-asr/
-│   ├── asradapter/    # ASR 服务 (FastAPI + gRPC + WebSocket, 内置 GPU 推理, HTTP:8080, gRPC:50051)
+│   ├── asradapter/    # ASR 服务 (FastAPI + WebSocket, 内置 GPU 推理, :8080)
 │   ├── models/        # SenseVoiceSmall/ 本地模型权重
 │   └── Dockerfile     # PyTorch GPU 镜像
 ├── agent-tts/
 │   ├── CosyVoice/     # CosyVoice 源码 (推理运行时)
-│   ├── ttsadapter/    # TTS 服务 (FastAPI + gRPC + WebSocket, 内置 GPU 推理, HTTP:8081, gRPC:50052)
+│   ├── ttsadapter/    # TTS 服务 (FastAPI + WebSocket, 内置 GPU 推理, :8081)
 │   ├── models/        # CosyVoice3-0.5B/ 本地模型权重
 │   └── Dockerfile     # PyTorch GPU 镜像
 ├── agent-flow/
 │   ├── main.py        # FastAPI 入口
-│   ├── src/           # 核心源码 (LangGraph 7 节点 + 流式管道 + WebSocket + ESL + gRPC/WS客户端 + 降噪, port 8000, uvloop)
+│   ├── src/           # 核心源码 (LangGraph 7 节点 + 流式管道 + WebSocket + ESL + ASR/TTS WS 客户端 + 降噪, port 8000, uvloop)
 │   ├── llm/           # LLM 推理引擎 (Qwen3.5-9B, vLLM)
 │   ├── alembic/       # 数据库迁移
 │   └── Dockerfile
@@ -1225,13 +1218,13 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
 
 4. **agent-asr** - ASR 服务（GPU0）
    - 内置 SenseVoice GPU 推理
-   - 支持三种传输: HTTP(:8080) + gRPC(:50051) + WebSocket
+   - WebSocket 流式传输 (:8080, FSMN-VAD 服务端分段)
    - PyTorch 基础镜像
    - 构建时下载模型
 
 5. **agent-tts** - TTS 服务（GPU1）
    - 内置 CosyVoice3 GPU 推理
-   - 支持三种传输: HTTP(:8081) + gRPC(:50052) + WebSocket
+   - WebSocket 流式传输 (:8081)
    - PyTorch 基础镜像
    - 构建时下载模型
 
@@ -1240,7 +1233,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
    - 流式 LLM + 句级 TTS + Barge-in 打断
    - uvloop 事件循环 (高并发优化)
    - VAD 前置降噪 (可选: highpass/noisereduce/rnnoise)
-   - ASR/TTS 三传输: HTTP (默认) + gRPC (可选) + WebSocket streaming (可选)
+   - ASR/TTS 均走 WebSocket 流式（唯一传输）
    - 连接 agent-asr, agent-tts, MCP, LLM, FreeSWITCH ESL
 
 ## 依赖关系
@@ -1260,7 +1253,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
             └─→ uuid_audio_fork ──→ agent-flow (:8000, uvloop) WebSocket /media/{uuid} 双向音频
                     │
                     ├─→ CallRecorder.feed_caller(frame)  ← 录音 L 声道 (VAD 前)
-                    ├─→ JitterBuffer → WebRTCAPM(AEC/NS/AGC) 或 Denoiser → VAD(WebRTC/Silero) → agent-asr (:8080 / gRPC:50051 / WS) ──→ SenseVoice GPU0
+                    ├─→ JitterBuffer → WebRTCAPM(AEC/NS/AGC) 或 Denoiser → agent-asr (:8080 WS, 服务端 FSMN-VAD 分段) ──→ SenseVoice GPU0
                     │                                                       └─→ 返回识别文本
                     │
                     ├─→ get_system_prompt(tenant_id, biz_type, scenario) ← 三维 Redis→DB + render.py 渲染
@@ -1270,7 +1263,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_vec_202605_hnsw
                     │              ├─→ Qwen3.5-9B (GPU2) 流式输出
                     │              ├─→ Redis（热记忆/对话历史/prompt 三维缓存）
                     │              ├─→ PG17 pgvector（长期记忆/RAG话术库/call_turn fire-and-forget 双写）
-                    │              └─→ agent-tts (:8081 / gRPC:50052 / WS) ──→ CosyVoice GPU1
+                    │              └─→ agent-tts (:8081 WS) ──→ CosyVoice GPU1
                     │                       └─→ recorder.feed_ai(pcm)  ← 录音 R 声道
                     │
                     └─→ TTS 音频 ──→ TTSOutputBuffer ──→ WebSocket 回传 FreeSWITCH ──→ 播放给用户
@@ -1301,9 +1294,7 @@ FreeSWITCH 拨号计划为 catch-all，`answer` + `playback silence_stream://-1`
 - [ ] TTS 播报正常
 - [ ] Barge-in 打断功能正常（用户说话时停止 AI 播放）
 - [ ] ESL Event Socket 连接正常
-- [ ] gRPC ASR 流式传输正常（CALLBOT_ASR_USE_GRPC=true 时）
-- [ ] gRPC TTS 合成正常（CALLBOT_TTS_USE_GRPC=true 时）
-- [ ] WebSocket ASR 流式识别正常（asr_ws_client.py）
+- [ ] WebSocket ASR 流式识别正常（asr_ws_client.py，服务端 FSMN-VAD 分段回推 final）
 - [ ] WebSocket TTS 流式合成正常（tts_ws_client.py）
 - [ ] uvloop 事件循环生效（pip freeze | grep uvloop）
 - [ ] 降噪模块工作正常（CALLBOT_DENOISE_ENABLED=highpass 时 VAD 误判减少）
@@ -1334,16 +1325,14 @@ FreeSWITCH 拨号计划为 catch-all，`answer` + `playback silence_stream://-1`
 | LLM | 推理地址 | :8083 (GPU2) |
 | Orchestrator | 服务地址 | :8000 |
 | Orchestrator | ESL 地址 | CALLBOT_ESL_HOST:CALLBOT_ESL_PORT |
-| Orchestrator | VAD 引擎 | CALLBOT_VAD_TYPE=webrtc (webrtc/silero) |
-| Orchestrator | VAD 灵敏度 | CALLBOT_VAD_AGGRESSIVENESS=3 (WebRTC), CALLBOT_VAD_SILERO_THRESHOLD=0.5 (Silero) |
+| Orchestrator | 端点检测 | 服务端 FSMN-VAD（agent-asr 分段 → 回推 final → on_final 触发轮次，无本地 VAD 引擎） |
+| Orchestrator | Barge-in 门禁 | CALLBOT_RMS_GATE_THRESHOLD=300, CALLBOT_RMS_GATE_SNR_FACTOR=3.0, CALLBOT_RMS_GATE_NOISE_FLOOR_INIT=300, CALLBOT_RMS_GATE_NOISE_ADAPT_RATE=0.1 |
 | Orchestrator | Jitter Buffer | CALLBOT_JITTER_TARGET_DEPTH=3 |
 | Orchestrator | 降噪模式 | CALLBOT_DENOISE_ENABLED="" (highpass/noisereduce/rnnoise; 与 AEC 互斥) |
 | Orchestrator | WebRTC APM(AEC) | CALLBOT_AEC_ENABLED=false, CALLBOT_AEC_TYPE=2(1=AECM/2=老AEC), CALLBOT_AEC_NS_LEVEL=2, CALLBOT_AEC_AGC_TYPE=1, CALLBOT_AEC_SYSTEM_DELAY_MS=80 (开启时取代 denoise + 固定增益) |
 | Orchestrator | 录音 | CALLBOT_RECORDINGS_DIR, CALLBOT_RECORDING_NOTICE_ENABLED=true, CALLBOT_RECORDING_NOTICE_SOUND, CALLBOT_RECORDING_ARCHIVE_DELAY_SEC=3, CALLBOT_RECORDING_ARCHIVE_TIMEOUT=30 |
-| Orchestrator | ASR gRPC | CALLBOT_ASR_USE_GRPC=false, CALLBOT_ASR_GRPC_TARGET=:50051 |
-| Orchestrator | TTS gRPC | CALLBOT_TTS_USE_GRPC=false, CALLBOT_TTS_GRPC_TARGET=:50052 |
-| Orchestrator | ASR WebSocket | CALLBOT_ASR_USE_WS=false, CALLBOT_ASR_WS_URL=ws://127.0.0.1:8080/ws/asr/streaming-recognize |
-| Orchestrator | TTS WebSocket | CALLBOT_TTS_USE_WS=false, CALLBOT_TTS_WS_URL=ws://127.0.0.1:8081/ws/tts/streaming-synthesize |
+| Orchestrator | ASR WebSocket | CALLBOT_ASR_WS_URL=ws://127.0.0.1:8080/ws/asr/streaming-recognize (唯一传输) |
+| Orchestrator | TTS WebSocket | CALLBOT_TTS_WS_URL=ws://127.0.0.1:8081/ws/tts/streaming-synthesize (唯一传输) |
 | Orchestrator | Audio gain | CALLBOT_AUDIO_GAIN=1.0 (放大安静 SIP 音频) |
 | Orchestrator | TTS pre-buffer | CALLBOT_TTS_PREBUFFER_FRAMES=0 (预缓冲 N 帧) |
 | Orchestrator | 事件循环 | uvloop (Dockerfile --loop uvloop) |
@@ -1371,7 +1360,7 @@ FreeSWITCH 拨号计划为 catch-all，`answer` + `playback silence_stream://-1`
 - 检查 agent-asr 服务状态（:8080）
 - 检查 GPU 可用性
 - 检查模型是否加载（MODEL_DIR 路径）
-- 检查 VAD 参数配置（CALLBOT_VAD_TYPE, CALLBOT_VAD_AGGRESSIVENESS, CALLBOT_VAD_SILENCE_FRAMES, CALLBOT_VAD_SILERO_THRESHOLD）
+- 检查 agent-asr 服务端 FSMN-VAD 分段是否正常（日志见 `[WS-ASR] result ... is_final`，无 final 则不触发轮次）
 
 ### 3. TTS 播放无声
 - 检查 agent-tts 服务状态（:8081）
@@ -1390,16 +1379,11 @@ FreeSWITCH 拨号计划为 catch-all，`answer` + `playback silence_stream://-1`
 - `CALLBOT_AEC_ENABLED=true` 但日志见 "WebRTCAPM process failed, passthrough"：livekit 库缺失或帧格式错误，单帧错误降级透传原帧（不影响通话）
 - AEC 开启时不再叠加固定 `CALLBOT_AUDIO_GAIN`（AGC 由 WebRTCAPM 逐帧处理）
 
-### 5. gRPC 连接失败
-- 检查 agent-asr gRPC 端口 50051 是否监听
-- 检查 agent-tts gRPC 端口 50052 是否监听
-- 检查 CALLBOT_ASR_GRPC_TARGET / CALLBOT_TTS_GRPC_TARGET 配置
-- gRPC 失败时自动回退到 HTTP，检查 HTTP 服务是否正常
-
-### 6. 环境噪音导致 VAD 误判
+### 5. 环境噪音导致 barge-in 误判
 - 启用降噪：设置 CALLBOT_DENOISE_ENABLED=highpass
-- 调整 VAD 灵敏度：降低 CALLBOT_VAD_AGGRESSIVENESS (0-3)
-- 增加最小音频阈值：调高 CALLBOT_VAD_MIN_AUDIO_BYTES
+- 调高 RMSGate 门限：CALLBOT_RMS_GATE_THRESHOLD / CALLBOT_RMS_GATE_SNR_FACTOR（自适应门限 = noise_floor × snr_factor）
+- 增加最小音频阈值：调高 CALLBOT_BARGE_IN_MIN_AUDIO_BYTES
+- barge-in 后冷却期 CALLBOT_COOLDOWN_AFTER_BARGEIN 内丢弃残余音频防误触发
 
 ## 文件版本
 

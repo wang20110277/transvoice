@@ -272,7 +272,7 @@ Data flow per turn (event-driven, dynamic uuid_audio_fork):
 注册: ActiveCallRegistry.register(uuid, biz_type, user_key, tenant_id, scenario) + insert_call_session
 启动: esl.audio_fork_start() → FS 连接 WebSocket /media/{uuid}
 录音: FreeSWITCH uuid_record 录双声道（audio_fork_start 之后发起，record bug 排在 WRITE_REPLACE 之后 tap 到 AI 下行）
-音频: JitterBuffer → WebRTCAPM(AEC/NS/AGC)或 Denoiser 降噪 → VAD(WebRTC/Silero) → ASR → 识别文本
+音频: JitterBuffer → WebRTCAPM(AEC/NS/AGC)或 Denoiser 降噪 → ASR 全量喂(服务端 FSMN-VAD 分段 → on_final 触发轮次)→ 识别文本
 提示词: get_system_prompt(tenant_id, biz_type, scenario) Redis(5min)→DB 降级 + render.py 变量渲染
 并行: MCP身份查询 ‖ 记忆召回 ‖ RAG检索 (fan-out 并发)
 决策: LLM 流式输出 → IncrementalJSONParser → SentenceSplitter → 句级文本
