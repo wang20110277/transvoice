@@ -74,3 +74,30 @@ async def test_cancel_for_barge_clears_task_and_calls_reset():
         await old
     except asyncio.CancelledError:
         pass
+
+
+@pytest.mark.asyncio
+async def test_on_final_dropped_within_barge_cooldown_then_passes(monkeypatch):
+    """barge 后 cooldown 窗口内的 final(残余段)丢弃,窗口外才启动 —— 防伪轮次。"""
+    import ws.handler as handler_mod
+    now = [1000.0]
+    monkeypatch.setattr(handler_mod.time, "monotonic", lambda: now[0])
+
+    launched = []
+    tc = TurnController(_make_launch(launched), lambda: None, barge_cooldown_sec=0.5)
+    await tc.cancel_for_barge()        # _barge_at = 1000.0
+
+    now[0] = 1000.2                    # +0.2s, within 0.5s cooldown
+    await tc.on_final({"text": "stale"})
+    assert launched == []              # dropped
+
+    now[0] = 1000.7                    # +0.7s, past cooldown
+    await tc.on_final({"text": "fresh"})
+    assert len(launched) == 1 and launched[0][1] == "fresh"
+
+    # cleanup the launched never-complete task
+    tc.streaming_task.cancel()
+    try:
+        await tc.streaming_task
+    except asyncio.CancelledError:
+        pass

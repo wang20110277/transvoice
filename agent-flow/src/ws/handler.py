@@ -46,16 +46,23 @@ class TurnController:
     reset_fn(清 audio_buffer/jitter/rms_gate)在锁内调用,确保 launch 快照后再清。
     """
 
-    def __init__(self, launch_fn, reset_fn, min_text_len: int = 2):
+    def __init__(self, launch_fn, reset_fn, min_text_len: int = 2, barge_cooldown_sec: float = 0.0):
         self._launch_fn = launch_fn   # (result_dict, turn:int) -> asyncio.Task
         self._reset_fn = reset_fn     # () -> None
         self._min_text_len = min_text_len
+        self._barge_cooldown_sec = barge_cooldown_sec
+        self._barge_at: float = 0.0           # monotonic ts of last barge cancel (0 = none)
         self.lock = asyncio.Lock()
         self.streaming_task: asyncio.Task | None = None
         self.turn_count = 0
 
     async def on_final(self, result: dict) -> None:
         async with self.lock:
+            # barge 冷却窗内的 final 多为 reset 生效前服务端推送的残余段 → 丢弃,防伪轮次
+            if (self._barge_cooldown_sec > 0 and self._barge_at
+                    and time.monotonic() - self._barge_at < self._barge_cooldown_sec):
+                logger.info("final within barge cooldown (%.2fs), drop", self._barge_cooldown_sec)
+                return
             if self.streaming_task and not self.streaming_task.done():
                 logger.info("final while turn active, drop")
                 return
@@ -69,6 +76,7 @@ class TurnController:
 
     async def cancel_for_barge(self) -> "asyncio.Task | None":
         async with self.lock:
+            self._barge_at = time.monotonic()
             task = self.streaming_task
             self.streaming_task = None
             self._reset_fn()
@@ -191,6 +199,7 @@ class StreamingCallHandler:
         turn_ctrl = TurnController(
             launch_fn=_launch_turn,
             reset_fn=lambda: self._reset_audio_state(audio_buffer, rms_gate, jitter),
+            barge_cooldown_sec=_settings.cooldown_after_bargein,
         )
 
         # ASR streaming state —— on_final=turn_ctrl.on_final 驱动轮次(WS 服务端分段)
