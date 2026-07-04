@@ -8,7 +8,6 @@ batch 模式: _PendingRequest 用 asyncio.Future 等待完整音频。
 streaming 模式: _PendingRequest 用 asyncio.Queue 逐块投递。
 """
 import asyncio
-import base64
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -161,20 +160,6 @@ class TTSWebSocketClient:
             await self._reconnect()
         finally:
             self._pending.pop(request_id, None)
-
-    async def synthesize(
-        self, text: str, call_id: str, biz_type: str,
-    ) -> dict | None:
-        """合成文本为音频，返回 dict (base64 audio)，兼容 TTSClient 接口。"""
-        wav = await self.synthesize_raw(text, call_id, biz_type)
-        if wav is None:
-            return None
-        return {
-            "audio": base64.b64encode(wav).decode("ascii"),
-            "content_type": "audio/wav",
-            "duration_ms": 0,
-            "minio_key": None,
-        }
 
     # ── 后台 reader ──
 

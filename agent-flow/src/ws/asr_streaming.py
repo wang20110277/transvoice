@@ -26,12 +26,10 @@ class AsrStreamingManager:
     def __init__(
         self,
         asr_ws_client=None,
-        use_ws_streaming: bool = False,
         use_streaming_asr: bool = False,
         on_final: Callable[[dict], Awaitable[None]] | None = None,
     ) -> None:
         self._asr_ws_client = asr_ws_client
-        self._use_ws_streaming = use_ws_streaming
         self._use_streaming_asr = use_streaming_asr
         self._on_final = on_final  # WS 服务端驱动 final 回调(per-call)
         # 流生命周期三态
@@ -46,7 +44,7 @@ class AsrStreamingManager:
 
     def _provider(self):
         """返回 ASR 流式提供者(WS);未配置返回 None。"""
-        if self._use_ws_streaming and self._asr_ws_client:
+        if self._asr_ws_client:
             return self._asr_ws_client
         return None
 
@@ -93,10 +91,7 @@ class AsrStreamingManager:
         return result
 
     async def reset_server_segment(self, call_id: str) -> None:
-        """WS 模式:发 {type:reset} 丢服务端进行中段(barge-in 用,连接保持)。
-
-        无 stream / 非 WS 模式 → no-op。
-        """
+        """发 {type:reset} 丢服务端进行中段(barge-in 用,连接保持)。无 stream 时 no-op。"""
         if self._stream is not None and hasattr(self._stream, "send_reset"):
             try:
                 self._stream.send_reset()

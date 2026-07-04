@@ -59,7 +59,7 @@ async def test_creates_stream_on_first_feed_only():
     """首帧创建并 start 流；后续帧只 send_audio，不重复建流。"""
     stream = _FakeStream()
     prov = _FakeProvider(stream)
-    mgr = AsrStreamingManager(asr_ws_client=prov, use_ws_streaming=True)
+    mgr = AsrStreamingManager(asr_ws_client=prov)
 
     await mgr.feed(b"\x01" * 960, "call1")
     assert stream.started is True
@@ -74,7 +74,7 @@ async def test_creates_stream_on_first_feed_only():
 async def test_finalize_returns_result_and_resets():
     """finalize 收尾取结果，重置流状态供下一轮复用。"""
     stream = _FakeStream()
-    mgr = AsrStreamingManager(asr_ws_client=_FakeProvider(stream), use_ws_streaming=True)
+    mgr = AsrStreamingManager(asr_ws_client=_FakeProvider(stream))
     await mgr.feed(b"\x01" * 960, "call1")
 
     result = await mgr.finalize("call1")
@@ -94,7 +94,7 @@ async def test_finalize_partial_fallback_when_finish_empty():
 
     sp = _StreamingProvider(stream)
     mgr = AsrStreamingManager(
-        asr_ws_client=sp, use_ws_streaming=True, use_streaming_asr=True,
+        asr_ws_client=sp, use_streaming_asr=True,
     )
     await mgr.feed(b"\x01" * 960, "call1")
     sp._on_partial("尾字丢失", 0.5)  # 模拟 WS partial 推送
@@ -107,7 +107,7 @@ async def test_finalize_partial_fallback_when_finish_empty():
 async def test_cancel_discards_stream():
     """cancel 取消并丢弃流，状态归零（barge-in 清理用）。"""
     stream = _FakeStream()
-    mgr = AsrStreamingManager(asr_ws_client=_FakeProvider(stream), use_ws_streaming=True)
+    mgr = AsrStreamingManager(asr_ws_client=_FakeProvider(stream))
     await mgr.feed(b"\x01" * 960, "call1")
 
     await mgr.cancel()
@@ -118,5 +118,5 @@ async def test_cancel_discards_stream():
 @pytest.mark.asyncio
 async def test_finalize_without_feed_returns_none():
     """未喂过帧（流未启动）时 finalize 返回 None。"""
-    mgr = AsrStreamingManager(asr_ws_client=_FakeProvider(_FakeStream()), use_ws_streaming=True)
+    mgr = AsrStreamingManager(asr_ws_client=_FakeProvider(_FakeStream()))
     assert await mgr.finalize("call1") is None

@@ -37,12 +37,6 @@ class Settings(BaseSettings):
     minio_bucket: str = "audio-archive"
     minio_secure: bool = False
 
-    # ASR adapter
-    asr_adapter_url: str = "http://127.0.0.1:8080"
-
-    # TTS adapter
-    tts_adapter_url: str = "http://127.0.0.1:8081"
-
     # 业务
     biz_types: list[str] = Field(
         default=["customer_service", "collection", "marketing"]
@@ -120,14 +114,11 @@ class Settings(BaseSettings):
     # TTS skip (local testing without GPU)
     tts_skip: bool = False
 
-    # ASR WebSocket streaming(主传输)。
-    # 注意:WS 是端点检测的唯一来源——服务端 FSMN-VAD 分段后回推 result,经 on_final 触发轮次。
-    # HTTP ASR 传输无本地端点触发器,关闭 asr_use_ws 会导致无轮次启动(仅批量 ASR 可用)。
-    asr_use_ws: bool = True
+    # ASR WebSocket —— 唯一传输方式。
+    # WS 是端点检测的唯一来源:服务端 FSMN-VAD 分段后回推 result,经 on_final 触发轮次。
     asr_ws_url: str = "ws://127.0.0.1:8080/ws/asr/streaming-recognize"
 
-    # TTS WebSocket streaming
-    tts_use_ws: bool = False
+    # TTS WebSocket —— 唯一传输方式。
     tts_ws_url: str = "ws://127.0.0.1:8081/ws/tts/streaming-synthesize"
 
     # Streaming ASR (engine-level streaming, requires streaming-capable engine)

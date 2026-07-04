@@ -112,7 +112,6 @@ class StreamingCallHandler:
         denoiser: BaseDenoiser | None = None,
         apm: "WebRTCAPM | None" = None,
         asr_ws_client: "ASRWebSocketClient | None" = None,
-        use_ws_streaming: bool = False,
         use_streaming_asr: bool = False,
         tts_prebuffer_frames: int = 0,
     ) -> None:
@@ -130,7 +129,6 @@ class StreamingCallHandler:
         self._denoiser = denoiser or PassThroughDenoiser()
         self._apm = apm
         self._asr_ws_client = asr_ws_client
-        self._use_ws_streaming = use_ws_streaming
         self._use_streaming_asr = use_streaming_asr
         self._tts_prebuffer_frames = tts_prebuffer_frames
 
@@ -167,13 +165,6 @@ class StreamingCallHandler:
         audio_buffer = bytearray()
         audio_gain = _settings.audio_gain
 
-        # 非 WS 路径无端点触发器:HTTP ASR 已移除本地 VAD endpoint,关闭 WS 等于无轮次启动
-        if not self._use_ws_streaming:
-            logger.warning(
-                "[%s] ASR WS streaming disabled — endpoint detection needs WS-driven finals; no turns will launch",
-                call_id,
-            )
-
         # TurnController:端点由 ASR final 回调驱动(控制流反转)
         def _launch_turn(result: dict, turn: int):
             raw_audio = self._gain_audio(audio_buffer, audio_gain)
@@ -200,9 +191,8 @@ class StreamingCallHandler:
         # ASR streaming state —— on_final=turn_ctrl.on_final 驱动轮次(WS 服务端分段)
         asr = AsrStreamingManager(
             asr_ws_client=self._asr_ws_client,
-            use_ws_streaming=self._use_ws_streaming,
             use_streaming_asr=self._use_streaming_asr,
-            on_final=turn_ctrl.on_final if self._use_ws_streaming else None,
+            on_final=turn_ctrl.on_final,
         )
 
         # Barge-in state

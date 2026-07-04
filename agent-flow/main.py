@@ -5,8 +5,8 @@
   → StreamingCallHandler → JitterBuffer → VAD → ASR → LLM 流式 → TTS → 回传
 
 服务启动顺序（lifespan）：
-  ① 核心服务 (MCP, TTS, ASR, Memory)
-  ② 可选 WebSocket 客户端
+  ① 核心服务 (MCP, Memory)
+  ② WebSocket 客户端 (ASR, TTS)
   ③ 注入 flow.py 服务单例
   ④ ESL 连接 + 事件订阅
   ⑤ 创建 StreamingCallHandler
@@ -38,8 +38,6 @@ from src.storage import minio_storage, repository
 from src.graph.flow import set_services, run_pre_llm_phase, run_streaming_pipeline
 from src.memory.assembler import MemoryAssembler
 from src.clients.mcp import MCPClient
-from src.clients.tts import TTSClient
-from src.clients.asr import ASRClient
 from src.clients.esl import ESLClient
 from src.ws.registry import ActiveCallRegistry
 from src.ws.denoise import create_denoiser
@@ -66,8 +64,8 @@ _outbound_executor = None  # OutboundExecutor 单例，lifespan 启停
 # 服务初始化
 # ═══════════════════════════════════════════════════════════════════
 
-async def _init_core_services() -> tuple[MemoryAssembler, MCPClient, TTSClient, ASRClient]:
-    """初始化核心服务：Memory、MCP、TTS、ASR。"""
+async def _init_core_services() -> tuple[MemoryAssembler, MCPClient]:
+    """初始化核心服务：Memory、MCP。ASR/TTS 走 WebSocket 客户端（见 _init_ws_clients）。"""
     assembler = MemoryAssembler()
     logger.info("MemoryAssembler initialized")
 
@@ -78,30 +76,18 @@ async def _init_core_services() -> tuple[MemoryAssembler, MCPClient, TTSClient, 
     except (asyncio.TimeoutError, Exception) as e:
         logger.warning("MCP init failed (identity/credit queries will be skipped): %s", e)
 
-    tts = TTSClient(settings.tts_adapter_url)
-    await tts.start()
-    logger.info("TTS client started → %s", settings.tts_adapter_url)
-
-    asr = ASRClient(settings.asr_adapter_url)
-    await asr.start()
-    logger.info("ASR client started → %s", settings.asr_adapter_url)
-
-    return assembler, mcp, tts, asr
+    return assembler, mcp
 
 
-async def _init_ws_clients() -> tuple[ASRWebSocketClient | None, TTSWebSocketClient | None]:
-    """初始化可选 WebSocket 客户端（ASR + TTS）。"""
-    asr_ws = None
-    if settings.asr_use_ws:
-        asr_ws = ASRWebSocketClient(settings.asr_ws_url)
-        await asr_ws.start()
-        logger.info("ASR WS client → %s", settings.asr_ws_url)
+async def _init_ws_clients() -> tuple[ASRWebSocketClient, TTSWebSocketClient]:
+    """初始化 WebSocket 客户端（ASR + TTS，唯一传输）。"""
+    asr_ws = ASRWebSocketClient(settings.asr_ws_url)
+    await asr_ws.start()
+    logger.info("ASR WS client → %s", settings.asr_ws_url)
 
-    tts_ws = None
-    if settings.tts_use_ws:
-        tts_ws = TTSWebSocketClient(settings.tts_ws_url)
-        await tts_ws.start()
-        logger.info("TTS WS client → %s", settings.tts_ws_url)
+    tts_ws = TTSWebSocketClient(settings.tts_ws_url)
+    await tts_ws.start()
+    logger.info("TTS WS client → %s", settings.tts_ws_url)
 
     return asr_ws, tts_ws
 
@@ -120,13 +106,13 @@ async def lifespan(app: FastAPI):
     logger.info("══════════════════════════════════════")
 
     # ── ① 核心服务 ──
-    assembler, mcp, tts, asr = await _init_core_services()
+    assembler, mcp = await _init_core_services()
 
-    # ── ② 可选 WebSocket 客户端 ──
+    # ── ② WebSocket 客户端（ASR/TTS 唯一传输）──
     asr_ws, tts_ws = await _init_ws_clients()
 
     # ── ③ 注入 flow.py 服务单例 ──
-    set_services(assembler, mcp, tts, asr, tts_ws=tts_ws, asr_ws=asr_ws)
+    set_services(assembler, mcp, tts_ws=tts_ws, asr_ws=asr_ws)
 
     # ── ⑤ ESL 连接 + 事件订阅 ──
     esl = ESLClient(host=settings.esl_host, port=settings.esl_port, password=settings.esl_password)
@@ -167,7 +153,6 @@ async def lifespan(app: FastAPI):
         denoiser=denoiser,
         apm=apm,
         asr_ws_client=asr_ws,
-        use_ws_streaming=settings.asr_use_ws,
         use_streaming_asr=settings.asr_streaming_enabled,
         tts_prebuffer_frames=settings.tts_prebuffer_frames,
     )
@@ -187,7 +172,7 @@ async def lifespan(app: FastAPI):
     if _outbound_executor is not None:
         await _outbound_executor.stop()
         _outbound_executor = None
-    await _shutdown(mcp, asr_ws, tts_ws, asr, tts, esl)
+    await _shutdown(mcp, asr_ws, tts_ws, esl)
     _initialized = False
 
 
@@ -199,10 +184,8 @@ def _log_startup_summary() -> None:
     logger.info("  AEC/APM: enabled=%s type=%d ns=%d agc=%d delay=%dms",
                 settings.aec_enabled, settings.aec_type,
                 settings.aec_ns_level, settings.aec_agc_type, settings.aec_system_delay_ms)
-    logger.info("  ASR transport: ws=%s streaming=%s",
-                settings.asr_use_ws, settings.asr_streaming_enabled)
-    logger.info("  TTS transport: ws=%s streaming=%s",
-                settings.tts_use_ws, settings.tts_streaming_enabled)
+    logger.info("  ASR streaming: %s", settings.asr_streaming_enabled)
+    logger.info("  TTS streaming: %s", settings.tts_streaming_enabled)
     logger.info("  Splitter: min=%d timeout=%.1fs eager_first=%s",
                 settings.splitter_min_length, settings.splitter_flush_timeout, settings.splitter_eager_first)
     logger.info("  Audio: sample_rate=%d gain=%.1fx jitter=%d-%d",
@@ -218,8 +201,6 @@ async def _shutdown(
     mcp: MCPClient,
     asr_ws: ASRWebSocketClient | None,
     tts_ws: TTSWebSocketClient | None,
-    asr: ASRClient,
-    tts: TTSClient,
     esl: ESLClient,
 ) -> None:
     """按逆序关闭所有服务。"""
@@ -232,7 +213,7 @@ async def _shutdown(
     except Exception:
         pass
 
-    # 关闭可选客户端
+    # 关闭 WS 客户端
     for name, client in [("ASR WS", asr_ws), ("TTS WS", tts_ws)]:
         if client:
             try:
@@ -241,13 +222,12 @@ async def _shutdown(
             except Exception:
                 pass
 
-    # 关闭核心客户端
-    for name, client in [("MCP", mcp), ("ASR", asr), ("TTS", tts)]:
-        try:
-            await client.close()
-            logger.info("%s client closed", name)
-        except Exception:
-            pass
+    # 关闭 MCP
+    try:
+        await mcp.close()
+        logger.info("MCP client closed")
+    except Exception:
+        pass
 
     logger.info("══════════════════════════════════════")
     logger.info("  Agent Orchestrator shut down")
