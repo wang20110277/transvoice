@@ -8,7 +8,11 @@ import types
 
 import pytest
 
-from asradapter.vad_segmenter import BYTES_PER_MS, FsmnVadSegmenter
+from asradapter.vad_segmenter import (
+    BYTES_PER_MS,
+    FsmnVadSegmenter,
+    load_fsmn_vad_model,
+)
 
 
 class _FakeGenerate:
@@ -54,7 +58,7 @@ def test_bytes_per_ms_constant():
 def test_feed_accumulates_until_chunk_then_emits_segment(monkeypatch):
     # 一个 600ms chunk 后,generate 报告 [100,500]ms 段已结束
     _patch_funasr(monkeypatch, value_seq=[[[100, 500]]])
-    seg = FsmnVadSegmenter(model_dir="fake")
+    seg = FsmnVadSegmenter(load_fsmn_vad_model("fake"))
     out = seg.feed(_pcm(600))  # 600ms = CHUNK_MS,触发一次 generate
     assert len(out) == 1
     assert len(out[0]) == (500 - 100) * BYTES_PER_MS  # 400ms 段
@@ -62,7 +66,7 @@ def test_feed_accumulates_until_chunk_then_emits_segment(monkeypatch):
 
 def test_feed_below_chunk_threshold_emits_nothing(monkeypatch):
     _patch_funasr(monkeypatch, value_seq=[[[0, 100]]])
-    seg = FsmnVadSegmenter(model_dir="fake")
+    seg = FsmnVadSegmenter(load_fsmn_vad_model("fake"))
     assert seg.feed(_pcm(300)) == []  # 不足 600ms,不 generate
 
 
@@ -72,7 +76,7 @@ def test_segment_offsets_track_absolute_ms_across_chunks(monkeypatch):
         [[100, 400]],        # chunk1:吐 [100,400]
         [[100, 400], [400, 900]],  # chunk2:第一段已吐(跳过),吐 [400,900]
     ])
-    seg = FsmnVadSegmenter(model_dir="fake")
+    seg = FsmnVadSegmenter(load_fsmn_vad_model("fake"))
     first = seg.feed(_pcm(600))
     second = seg.feed(_pcm(600))
     assert len(first) == 1 and len(first[0]) == 300 * BYTES_PER_MS
@@ -83,7 +87,7 @@ def test_force_flush_emits_trailing_segment(monkeypatch):
     # feed 不足 chunk 时不 generate(test_feed_below_chunk_threshold_emits_nothing
     # 已验证),故 force_flush 是首次也是唯一的 generate 调用,value_seq 只需 1 项。
     _patch_funasr(monkeypatch, value_seq=[[[200, 350]]])
-    seg = FsmnVadSegmenter(model_dir="fake")
+    seg = FsmnVadSegmenter(load_fsmn_vad_model("fake"))
     seg.feed(_pcm(400))  # 不足 chunk,无输出
     tail = seg.force_flush()
     assert len(tail) == 1
@@ -92,13 +96,13 @@ def test_force_flush_emits_trailing_segment(monkeypatch):
 
 def test_force_flush_empty_buffer_returns_empty(monkeypatch):
     _patch_funasr(monkeypatch, value_seq=[[[10, 20]]])
-    seg = FsmnVadSegmenter(model_dir="fake")
+    seg = FsmnVadSegmenter(load_fsmn_vad_model("fake"))
     assert seg.force_flush() == []
 
 
 def test_reset_clears_state(monkeypatch):
     _patch_funasr(monkeypatch, value_seq=[[[100, 400]], []])
-    seg = FsmnVadSegmenter(model_dir="fake")
+    seg = FsmnVadSegmenter(load_fsmn_vad_model("fake"))
     seg.feed(_pcm(600))
     seg.reset()
     # reset 后缓冲清空,force_flush 无尾部
@@ -114,6 +118,6 @@ def test_generate_exception_propagates(monkeypatch):
 
     fake.AutoModel = _Boom
     monkeypatch.setitem(sys.modules, "funasr", fake)
-    seg = FsmnVadSegmenter(model_dir="fake")
+    seg = FsmnVadSegmenter(load_fsmn_vad_model("fake"))
     with pytest.raises(RuntimeError, match="model boom"):
         seg.feed(_pcm(600))

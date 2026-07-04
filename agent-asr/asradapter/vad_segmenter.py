@@ -31,14 +31,26 @@ DECODER_CHUNK_LOOK_BACK = 1
 CHUNK_MS = CHUNK_SIZE[1] * 60  # 600ms 累积阈值
 
 
+def load_fsmn_vad_model(model_dir: str = DEFAULT_MODEL_DIR):
+    """加载 FSMN-VAD AutoModel(进程级单例,只读权重,可跨连接共享)。
+
+    模型权重在推理期间只读,可被多个 FsmnVadSegmenter 共享;每连接的流状态
+    生活在 generate() 的 cache 字典中,由 FsmnVadSegmenter 实例持有。
+    """
+    from funasr import AutoModel
+    return AutoModel(model=model_dir, disable_update=True)
+
+
 class FsmnVadSegmenter:
-    """流式 VAD 分段器。线程不安全 —— 单 WS 连接独占一个实例。"""
+    """流式 VAD 分段器。线程不安全 —— 单 WS 连接独占一个实例。
 
-    def __init__(self, model_dir: str = DEFAULT_MODEL_DIR, chunk_size=CHUNK_SIZE):
-        from funasr import AutoModel
+    model 参数为 load_fsmn_vad_model() 返回的共享 AutoModel(只读);每实例自己
+    持有 feed_buf/audio/cache 等流状态,故多连接并发安全。
+    """
 
+    def __init__(self, model, chunk_size=CHUNK_SIZE):
+        self._model = model            # 共享的已加载 AutoModel(只读)
         self._chunk_size = chunk_size
-        self._model = AutoModel(model=model_dir, disable_update=True)
         self._feed_buf = bytearray()    # 累积到 chunk_bytes 才喂模型
         self._audio = bytearray()       # 保留音频供段切片(绝对 ms 索引)
         self._audio_offset_ms = 0       # _audio[0] 对应的绝对 ms
