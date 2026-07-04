@@ -45,7 +45,7 @@ from src.clients.esl import ESLClient
 from src.ws.registry import ActiveCallRegistry
 from src.ws.denoise import create_denoiser
 from src.ws.audio_processing import create_audio_processing
-from src.ws.vad import create_vad
+from src.ws.rms_gate import RMSGate
 from src.clients.asr_grpc_client import ASRGrpcClient
 from src.clients.tts_grpc_client import TTSGrpcClient
 from src.clients.asr_ws_client import ASRWebSocketClient
@@ -171,7 +171,12 @@ async def lifespan(app: FastAPI):
 
     denoiser = create_denoiser()
     apm = create_audio_processing(settings)
-    vad_factory = lambda: create_vad(settings)
+    rms_gate_factory = lambda: RMSGate(
+        threshold=settings.vad_rms_threshold,
+        snr_factor=settings.vad_snr_factor,
+        noise_floor_init=settings.vad_noise_floor_init,
+        noise_adapt_rate=settings.vad_noise_adapt_rate,
+    )
 
     _streaming_handler = StreamingCallHandler(
         pre_llm_fn=run_pre_llm_phase,
@@ -179,7 +184,7 @@ async def lifespan(app: FastAPI):
         esl=esl,
         handoff_extension=settings.handoff_extension,
         registry=_call_registry,
-        vad_factory=vad_factory,
+        rms_gate_factory=rms_gate_factory,
         barge_in_min_audio_bytes=settings.barge_in_min_audio_bytes,
         jitter_target_depth=settings.jitter_target_depth,
         jitter_max_depth=settings.jitter_max_depth,
@@ -215,7 +220,7 @@ async def lifespan(app: FastAPI):
 def _log_startup_summary() -> None:
     """输出启动配置摘要。"""
     logger.info("──────────────────────────────────────")
-    logger.info("  VAD: %s", settings.vad_type)
+    logger.info("  RMS gate: threshold=%.0f snr=%.1f", settings.vad_rms_threshold, settings.vad_snr_factor)
     logger.info("  Denoise: %s", settings.denoise_enabled or "disabled")
     logger.info("  AEC/APM: enabled=%s type=%d ns=%d agc=%d delay=%dms",
                 settings.aec_enabled, settings.aec_type,

@@ -6,9 +6,9 @@
 
 调用链路：
   main.py::ws_media_fork() → handler.handle()
-    → 接收循环: JitterBuffer → Denoiser → VAD → 端点检测
-    → _handle_end_of_speech(): ASR 流式/批量 → pre_llm_fn → streaming_fn
-    → _receive_during_streaming(): barge-in 并发检测
+    → 接收循环: near 音频全量喂 ASR → 服务端 FSMN-VAD 分段 → ASR final 回调(on_final)驱动轮次
+    → TurnController.on_final(): pre_llm_fn → streaming_fn
+    → _receive_during_streaming(): RMSGate 检测 barge-in
 """
 import asyncio
 import json
@@ -21,7 +21,7 @@ import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
 
 from config import settings as _settings
-from ws.vad import BaseVAD, SimpleVAD
+from ws.rms_gate import RMSGate
 from ws.jitter_buffer import JitterBuffer, TTSOutputBuffer
 from ws.registry import ActiveCallRegistry
 from ws.denoise import BaseDenoiser, PassThroughDenoiser
@@ -39,11 +39,47 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class TurnController:
+    """streaming_task 生命周期 + turn_lock —— 解耦 on_final/barge-in 并发,便于单测。
+
+    lock 串行化 streaming_task 的 check-and-set:on_final launch vs cancel_for_barge 取消。
+    reset_fn(清 audio_buffer/jitter/rms_gate)在锁内调用,确保 launch 快照后再清。
+    """
+
+    def __init__(self, launch_fn, reset_fn, min_text_len: int = 2):
+        self._launch_fn = launch_fn   # (result_dict, turn:int) -> asyncio.Task
+        self._reset_fn = reset_fn     # () -> None
+        self._min_text_len = min_text_len
+        self.lock = asyncio.Lock()
+        self.streaming_task: asyncio.Task | None = None
+        self.turn_count = 0
+
+    async def on_final(self, result: dict) -> None:
+        async with self.lock:
+            if self.streaming_task and not self.streaming_task.done():
+                logger.info("final while turn active, drop")
+                return
+            text = (result.get("text") or "").strip()
+            if len(text) < self._min_text_len:
+                logger.info("ASR final too short ('%s'), skip", text)
+                return
+            self.turn_count += 1
+            self.streaming_task = self._launch_fn(result, self.turn_count)
+            self._reset_fn()
+
+    async def cancel_for_barge(self) -> "asyncio.Task | None":
+        async with self.lock:
+            task = self.streaming_task
+            self.streaming_task = None
+            self._reset_fn()
+            return task
+
+
 class StreamingCallHandler:
     """流式 WebSocket handler — LLM 流式 → 句级 TTS → 音频按序回传 + Barge-in。
 
     Barge-in 机制：
-    - 流式 TTS 回传期间，并发接收用户音频并运行 VAD
+    - 流式 TTS 回传期间，并发接收用户音频并用 RMSGate 检测 barge-in
     - 连续 N 帧（600ms）检测到语音 → 取消 LLM/TTS 流 → 开始新一轮
     - AI 未开口前不允许 barge-in（用户不可能打断沉默）
     """
@@ -62,7 +98,7 @@ class StreamingCallHandler:
         esl: "ESLClient | None" = None,
         handoff_extension: str = "1001",
         registry: ActiveCallRegistry | None = None,
-        vad_factory: "callable | None" = None,
+        rms_gate_factory: "callable | None" = None,
         barge_in_min_audio_bytes: int = 1600,
         jitter_target_depth: int = 3,
         jitter_max_depth: int = 10,
@@ -80,7 +116,7 @@ class StreamingCallHandler:
         self._esl = esl
         self._handoff_extension = handoff_extension
         self._registry = registry
-        self._vad_factory = vad_factory
+        self._rms_gate_factory = rms_gate_factory
         self._barge_in_min_audio_bytes = barge_in_min_audio_bytes
         # AEC 场景可调高 barge-in RMS 阈值，过滤 AEC 残留回声尖峰（实例属性覆盖类常量）
         self._BARGE_IN_RMS_THRESHOLD = _settings.barge_in_rms_threshold
@@ -108,7 +144,7 @@ class StreamingCallHandler:
         tenant_id: str = "default",
         scenario: str = "default",
     ) -> None:
-        """WebSocket 主循环：接收音频 → VAD 端点检测 → 流式管线 → barge-in 并发检测。"""
+        """WebSocket 主循环：接收音频全量喂 ASR → ASR final 回调驱动轮次 → 流式管线 → RMSGate 检测 barge-in。"""
         await websocket.accept()
         logger.info(
             "[%s] WS connected tenant=%s biz_type=%s scenario=%s user_key=%s",
@@ -123,24 +159,44 @@ class StreamingCallHandler:
         await tts_buffer.start()
 
         active_call = self._resolve_active_call(call_id, biz_type, user_key, tenant_id, scenario)
-        vad = self._vad_factory() if self._vad_factory else SimpleVAD()
+        rms_gate = self._rms_gate_factory() if self._rms_gate_factory else RMSGate()
         jitter = JitterBuffer(target_depth=self._jitter_target_depth, max_depth=self._jitter_max_depth)
         audio_buffer = bytearray()
         audio_gain = _settings.audio_gain
-        turn_count = 0
 
-        # ASR streaming state
+        # TurnController:端点由 ASR final 回调驱动(控制流反转)
+        def _launch_turn(result: dict, turn: int):
+            raw_audio = self._gain_audio(audio_buffer, audio_gain)
+            return asyncio.create_task(
+                self._process_streaming_turn(
+                    websocket, call_id, biz_type, user_key,
+                    raw_audio, turn, active_call,
+                    barge_in_event=barge_in_event,
+                    precomputed_asr_result=result,
+                    ai_spoken_event=ai_has_spoken,
+                    tts_buffer=tts_buffer,
+                    tenant_id=tenant_id,
+                    scenario=scenario,
+                ),
+                name=f"stream-{call_id}-{turn}",
+            )
+
+        turn_ctrl = TurnController(
+            launch_fn=_launch_turn,
+            reset_fn=lambda: self._reset_audio_state(audio_buffer, rms_gate, jitter),
+        )
+
+        # ASR streaming state —— on_final=turn_ctrl.on_final 驱动轮次(WS 服务端分段)
         asr = AsrStreamingManager(
             asr_grpc_client=self._asr_grpc_client,
             asr_ws_client=self._asr_ws_client,
             use_grpc_streaming=self._use_grpc_streaming,
             use_ws_streaming=self._use_ws_streaming,
             use_streaming_asr=self._use_streaming_asr,
+            on_final=turn_ctrl.on_final if self._use_ws_streaming else None,
         )
-        precomputed_asr_result: dict | None = None
 
         # Barge-in state
-        streaming_task: asyncio.Task | None = None
         barge_in_event = asyncio.Event()
         ai_has_spoken = asyncio.Event()
         ai_spoken_buffer_cleared = False
@@ -158,7 +214,7 @@ class StreamingCallHandler:
                     break
 
                 # ── AI 说话中：并发接收用户音频检测 barge-in ──
-                if streaming_task and not streaming_task.done():
+                if turn_ctrl.streaming_task and not turn_ctrl.streaming_task.done():
                     if ai_has_spoken.is_set() and not ai_spoken_buffer_cleared:
                         # AI 首次开口：清空之前的残余音频，设置 1s grace period
                         audio_buffer.clear()
@@ -171,8 +227,8 @@ class StreamingCallHandler:
                         logger.info("[%s] AI first audio — cleared buffer, grace 1.0s", call_id)
 
                     barge_detected = await self._receive_during_streaming(
-                        websocket, call_id, vad, jitter, audio_buffer,
-                        streaming_task, barge_in_event, active_call,
+                        websocket, call_id, rms_gate, jitter, audio_buffer,
+                        turn_ctrl.streaming_task, barge_in_event, active_call,
                         barge_grace_until, ai_has_spoken, barge_speech_counter,
                         barge_tolerance_counter, tts_buffer,
                     )
@@ -186,40 +242,41 @@ class StreamingCallHandler:
                         fire_insert_event(
                             call_id=call_id, fs_uuid=call_id,
                             biz_type=biz_type, user_id=user_key, user_key=user_key,
-                            event_type="barge_in", payload={"turn": turn_count},
+                            event_type="barge_in", payload={"turn": turn_ctrl.turn_count},
                         )
-                        # 不对 barge-in 音频做 ASR — 音频缓冲混入 AI 回声，ASR 无法识别
-                        # 直接重置，让正常 VAD/ASR 路径处理用户下一轮语音
                         await asr.cancel()
-                        self._reset_audio_state(audio_buffer, vad, jitter)
-                        # 冷却期：丢弃残余音频，防止 VAD 误触发
+                        await asr.reset_server_segment(call_id)  # 丢服务端进行中段
+                        old_task = await turn_ctrl.cancel_for_barge()
+                        if old_task and not old_task.done():
+                            old_task.cancel()
+                        # cooldown:vad_cooldown_until 是 handle() 局部变量,直接 rebind
                         vad_cooldown_until = time.monotonic() + _settings.vad_cooldown_after_bargein
                         barge_in_event.clear()
                         ai_has_spoken.clear()
                         ai_spoken_buffer_cleared = False
-                        streaming_task = None
                         continue
-                    elif streaming_task.done():
+                    elif turn_ctrl.streaming_task.done():
                         # 正常完成
-                        exc = streaming_task.exception()
+                        exc = turn_ctrl.streaming_task.exception()
                         if exc:
                             logger.error("[%s] streaming task error: %s", call_id, exc)
                         else:
                             logger.info("[%s] streaming turn completed", call_id)
-                        streaming_task = None
-                        self._reset_audio_state(audio_buffer, vad, jitter)
+                        turn_ctrl.streaming_task = None
+                        # 清本轮 barge-listening 残余,保下轮 raw_audio 干净
+                        self._reset_audio_state(audio_buffer, rms_gate, jitter)
                         barge_in_event.clear()
                         continue
                     else:
                         # streaming task 仍在运行（LLM 处理或 TTS 播放中）
-                        # 不能落到正常接收分支，否则 VAD/ASR 会在等待期间误触发
+                        # 不能落到正常接收分支，否则会在等待期间误触发新轮次
                         continue
 
                 # ── AI 未说话：正常接收用户音频 ──
                 data = await websocket.receive()
 
                 if "bytes" in data and data["bytes"]:
-                    # barge-in 冷却期：丢弃残余音频，防止 VAD 误触发
+                    # barge-in 冷却期:丢弃残余音频,防止 RMS 误触发
                     if time.monotonic() < vad_cooldown_until:
                         continue
 
@@ -231,66 +288,9 @@ class StreamingCallHandler:
                         if not smooth_frame:
                             break
                         denoised_frame = self._process_near_frame(smooth_frame, tts_buffer)
-
-                        # VAD 门控：确认语音后才缓冲音频、创建 ASR 流
-                        if not vad.speech_detected:
-                            # 仅更新 VAD 状态机，不缓冲、不喂 ASR
-                            vad.is_end_of_speech(denoised_frame, 0)
-                            continue
-
                         audio_buffer.extend(denoised_frame)
-
+                        # 全量喂 ASR —— 服务端 FSMN-VAD 分段,final 经 on_final 触发轮次
                         await asr.feed(denoised_frame, call_id)
-
-                        # VAD 端点检测
-                        if vad.is_end_of_speech(denoised_frame, len(audio_buffer)):
-                            if active_call and active_call.cancel.is_set():
-                                break
-
-                            turn_count += 1
-                            # ASR 收尾取结果 + 应用增益（AEC 开启时 AGC 已逐帧处理，不叠加固定增益）
-                            precomputed_asr_result = await asr.finalize(call_id)
-                            raw_audio = self._gain_audio(audio_buffer, audio_gain)
-                            asr_text = (precomputed_asr_result.get("text", "").strip()
-                                        if precomputed_asr_result else "")
-                            # ASR 空文本 → VAD 误触发；单字噪音（啊/嗯）不应触发完整轮次
-                            if len(asr_text) < 2:
-                                if asr_text:
-                                    logger.info("[%s] ASR too short ('%s'), skipping turn %d",
-                                                call_id, asr_text, turn_count)
-                                else:
-                                    logger.info("[%s] ASR empty, skipping turn %d (VAD false positive)",
-                                                call_id, turn_count)
-                                raw_audio = b""
-
-                            if not raw_audio:
-                                # ASR 空文本 — VAD 误触发，跳过
-                                self._reset_audio_state(audio_buffer, vad, jitter)
-                                continue
-
-                            # 启动流式管线（并发 task，允许 barge-in）
-                            barge_in_event.clear()
-                            ai_has_spoken.clear()
-                            ai_spoken_buffer_cleared = False
-                            barge_grace_until[0] = time.monotonic() + 0.5
-
-                            streaming_task = asyncio.create_task(
-                                self._process_streaming_turn(
-                                    websocket, call_id, biz_type, user_key,
-                                    raw_audio, turn_count, active_call,
-                                    barge_in_event=barge_in_event,
-                                    precomputed_asr_result=precomputed_asr_result,
-                                    ai_spoken_event=ai_has_spoken,
-                                    tts_buffer=tts_buffer,
-                                    tenant_id=tenant_id,
-                                    scenario=scenario,
-                                ),
-                                name=f"stream-{call_id}-{turn_count}",
-                            )
-                            logger.info("[%s] streaming task launched for turn %d", call_id, turn_count)
-
-                            self._reset_audio_state(audio_buffer, vad, jitter)
-                            break  # 回到外层循环进入 barge-in 检测模式
 
                 elif "text" in data and data["text"]:
                     msg = json.loads(data["text"])
@@ -299,13 +299,13 @@ class StreamingCallHandler:
                         break
 
         except WebSocketDisconnect:
-            logger.info("[%s] WS disconnected after %d turns", call_id, turn_count)
+            logger.info("[%s] WS disconnected after %d turns", call_id, turn_ctrl.turn_count)
         except RuntimeError:
-            logger.info("[%s] WS already disconnected after %d turns", call_id, turn_count)
+            logger.info("[%s] WS already disconnected after %d turns", call_id, turn_ctrl.turn_count)
         except Exception as e:
             logger.error("[%s] WS error: %s", call_id, e, exc_info=True)
         finally:
-            await self._cleanup(streaming_task, asr, tts_buffer, call_id, turn_count)
+            await self._cleanup(turn_ctrl, asr, tts_buffer, call_id)
 
     # ───────────────────────────────────────────────────────────────
     # 音频处理辅助
@@ -350,10 +350,10 @@ class StreamingCallHandler:
             return self._apm.process(smooth_frame, tts_buffer.recent_reverse)
         return self._denoiser.process(smooth_frame)
 
-    def _reset_audio_state(self, audio_buffer: bytearray, vad: BaseVAD, jitter: JitterBuffer) -> None:
+    def _reset_audio_state(self, audio_buffer: bytearray, rms_gate: RMSGate, jitter: JitterBuffer) -> None:
         """重置所有音频处理状态，准备下一轮。"""
         audio_buffer.clear()
-        vad.reset()
+        rms_gate.reset()
         jitter.reset()
         self._denoiser.reset()
 
@@ -364,7 +364,7 @@ class StreamingCallHandler:
         self,
         websocket: WebSocket,
         call_id: str,
-        vad: BaseVAD,
+        rms_gate: RMSGate,
         jitter: JitterBuffer,
         audio_buffer: bytearray,
         streaming_task: asyncio.Task,
@@ -412,7 +412,7 @@ class StreamingCallHandler:
                 if not in_grace and ai_speaking and has_enough_audio and len(denoised_frame) >= 320:
                     _f32 = np.frombuffer(denoised_frame, dtype=np.int16).astype(np.float32)
                     frame_rms = float(np.sqrt(np.mean(_f32**2)))
-                    is_speech = frame_rms > self._BARGE_IN_RMS_THRESHOLD and vad.is_speech(denoised_frame)
+                    is_speech = frame_rms > self._BARGE_IN_RMS_THRESHOLD and rms_gate.is_speech(denoised_frame)
 
                     if is_speech:
                         speech_counter[0] += 1
@@ -572,10 +572,14 @@ class StreamingCallHandler:
     # ───────────────────────────────────────────────────────────────
 
     async def _cleanup(
-        self, streaming_task: asyncio.Task | None, asr: AsrStreamingManager,
-        tts_buffer: TTSOutputBuffer, call_id: str, turn_count: int,
+        self,
+        turn_ctrl: "TurnController",
+        asr: AsrStreamingManager,
+        tts_buffer: TTSOutputBuffer,
+        call_id: str,
     ) -> None:
         """清理所有资源。"""
+        streaming_task = turn_ctrl.streaming_task
         if streaming_task and not streaming_task.done():
             streaming_task.cancel()
             try:
@@ -590,4 +594,4 @@ class StreamingCallHandler:
         await tts_buffer.stop()
         if self._registry:
             self._registry.unregister(call_id)
-        logger.info("[%s] WS closed, total turns=%d", call_id, turn_count)
+        logger.info("[%s] WS closed, total turns=%d", call_id, turn_ctrl.turn_count)
