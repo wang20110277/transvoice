@@ -201,7 +201,7 @@ class StreamingCallHandler:
         ai_has_spoken = asyncio.Event()
         ai_spoken_buffer_cleared = False
         # barge-in 后 VAD 冷却截止时间：此时间内丢弃音频，防止残余噪声误触发 VAD
-        vad_cooldown_until: float = 0.0
+        cooldown_until: float = 0.0
         # list 包装允许内部方法修改外部变量
         barge_grace_until: list[float] = [0.0]
         barge_speech_counter: list[int] = [0]
@@ -249,8 +249,8 @@ class StreamingCallHandler:
                         old_task = await turn_ctrl.cancel_for_barge()
                         if old_task and not old_task.done():
                             old_task.cancel()
-                        # cooldown:vad_cooldown_until 是 handle() 局部变量,直接 rebind
-                        vad_cooldown_until = time.monotonic() + _settings.cooldown_after_bargein
+                        # cooldown_until 是 handle() 局部变量,直接 rebind(非 nested 函数,无需 nonlocal)
+                        cooldown_until = time.monotonic() + _settings.cooldown_after_bargein
                         barge_in_event.clear()
                         ai_has_spoken.clear()
                         ai_spoken_buffer_cleared = False
@@ -277,7 +277,7 @@ class StreamingCallHandler:
 
                 if "bytes" in data and data["bytes"]:
                     # barge-in 冷却期:丢弃残余音频,防止 RMS 误触发
-                    if time.monotonic() < vad_cooldown_until:
+                    if time.monotonic() < cooldown_until:
                         continue
 
                     frame = data["bytes"]
