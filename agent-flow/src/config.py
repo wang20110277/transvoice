@@ -81,39 +81,23 @@ class Settings(BaseSettings):
     # Audio temp
     temp_dir: str = "/tmp/aiphone_tts"
 
-    # VAD engine: "webrtc" (default, lightweight + RMS gating) or "silero" (neural network, needs louder audio)
-    vad_type: str = "webrtc"
-
-    # VAD — WebRTC params
-    vad_aggressiveness: int = 3
-    vad_silence_frames: int = 15
-
-    # VAD — Silero params
-    vad_silero_threshold: float = 0.3
-    vad_silero_min_silence_ms: int = 300
-
-    # VAD — common
-    vad_min_audio_bytes: int = 3200
-    # VAD RMS threshold: frame energy below this is treated as silence (filters SIP line noise)
-    # 0 = disabled (WebRTC VAD only), 300 = match barge-in threshold
-    vad_rms_threshold: float = 300.0
-    # VAD 自适应噪声底噪（noise floor tracking）— 解决固定 RMS 门限在嘈杂环境失效
-    # （底噪 RMS 本身 > 300，门限形同虚设）。门限 = noise_floor * snr_factor，非语音帧
-    # 用 EMA 更新 noise_floor，使门限随环境底噪自适应：安静时低、嘈杂时抬高。
-    # snr_factor <= 0 = 关闭（回退固定 rms_threshold）；典型值 3.0（要求 RMS 明显超出底噪）
-    vad_snr_factor: float = 3.0
-    # 初始噪声底噪估计（启动/换通话的 warm-up 门限基线）；与 rms_threshold 一致以平滑过渡
-    vad_noise_floor_init: float = 300.0
-    # 底噪 EMA 更新率（0-1，越大越快收敛）；0.1 ≈ 1s 内收敛到真实底噪
-    vad_noise_adapt_rate: float = 0.1
+    # RMS 门禁(barge-in 低延迟语音检测,RMS+SNR 自适应底噪)
+    # 帧能量低于 threshold 视为静音(过滤 SIP 底噪);snr_factor>0 时门限=noise_floor*snr_factor
+    rms_gate_threshold: float = 300.0
+    # 自适应噪声底噪:门限随环境底噪浮动(安静时低、嘈杂时抬高),解决固定门限在嘈杂环境失效
+    rms_gate_snr_factor: float = 3.0
+    # 初始噪声底噪估计(启动/换通话的 warm-up 基线)
+    rms_gate_noise_floor_init: float = 300.0
+    # 底噪 EMA 更新率(0-1,越大越快收敛);0.1 ≈ 1s 收敛
+    rms_gate_noise_adapt_rate: float = 0.1
 
     # Barge-in
     barge_in_min_audio_bytes: int = 1600
-    # Barge-in RMS 阈值：AEC 场景调高（过滤残留回声尖峰），默认 300
+    # Barge-in RMS 阈值:AEC 场景调高(过滤残留回声尖峰),默认 300;.env 实测调优 1500
     barge_in_rms_threshold: int = 300
 
-    # VAD cooldown after barge-in (seconds): discard residual audio to prevent false positives
-    vad_cooldown_after_bargein: float = 0.5
+    # Barge-in 后冷却(秒):丢弃残余音频防 RMS 误触发
+    cooldown_after_bargein: float = 0.5
 
     # Jitter Buffer
     jitter_target_depth: int = 3
@@ -144,8 +128,8 @@ class Settings(BaseSettings):
     tts_grpc_target: str = "127.0.0.1:50052"
     tts_use_grpc: bool = False
 
-    # ASR WebSocket streaming
-    asr_use_ws: bool = False
+    # ASR WebSocket streaming(主传输)
+    asr_use_ws: bool = True
     asr_ws_url: str = "ws://127.0.0.1:8080/ws/asr/streaming-recognize"
 
     # TTS WebSocket streaming

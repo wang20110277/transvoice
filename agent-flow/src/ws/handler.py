@@ -250,7 +250,7 @@ class StreamingCallHandler:
                         if old_task and not old_task.done():
                             old_task.cancel()
                         # cooldown:vad_cooldown_until 是 handle() 局部变量,直接 rebind
-                        vad_cooldown_until = time.monotonic() + _settings.vad_cooldown_after_bargein
+                        vad_cooldown_until = time.monotonic() + _settings.cooldown_after_bargein
                         barge_in_event.clear()
                         ai_has_spoken.clear()
                         ai_spoken_buffer_cleared = False

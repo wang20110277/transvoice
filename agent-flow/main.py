@@ -172,10 +172,10 @@ async def lifespan(app: FastAPI):
     denoiser = create_denoiser()
     apm = create_audio_processing(settings)
     rms_gate_factory = lambda: RMSGate(
-        threshold=settings.vad_rms_threshold,
-        snr_factor=settings.vad_snr_factor,
-        noise_floor_init=settings.vad_noise_floor_init,
-        noise_adapt_rate=settings.vad_noise_adapt_rate,
+        threshold=settings.rms_gate_threshold,
+        snr_factor=settings.rms_gate_snr_factor,
+        noise_floor_init=settings.rms_gate_noise_floor_init,
+        noise_adapt_rate=settings.rms_gate_noise_adapt_rate,
     )
 
     _streaming_handler = StreamingCallHandler(
@@ -220,7 +220,7 @@ async def lifespan(app: FastAPI):
 def _log_startup_summary() -> None:
     """输出启动配置摘要。"""
     logger.info("──────────────────────────────────────")
-    logger.info("  RMS gate: threshold=%.0f snr=%.1f", settings.vad_rms_threshold, settings.vad_snr_factor)
+    logger.info("  RMS gate: threshold=%.0f snr=%.1f", settings.rms_gate_threshold, settings.rms_gate_snr_factor)
     logger.info("  Denoise: %s", settings.denoise_enabled or "disabled")
     logger.info("  AEC/APM: enabled=%s type=%d ns=%d agc=%d delay=%dms",
                 settings.aec_enabled, settings.aec_type,
