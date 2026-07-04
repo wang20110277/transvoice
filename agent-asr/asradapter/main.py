@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 engine = None
 _grpc_server = None
+_segmenter = None
 
 
 def _load_config():
@@ -22,12 +23,17 @@ def _load_config():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global engine, _grpc_server
+    global engine, _grpc_server, _segmenter
     config = _load_config()
     engine = load_asr_engine(config["engine"]["asr"])
     if hasattr(engine, "load_model"):
         await engine.load_model()
     logger.info(f"ASR engine loaded: {config['engine']['asr']}")
+
+    # ── FSMN-VAD 分段器(WS 路径用,模型全局单例)──
+    from asradapter.vad_segmenter import FsmnVadSegmenter
+    _segmenter = FsmnVadSegmenter()
+    logger.info("FSMN-VAD segmenter loaded")
 
     # Start gRPC server alongside FastAPI
     _grpc_server = await serve_grpc(engine)
@@ -70,5 +76,5 @@ async def ws_streaming_recognize(websocket: WebSocket):
             - Text JSON 帧: {"type": "result", "text": "...", "confidence": 0.95, ...}
             - Text JSON 帧: {"type": "error", "message": "..."}
     """
-    handler = ASRWebSocketHandler(engine)
+    handler = ASRWebSocketHandler(engine, _segmenter)
     await handler.handle(websocket)
