@@ -60,11 +60,13 @@ class ASRWebSocketClient:
                 logger.debug("ASR WS close error (result preserved) call_id=%s: %s", call_id, e)
         return result_data
 
-    def create_stream(self, call_id: str, streaming: bool = False, on_partial=None) -> "ASRWsStream | None":
+    def create_stream(self, call_id: str, streaming: bool = False,
+                      on_partial=None, on_final=None) -> "ASRWsStream | None":
         """创建流式会话 — 返回与 gRPC ASRStream 接口一致的对象。"""
         if not self._started:
             return None
-        return ASRWsStream(self._base_url, call_id, streaming=streaming, on_partial=on_partial)
+        return ASRWsStream(self._base_url, call_id, streaming=streaming,
+                           on_partial=on_partial, on_final=on_final)
 
 
 class ASRWsStream:
@@ -82,11 +84,13 @@ class ASRWsStream:
         call_id: str,
         streaming: bool = False,
         on_partial: Callable[[str, float], None] | None = None,
+        on_final: Callable[[dict], None] | None = None,
     ):
         self._base_url = base_url
         self._call_id = call_id
         self._streaming = streaming
         self._on_partial = on_partial
+        self._on_final = on_final
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._queue: asyncio.Queue | None = None
         self._sender_task: asyncio.Task | None = None
@@ -141,7 +145,7 @@ class ASRWsStream:
                         self._on_partial(self._partial_text, stability)
 
                 elif msg_type == "result":
-                    self._result = {
+                    result_dict = {
                         "text": msg.get("text", ""),
                         "confidence": msg.get("confidence", 0.0),
                         "is_final": True,
@@ -149,8 +153,17 @@ class ASRWsStream:
                     }
                     logger.info(
                         "[WS-ASR] result call_id=%s text=%s confidence=%.2f",
-                        self._call_id, self._result["text"], self._result["confidence"],
+                        self._call_id, result_dict["text"], result_dict["confidence"],
                     )
+                    if self._on_final:
+                        # 服务端驱动多 final:每次 result 触发回调,继续接收
+                        try:
+                            self._on_final(result_dict)
+                        except Exception as e:
+                            logger.error("[WS-ASR] on_final callback error call_id=%s: %s", self._call_id, e)
+                        continue
+                    # 旧行为(无 on_final):首结果落地 + break
+                    self._result = result_dict
                     self._result_event.set()
                     break
 
@@ -172,6 +185,12 @@ class ASRWsStream:
         if self._queue is None:
             return
         self._queue.put_nowait(chunk)
+
+    def send_reset(self) -> None:
+        """发 {type:reset} —— barge-in 时丢服务端进行中段(连接保持)。"""
+        if self._queue is None:
+            return
+        self._queue.put_nowait(json.dumps({"type": "reset"}))
 
     async def finish(self) -> dict | None:
         """发送结束信号，等待识别结果。"""
@@ -203,8 +222,6 @@ class ASRWsStream:
                             "[WS-ASR] finish result call_id=%s text=%s",
                             self._call_id, self._result["text"],
                         )
-                except Exception as e:
-                    logger.error("[WS-ASR] finish failed call_id=%s: %s", self._call_id, e)
                 except Exception as e:
                     logger.error("[WS-ASR] finish failed call_id=%s: %s", self._call_id, e)
 

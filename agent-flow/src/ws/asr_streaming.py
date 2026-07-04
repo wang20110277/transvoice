@@ -29,12 +29,14 @@ class AsrStreamingManager:
         use_grpc_streaming: bool = False,
         use_ws_streaming: bool = False,
         use_streaming_asr: bool = False,
+        on_final=None,
     ) -> None:
         self._asr_grpc_client = asr_grpc_client
         self._asr_ws_client = asr_ws_client
         self._use_grpc_streaming = use_grpc_streaming
         self._use_ws_streaming = use_ws_streaming
         self._use_streaming_asr = use_streaming_asr
+        self._on_final = on_final  # WS 服务端驱动 final 回调(per-call)
         # 流生命周期三态
         self._stream: "ASRStream | None" = None
         self._speech_started = False
@@ -69,6 +71,7 @@ class AsrStreamingManager:
             self._stream = provider.create_stream(
                 call_id, streaming=self._use_streaming_asr,
                 on_partial=_on_partial if self._use_streaming_asr else None,
+                on_final=self._on_final,
             )
             if self._stream:
                 await self._stream.start()
@@ -93,6 +96,17 @@ class AsrStreamingManager:
             logger.info("[%s] ASR partial fallback: %s", call_id, self._partial_text[:50])
         self._partial_text = ""
         return result
+
+    async def reset_server_segment(self, call_id: str) -> None:
+        """WS 模式:发 {type:reset} 丢服务端进行中段(barge-in 用,连接保持)。
+
+        无 stream / 非 WS 模式 → no-op。
+        """
+        if self._stream is not None and hasattr(self._stream, "send_reset"):
+            try:
+                self._stream.send_reset()
+            except Exception as e:
+                logger.warning("[%s] reset_server_segment failed: %s", call_id, e)
 
     async def cancel(self) -> None:
         """取消并丢弃当前流（barge-in / 误触发清理用）。"""

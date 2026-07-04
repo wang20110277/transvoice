@@ -37,7 +37,7 @@ class _FakeProvider:
         self._stream = stream
         self.created_with = None
 
-    def create_stream(self, call_id, streaming=False, on_partial=None):
+    def create_stream(self, call_id, streaming=False, on_partial=None, on_final=None):
         self.created_with = dict(call_id=call_id, streaming=streaming, has_partial=on_partial is not None)
         return self._stream
 
@@ -103,7 +103,7 @@ async def test_finalize_partial_fallback_when_finish_empty():
     stream = _PartialStream()
 
     class _StreamingProvider(_FakeProvider):
-        def create_stream(self, call_id, streaming=False, on_partial=None):
+        def create_stream(self, call_id, streaming=False, on_partial=None, on_final=None):
             self._on_partial = on_partial
             return super().create_stream(call_id, streaming, on_partial)
 
