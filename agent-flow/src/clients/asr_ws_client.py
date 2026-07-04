@@ -2,7 +2,7 @@
 import asyncio
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 import websockets
 
@@ -60,8 +60,13 @@ class ASRWebSocketClient:
                 logger.debug("ASR WS close error (result preserved) call_id=%s: %s", call_id, e)
         return result_data
 
-    def create_stream(self, call_id: str, streaming: bool = False,
-                      on_partial=None, on_final=None) -> "ASRWsStream | None":
+    def create_stream(
+        self,
+        call_id: str,
+        streaming: bool = False,
+        on_partial: Callable[[str, float], None] | None = None,
+        on_final: Callable[[dict], Awaitable[None]] | None = None,
+    ) -> "ASRWsStream | None":
         """创建流式会话 — 返回与 gRPC ASRStream 接口一致的对象。"""
         if not self._started:
             return None
@@ -84,7 +89,7 @@ class ASRWsStream:
         call_id: str,
         streaming: bool = False,
         on_partial: Callable[[str, float], None] | None = None,
-        on_final: Callable[[dict], None] | None = None,
+        on_final: Callable[[dict], Awaitable[None]] | None = None,
     ):
         self._base_url = base_url
         self._call_id = call_id
@@ -157,8 +162,9 @@ class ASRWsStream:
                     )
                     if self._on_final:
                         # 服务端驱动多 final:每次 result 触发回调,继续接收
+                        # on_final 为 async(如 TurnController.on_final),必须 await 否则协程被丢弃、轮次永不启动
                         try:
-                            self._on_final(result_dict)
+                            await self._on_final(result_dict)
                         except Exception as e:
                             logger.error("[WS-ASR] on_final callback error call_id=%s: %s", self._call_id, e)
                         continue

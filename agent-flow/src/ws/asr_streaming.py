@@ -7,6 +7,7 @@
 （空文本/单字过滤）留 handler——它们依赖 audio_buffer 和 turn 语义，不属于 ASR。
 """
 import logging
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
 logger = logging.getLogger(__name__)
@@ -29,7 +30,7 @@ class AsrStreamingManager:
         use_grpc_streaming: bool = False,
         use_ws_streaming: bool = False,
         use_streaming_asr: bool = False,
-        on_final=None,
+        on_final: Callable[[dict], Awaitable[None]] | None = None,
     ) -> None:
         self._asr_grpc_client = asr_grpc_client
         self._asr_ws_client = asr_ws_client

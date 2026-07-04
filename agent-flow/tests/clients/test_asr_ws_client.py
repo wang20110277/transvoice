@@ -32,8 +32,11 @@ class _FakeWS:
 @pytest.mark.asyncio
 async def test_on_final_fires_per_result_and_loops():
     finals = []
-    stream = ASRWsStream("ws://x", "c1", streaming=True,
-                         on_final=lambda r: finals.append(r["text"]))
+
+    async def _on_final(r):
+        finals.append(r["text"])
+
+    stream = ASRWsStream("ws://x", "c1", streaming=True, on_final=_on_final)
     ws = _FakeWS([
         json.dumps({"type": "result", "text": "你好", "confidence": 0.9}),
         json.dumps({"type": "result", "text": "第二句", "confidence": 0.9}),
@@ -52,11 +55,44 @@ async def test_on_final_fires_per_result_and_loops():
 
 @pytest.mark.asyncio
 async def test_send_reset_enqueues_reset_message():
-    stream = ASRWsStream("ws://x", "c1", streaming=True, on_final=lambda r: None)
+    async def _on_final(r):
+        return None
+
+    stream = ASRWsStream("ws://x", "c1", streaming=True, on_final=_on_final)
     stream._queue = asyncio.Queue()
     stream.send_reset()
     item = stream._queue.get_nowait()
     assert json.loads(item) == {"type": "reset"}
+
+
+@pytest.mark.asyncio
+async def test_on_final_is_awaited_not_dropped():
+    """回归: on_final 为 async 时必须 await,否则协程被丢弃、轮次永不启动。
+
+    Bug:_receiver_loop 旧版同步调用 self._on_final(result_dict),返回的协程 never awaited →
+    TurnController.on_final body 永不执行 → WS 默认链路下每个通话都静默挂死。
+    用 asyncio.Event 探测 body 是否真的执行过(而非仅创建了协程对象)。
+    """
+    fired = asyncio.Event()
+
+    async def _cb(result):
+        # 只有 body 真的执行才会 set；如果只是创建了协程对象,此行永不运行
+        assert result["text"] == "hi"
+        fired.set()
+
+    stream = ASRWsStream(
+        "ws://x", "c1", streaming=True, on_final=_cb,
+    )
+    stream._ws = _FakeWS([json.dumps({"type": "result", "text": "hi", "confidence": 0.9})])
+    task = asyncio.create_task(stream._receiver_loop())
+    # 若 cb 未被 await,fired 永远不 set,wait_for 会超时
+    await asyncio.wait_for(fired.wait(), timeout=1.0)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert fired.is_set()
 
 
 @pytest.mark.asyncio

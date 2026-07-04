@@ -34,7 +34,11 @@ class _FakeClient:
 @pytest.mark.asyncio
 async def test_feed_threads_on_final_to_stream():
     client = _FakeClient()
-    mgr = AsrStreamingManager(asr_ws_client=client, use_ws_streaming=True, on_final=lambda r: None)
+
+    async def _on_final(r):
+        return None
+
+    mgr = AsrStreamingManager(asr_ws_client=client, use_ws_streaming=True, on_final=_on_final)
     await mgr.feed(b"\x00" * 960, "c1")
     assert client.last_on_final is not None
 
@@ -42,7 +46,11 @@ async def test_feed_threads_on_final_to_stream():
 @pytest.mark.asyncio
 async def test_reset_server_segment_sends_reset():
     client = _FakeClient()
-    mgr = AsrStreamingManager(asr_ws_client=client, use_ws_streaming=True, on_final=lambda r: None)
+
+    async def _on_final(r):
+        return None
+
+    mgr = AsrStreamingManager(asr_ws_client=client, use_ws_streaming=True, on_final=_on_final)
     await mgr.feed(b"\x00" * 960, "c1")  # 建 stream
     await mgr.reset_server_segment("c1")
     assert mgr._stream.reset_calls == 1

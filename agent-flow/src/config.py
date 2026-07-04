@@ -128,7 +128,9 @@ class Settings(BaseSettings):
     tts_grpc_target: str = "127.0.0.1:50052"
     tts_use_grpc: bool = False
 
-    # ASR WebSocket streaming(主传输)
+    # ASR WebSocket streaming(主传输)。
+    # 注意:WS 是端点检测的唯一来源——服务端 FSMN-VAD 分段后回推 result,经 on_final 触发轮次。
+    # gRPC/HTTP ASR 传输不再有本地端点触发器,关闭 asr_use_ws 会导致无轮次启动(仅批量 ASR 可用)。
     asr_use_ws: bool = True
     asr_ws_url: str = "ws://127.0.0.1:8080/ws/asr/streaming-recognize"
 

@@ -164,6 +164,13 @@ class StreamingCallHandler:
         audio_buffer = bytearray()
         audio_gain = _settings.audio_gain
 
+        # 非 WS 路径无端点触发器:gRPC/HTTP ASR 已移除本地 VAD endpoint,关闭 WS 等于无轮次启动
+        if not self._use_ws_streaming:
+            logger.warning(
+                "[%s] ASR WS streaming disabled — endpoint detection needs WS-driven finals; no turns will launch",
+                call_id,
+            )
+
         # TurnController:端点由 ASR final 回调驱动(控制流反转)
         def _launch_turn(result: dict, turn: int):
             raw_audio = self._gain_audio(audio_buffer, audio_gain)
@@ -244,8 +251,9 @@ class StreamingCallHandler:
                             biz_type=biz_type, user_id=user_key, user_key=user_key,
                             event_type="barge_in", payload={"turn": turn_ctrl.turn_count},
                         )
-                        await asr.cancel()
-                        await asr.reset_server_segment(call_id)  # 丢服务端进行中段
+                        # WS 流为 per-call 生命周期:barge-in 仅 reset 服务端进行中段(连接保持),
+                        # 下一个 utterance 复用同一连接。streaming_task 由 cancel_for_barge 单独取消。
+                        await asr.reset_server_segment(call_id)
                         old_task = await turn_ctrl.cancel_for_barge()
                         if old_task and not old_task.done():
                             old_task.cancel()
