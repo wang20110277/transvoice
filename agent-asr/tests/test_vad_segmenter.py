@@ -10,6 +10,7 @@ import pytest
 
 from asradapter.vad_segmenter import (
     BYTES_PER_MS,
+    MAX_RETAINED_MS,
     FsmnVadSegmenter,
     load_fsmn_vad_model,
 )
@@ -140,3 +141,18 @@ def test_real_api_minus1_sentinel_assembles_segment_across_chunks(monkeypatch):
     assert len(out[0]) == 1800 * BYTES_PER_MS
     # 再喂无新段,确认不重复吐
     assert seg.feed(_pcm(600)) == []
+
+
+def test_audio_capped_during_long_silence(monkeypatch):
+    """用户长静音时 consumed 停滞,_audio 持续累积;超过 MAX_RETAINED_MS 后应截断,
+    偏移簿记保持一致(_consumed_ms >= _audio_offset_ms,不越界)。"""
+    _patch_funasr(monkeypatch, value_seq=[[]])  # 始终不报段 → consumed 停滞
+    seg = FsmnVadSegmenter(load_fsmn_vad_model("fake"))
+    # 喂超过 MAX_RETAINED_MS 的音频(每个 chunk 600ms)
+    chunks = MAX_RETAINED_MS // 600 + 5  # 确保超过上限
+    for _ in range(chunks):
+        seg.feed(_pcm(600))
+    # _audio 应被截断到不超过 MAX_RETAINED_MS
+    assert len(seg._audio) // BYTES_PER_MS <= MAX_RETAINED_MS
+    # 偏移簿记一致:consumed 不落后于 offset(被丢音频不可切片,consumed 随之推进)
+    assert seg._consumed_ms >= seg._audio_offset_ms

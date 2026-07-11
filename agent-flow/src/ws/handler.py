@@ -95,8 +95,6 @@ class StreamingCallHandler:
     _BARGE_IN_SPEECH_FRAMES = 5
     # 允许的非语音帧数 — 音节间隙（"你~是~谁"之间的短暂停顿）不重置计数器
     _BARGE_IN_TOLERANCE_FRAMES = 3
-    # RMS 阈值 — 低于此值的帧视为静音/噪声，不参与 barge-in 判定
-    _BARGE_IN_RMS_THRESHOLD = 300
 
     def __init__(
         self,
@@ -165,6 +163,11 @@ class StreamingCallHandler:
         audio_buffer = bytearray()
         audio_gain = _settings.audio_gain
 
+        # Barge-in 事件 —— 提前定义:下方 _launch_turn 闭包引用 barge_in_event / ai_has_spoken,
+        # Python 闭包延迟绑定使顺序不影响运行,但提前定义让数据依赖在视觉上自洽。
+        barge_in_event = asyncio.Event()
+        ai_has_spoken = asyncio.Event()
+
         # TurnController:端点由 ASR final 回调驱动(控制流反转)
         def _launch_turn(result: dict, turn: int):
             raw_audio = self._gain_audio(audio_buffer, audio_gain)
@@ -195,9 +198,6 @@ class StreamingCallHandler:
             on_final=turn_ctrl.on_final,
         )
 
-        # Barge-in state
-        barge_in_event = asyncio.Event()
-        ai_has_spoken = asyncio.Event()
         ai_spoken_buffer_cleared = False
         # barge-in 后 VAD 冷却截止时间：此时间内丢弃音频，防止残余噪声误触发 VAD
         cooldown_until: float = 0.0
@@ -245,10 +245,12 @@ class StreamingCallHandler:
                         )
                         # WS 流为 per-call 生命周期:barge-in 仅 reset 服务端进行中段(连接保持),
                         # 下一个 utterance 复用同一连接。streaming_task 由 cancel_for_barge 单独取消。
-                        await asr.reset_server_segment(call_id)
                         old_task = await turn_ctrl.cancel_for_barge()
                         if old_task and not old_task.done():
                             old_task.cancel()
+                        # 先置 cooldown 门(cancel_for_barge 设 _barge_at)再 reset 服务端段,
+                        # 防 reset send 期间 receiver 推入的残余 final 绕过门启动伪轮次
+                        await asr.reset_server_segment(call_id)
                         # cooldown_until 是 handle() 局部变量,直接 rebind(非 nested 函数,无需 nonlocal)
                         cooldown_until = time.monotonic() + _settings.cooldown_after_bargein
                         barge_in_event.clear()

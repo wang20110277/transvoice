@@ -28,6 +28,9 @@ DEFAULT_MODEL_DIR = os.environ.get(
 # generate() 内部 chunk_stride_samples = chunk_size * fs / 1000;600ms 是流式分段步长。
 CHUNK_SIZE = 600
 CHUNK_MS = CHUNK_SIZE  # 累积阈值 = chunk 步长(ms)
+# _audio 滑动窗口上限。用户长静音时 consumed 停滞、_audio 持续累积;FSMN 段延迟
+# (尾部静音确认)远小于此,丢弃超出部分不影响段切片(段 start_ms>=consumed)。
+MAX_RETAINED_MS = 30_000  # 30s ≈ 960KB
 
 
 def load_fsmn_vad_model(model_dir: str = DEFAULT_MODEL_DIR):
@@ -120,10 +123,16 @@ class FsmnVadSegmenter:
         return out
 
     def _drop_consumed_audio(self) -> None:
-        """丢弃已吐段之前的音频,控制 _audio 内存占用;保持偏移簿记一致。"""
+        """丢弃已吐段之前的音频;consumed 停滞时按 MAX_RETAINED_MS 截断防无界增长。"""
         drop_ms = min(self._consumed_ms - self._audio_offset_ms,
                       len(self._audio) // BYTES_PER_MS)
-        if drop_ms <= 0:
-            return
-        del self._audio[:drop_ms * BYTES_PER_MS]
-        self._audio_offset_ms += drop_ms
+        if drop_ms > 0:
+            del self._audio[:drop_ms * BYTES_PER_MS]
+            self._audio_offset_ms += drop_ms
+        retained_ms = len(self._audio) // BYTES_PER_MS
+        if retained_ms > MAX_RETAINED_MS:
+            excess = retained_ms - MAX_RETAINED_MS
+            del self._audio[:excess * BYTES_PER_MS]
+            self._audio_offset_ms += excess
+            if self._consumed_ms < self._audio_offset_ms:
+                self._consumed_ms = self._audio_offset_ms

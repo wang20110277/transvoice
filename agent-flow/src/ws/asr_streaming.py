@@ -19,8 +19,9 @@ if TYPE_CHECKING:
 class AsrStreamingManager:
     """单轮对话的 ASR 流管理器。
 
-    provider 选择(WS)在首帧时确定;之后 feed 持续喂帧,finalize 收尾取结果。
-    一轮结束后可 reset 复用于下一轮，或 cancel 后丢弃。
+    provider 选择(WS)在首帧时确定;之后 feed 持续喂帧。主路径由服务端 FSMN-VAD
+    分段后主动推 final 触发 on_final 回调驱动轮次;finalize 保留为批量/后备接口
+    (主动收尾取结果)。barge-in 用 reset_server_segment 丢服务端进行中段(连接保持)。
     """
 
     def __init__(
@@ -75,6 +76,9 @@ class AsrStreamingManager:
 
     async def finalize(self, call_id: str) -> dict | None:
         """收尾流并返回识别结果（dict 含 text/confidence/is_final）。
+
+        主路径(WS 多 final)不调用此方法——on_final 回调驱动轮次。保留供批量模式
+        /测试/后备路径:显式 end 取结果,空结果时用 partial 文本兜底。
 
         流未启动（无 provider 或未喂帧）时返回 None；流返回空结果但收到过 partial
         时回退用 partial 文本兜底（避免流式尾帧丢失导致整轮丢字）。
