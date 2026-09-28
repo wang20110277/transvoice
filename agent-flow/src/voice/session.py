@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 
 from fastapi import WebSocket
-from livekit.agents import AgentSession, inference
+from livekit.agents import AgentSession, inference, llm
 
 from config import settings
 from voice.agent import CallContext, TransvoiceAgent
@@ -16,6 +16,26 @@ from voice.io import TelephonyAudioInput, TelephonyAudioOutput
 from voice.stt_plugin import TransvoiceSTT
 from voice.tts_plugin import TransvoiceTTS
 from ws.jitter_buffer import JitterBuffer
+
+
+class _PipelineLLM(llm.LLM):
+    """占位 LLM：推理由 TransvoiceAgent.llm_node（LangGraph 管线）全覆盖。
+
+    SDK 门禁要求 session llm 非 None 才会调度回复（agent_activity
+    `_user_turn_completed_impl` 对 llm is None 直接 return，且不报错），
+    默认 llm_node 又被覆盖，chat() 永不被调用。
+    """
+
+    def chat(self, *, chat_ctx, tools=None, conn_options=None, **kwargs):
+        raise NotImplementedError("llm_node 已覆盖默认推理，chat 不应被调用")
+
+    @property
+    def model(self) -> str:
+        return "transvoice-pipeline"
+
+    @property
+    def provider(self) -> str:
+        return "transvoice"
 
 
 def _turn_handling_options() -> dict:
@@ -62,6 +82,7 @@ def build_agent_session(
         stt=TransvoiceSTT(ws_url=settings.asr_ws_url),
         tts=TransvoiceTTS(ws_url=settings.tts_ws_url,
                           biz_type=ctx.biz_type, call_id=ctx.call_id),
+        llm=_PipelineLLM(),  # SDK 回复调度门禁需要非 None；真实推理在 llm_node
         vad=inference.VAD(),  # 本地 silero，仅辅助打断（design.md §2.2）
         turn_handling=_turn_handling_options(),
         aec_warmup_duration=None,  # 关键：默认 3s 会屏蔽首轮 barge-in

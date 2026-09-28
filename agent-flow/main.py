@@ -2,14 +2,15 @@
 
 事件驱动架构：
   FreeSWITCH CHANNEL_ANSWER → ESL handler → uuid_audio_fork → WS /media/{uuid}
-  → StreamingCallHandler → JitterBuffer → VAD → ASR → LLM 流式 → TTS → 回传
+  → AgentSession 无头管线（livekit-agents）：TelephonyAudioInput（Jitter→APM/denoise→增益）
+  → TransvoiceSTT（FSMN 多 final）→ TransvoiceAgent（LangGraph 节点 ①-⑥）
+  → TransvoiceTTS → TelephonyAudioOutput（30ms 匀速）→ 回传
 
 服务启动顺序（lifespan）：
   ① 核心服务 (MCP, Memory)
-  ② WebSocket 客户端 (ASR, TTS)
-  ③ 注入 flow.py 服务单例
-  ④ ESL 连接 + 事件订阅
-  ⑤ 创建 StreamingCallHandler
+  ② 注入 flow.py 服务单例
+  ③ ESL 连接 + 事件订阅
+  ④ 外呼执行器
 """
 import sys
 from pathlib import Path
@@ -26,25 +27,23 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import asyncio
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from src.config import settings
 from src.storage import minio_storage, repository
-from src.graph.flow import set_services, run_pre_llm_phase, run_streaming_pipeline
+from src.graph.flow import set_services
 from src.memory.assembler import MemoryAssembler
 from src.clients.mcp import MCPClient
 from src.clients.esl import ESLClient
 from src.ws.registry import ActiveCallRegistry
 from src.ws.denoise import create_denoiser
 from src.ws.audio_processing import create_audio_processing
-from src.ws.rms_gate import RMSGate
-from src.clients.asr_ws_client import ASRWebSocketClient
-from src.clients.tts_ws_client import TTSWebSocketClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,7 +54,7 @@ logger = logging.getLogger(__name__)
 # ── 模块级状态 — 由 lifespan 管理 ──
 
 _initialized = False
-_streaming_handler = None
+_esl = None  # ESLClient 单例，ws_media_fork 供 TransvoiceAgent 终端动作使用
 _call_registry = ActiveCallRegistry()
 _outbound_executor = None  # OutboundExecutor 单例，lifespan 启停
 
@@ -65,7 +64,7 @@ _outbound_executor = None  # OutboundExecutor 单例，lifespan 启停
 # ═══════════════════════════════════════════════════════════════════
 
 async def _init_core_services() -> tuple[MemoryAssembler, MCPClient]:
-    """初始化核心服务：Memory、MCP。ASR/TTS 走 WebSocket 客户端（见 _init_ws_clients）。"""
+    """初始化核心服务：Memory、MCP。ASR/TTS 由 voice 插件按 call 自建 WS 连接。"""
     assembler = MemoryAssembler()
     logger.info("MemoryAssembler initialized")
 
@@ -79,19 +78,6 @@ async def _init_core_services() -> tuple[MemoryAssembler, MCPClient]:
     return assembler, mcp
 
 
-async def _init_ws_clients() -> tuple[ASRWebSocketClient, TTSWebSocketClient]:
-    """初始化 WebSocket 客户端（ASR + TTS，唯一传输）。"""
-    asr_ws = ASRWebSocketClient(settings.asr_ws_url)
-    await asr_ws.start()
-    logger.info("ASR WS client → %s", settings.asr_ws_url)
-
-    tts_ws = TTSWebSocketClient(settings.tts_ws_url)
-    await tts_ws.start()
-    logger.info("TTS WS client → %s", settings.tts_ws_url)
-
-    return asr_ws, tts_ws
-
-
 # ═══════════════════════════════════════════════════════════════════
 # 生命周期
 # ═══════════════════════════════════════════════════════════════════
@@ -99,7 +85,7 @@ async def _init_ws_clients() -> tuple[ASRWebSocketClient, TTSWebSocketClient]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI 生命周期：按顺序初始化所有服务，yield 后清理。"""
-    global _initialized, _streaming_handler
+    global _initialized, _esl, _outbound_executor
 
     logger.info("══════════════════════════════════════")
     logger.info("  Agent Orchestrator starting up")
@@ -108,59 +94,28 @@ async def lifespan(app: FastAPI):
     # ── ① 核心服务 ──
     assembler, mcp = await _init_core_services()
 
-    # ── ② WebSocket 客户端（ASR/TTS 唯一传输）──
-    asr_ws, tts_ws = await _init_ws_clients()
+    # ── ② 注入 flow.py 服务单例（ASR/TTS WS 客户端参数 Task 9 收敛，暂传 None）──
+    set_services(assembler, mcp, tts_ws=None, asr_ws=None)
+    logger.info("ASR/TTS WS clients: per-call, owned by voice plugins (%s / %s)",
+                settings.asr_ws_url, settings.tts_ws_url)
 
-    # ── ③ 注入 flow.py 服务单例 ──
-    set_services(assembler, mcp, tts_ws=tts_ws, asr_ws=asr_ws)
-
-    # ── ⑤ ESL 连接 + 事件订阅 ──
-    esl = ESLClient(host=settings.esl_host, port=settings.esl_port, password=settings.esl_password)
+    # ── ③ ESL 连接 + 事件订阅 ──
+    _esl = ESLClient(host=settings.esl_host, port=settings.esl_port, password=settings.esl_password)
     from src.ws.esl_events import register_esl_event_handlers
-    register_esl_event_handlers(esl, _call_registry)
+    register_esl_event_handlers(_esl, _call_registry)
 
     subscribed_events = ["CHANNEL_HANGUP", "CHANNEL_ANSWER"]
     try:
-        await esl.start()
-        await esl.subscribe(subscribed_events)
+        await _esl.start()
+        await _esl.subscribe(subscribed_events)
         logger.info("ESL connected to %s:%d, subscribed to %s",
                      settings.esl_host, settings.esl_port, ", ".join(subscribed_events))
     except Exception as e:
         logger.warning("ESL connection failed (background reconnect started): %s", e)
 
-    # ── ⑥ 创建 StreamingCallHandler ──
-    from src.ws.handler import StreamingCallHandler
-
-    denoiser = create_denoiser()
-    apm = create_audio_processing(settings)
-    rms_gate_factory = lambda: RMSGate(
-        threshold=settings.rms_gate_threshold,
-        snr_factor=settings.rms_gate_snr_factor,
-        noise_floor_init=settings.rms_gate_noise_floor_init,
-        noise_adapt_rate=settings.rms_gate_noise_adapt_rate,
-    )
-
-    _streaming_handler = StreamingCallHandler(
-        pre_llm_fn=run_pre_llm_phase,
-        streaming_fn=run_streaming_pipeline,
-        esl=esl,
-        handoff_extension=settings.handoff_extension,
-        registry=_call_registry,
-        rms_gate_factory=rms_gate_factory,
-        barge_in_min_audio_bytes=settings.barge_in_min_audio_bytes,
-        jitter_target_depth=settings.jitter_target_depth,
-        jitter_max_depth=settings.jitter_max_depth,
-        denoiser=denoiser,
-        apm=apm,
-        asr_ws_client=asr_ws,
-        use_streaming_asr=settings.asr_streaming_enabled,
-        tts_prebuffer_frames=settings.tts_prebuffer_frames,
-    )
-
-    # ── ⑦ 外呼执行器（进程内 asyncio，tick 调度）──
-    global _outbound_executor
+    # ── ④ 外呼执行器（进程内 asyncio，tick 调度）──
     from src.outbound.executor import OutboundExecutor
-    _outbound_executor = OutboundExecutor(esl, settings)
+    _outbound_executor = OutboundExecutor(_esl, settings)
     _outbound_executor.start()
 
     _initialized = True
@@ -172,7 +127,8 @@ async def lifespan(app: FastAPI):
     if _outbound_executor is not None:
         await _outbound_executor.stop()
         _outbound_executor = None
-    await _shutdown(mcp, asr_ws, tts_ws, esl)
+    await _shutdown(mcp, _esl)
+    _esl = None
     _initialized = False
 
 
@@ -197,12 +153,7 @@ def _log_startup_summary() -> None:
     logger.info("══════════════════════════════════════")
 
 
-async def _shutdown(
-    mcp: MCPClient,
-    asr_ws: ASRWebSocketClient | None,
-    tts_ws: TTSWebSocketClient | None,
-    esl: ESLClient,
-) -> None:
+async def _shutdown(mcp: MCPClient, esl: ESLClient) -> None:
     """按逆序关闭所有服务。"""
     logger.info("Shutting down...")
 
@@ -212,15 +163,6 @@ async def _shutdown(
         logger.info("ESL closed")
     except Exception:
         pass
-
-    # 关闭 WS 客户端
-    for name, client in [("ASR WS", asr_ws), ("TTS WS", tts_ws)]:
-        if client:
-            try:
-                await client.close()
-                logger.info("%s client closed", name)
-            except Exception:
-                pass
 
     # 关闭 MCP
     try:
@@ -296,14 +238,13 @@ async def archive_recording(fs_uuid: str):
 
 @app.websocket("/media/{call_id}")
 async def ws_media_fork(websocket: WebSocket, call_id: str):
-    """uuid_audio_fork 端点 — FreeSWITCH 作为 WS 客户端连接。
+    """uuid_audio_fork 端点 — FreeSWITCH 作为 WS 客户端连接（AgentSession 无头管线）。
 
-    流程:
-      1. FreeSWITCH CHANNEL_ANSWER → ESL handler → uuid_audio_fork start → FS 连接本端点
-      2. 双向音频流: JitterBuffer → VAD → ASR → LLM 流式 → 句级 TTS → 回传
-      3. CHANNEL_HANGUP → uuid_audio_fork stop → 清理
+    1. CHANNEL_ANSWER → ESL handler → audio_fork start → FS 连接本端点
+    2. 上行帧 push 进 TelephonyAudioInput；下行由 TelephonyAudioOutput 匀速回传
+    3. CHANNEL_HANGUP / WS 断开 → session.aclose
     """
-    if _streaming_handler is None:
+    if not _initialized:
         await websocket.close(code=503, reason="Service not initialized")
         return
 
@@ -313,4 +254,53 @@ async def ws_media_fork(websocket: WebSocket, call_id: str):
     tenant_id = call.tenant_id if call else "default"
     scenario = call.scenario if call else "default"
 
-    await _streaming_handler.handle(websocket, call_id, biz_type, user_key, tenant_id, scenario)
+    from src.voice.agent import CallContext
+    from src.voice.session import build_agent_session
+
+    ctx = CallContext(
+        call_id=call_id, biz_type=biz_type, user_key=user_key,
+        tenant_id=tenant_id, scenario=scenario,
+        call_task_vars=call.call_target_vars if call else {},
+        handoff_extension=settings.handoff_extension,
+    )
+    # APM/denoiser 每 call 实例化（内部持有逐帧自适应状态，跨 call 复用会串扰）
+    session, agent = build_agent_session(
+        ctx=ctx, websocket=websocket, registry=_call_registry, esl=_esl,
+        apm=create_audio_processing(settings), denoiser=create_denoiser(),
+    )
+    audio_input = session.input.audio
+    await websocket.accept()
+    await session.start(agent)
+    logger.info("[%s] AgentSession started (tenant=%s biz_type=%s scenario=%s)",
+                call_id, tenant_id, biz_type, scenario)
+
+    try:
+        while True:
+            if call and call.cancel.is_set():
+                logger.info("[%s] CHANNEL_HANGUP, stopping", call_id)
+                break
+            data = await websocket.receive()
+            if "bytes" in data and data["bytes"]:
+                audio_input.push_bytes(data["bytes"])
+            elif "text" in data and data["text"]:
+                if json.loads(data["text"]).get("type") == "stop":
+                    logger.info("[%s] WS stop received", call_id)
+                    break
+    except WebSocketDisconnect:
+        logger.info("[%s] WS disconnected", call_id)
+    except RuntimeError:
+        logger.info("[%s] WS already disconnected", call_id)
+    finally:
+        audio_input.close()
+        try:
+            await asyncio.wait_for(session.aclose(), timeout=10.0)
+        except Exception as e:
+            logger.warning("[%s] session aclose: %s", call_id, e)
+        # 主动收口：stop/cancel 路径下 FS 可能尚未断开 WS
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+        if _call_registry.get(call_id):
+            _call_registry.unregister(call_id)
+        logger.info("[%s] AgentSession closed", call_id)
