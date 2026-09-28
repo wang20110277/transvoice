@@ -14,7 +14,8 @@
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from inspect import isawaitable
 from typing import TypedDict
 
 import numpy as np
@@ -475,3 +476,105 @@ async def run_streaming_pipeline(
                 call_id, elapsed, len(tts_tasks))
 
     return LLMAction(action=detected_action, text=full_text)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 2 (livekit): 文本流化输出 — run_streaming_pipeline 的输出改造
+# ═══════════════════════════════════════════════════════════════════
+
+async def astream_reply_text(
+    state: CallGraphState,
+    on_action: Callable[[str], Awaitable[None]] | None = None,
+) -> AsyncIterator[str]:
+    """LLM 流式回复文本迭代器（livekit llm_node 消费，design.md §3.6）。
+
+    节点 ⑥：prompt 三维加载 + 变量渲染与 run_streaming_pipeline 完全一致；
+    输出改为逐 token yield（SDK tokenizer 接管分句→TTS，节点 ⑦ 拆除）。
+    action 经 on_action 回调（end/handoff 由 TransvoiceAgent 在 playout 排空后执行）。
+    流末持久化对话历史（Redis save_turn + PG fire_insert_turn）。
+    """
+    from graph.prompt_config import get_system_prompt
+
+    async def _emit_action(action: str) -> None:
+        # 兼容同步回调实现（list.append / 同步方法）：仅 await 可等待返回值
+        if on_action:
+            result = on_action(action)
+            if isawaitable(result):
+                await result
+
+    llm = get_llm_service()
+    call_id = state.get("call_id", "?")
+    biz_type = state["biz_type"]
+    tenant_id = state.get("tenant_id", "default")
+    scenario = state.get("scenario", "default")
+
+    # ── 构建 Prompt（与 run_streaming_pipeline 逐行一致）──
+    system_prompt = await get_system_prompt(tenant_id, biz_type, scenario)
+    logger.info(
+        "[%s] tenant=%s biz_type=%s scenario=%s prompt loaded: %d chars",
+        call_id, tenant_id, biz_type, scenario, len(system_prompt),
+    )
+
+    # 聚合变量上下文:MCP 身份 ‖ 外呼 call_task.vars(渲染 {占位符})
+    vars_context: dict = {}
+    identity = state.get("identity")
+    if isinstance(identity, dict):
+        vars_context.update(identity)
+    call_task_vars = state.get("call_task_vars")
+    if isinstance(call_task_vars, dict):
+        vars_context.update(call_task_vars)
+    rendered_prompt = render(system_prompt, vars_context)
+    logger.info("[%s] rendered system_prompt (vars=%s):\n%s", call_id, list(vars_context), rendered_prompt)
+
+    messages = build_messages(
+        biz_type=biz_type,
+        system_prompt=rendered_prompt,
+        user_input=state["user_input"],
+        memory_block=state.get("memory_block", ""),
+        rag_block=state.get("rag_block", ""),
+        chat_history=state.get("chat_history", []),
+    )
+
+    action_sent = False
+    detected_action = "say"
+    full_text = ""
+    try:
+        async for event in llm.astream_action([m.model_dump() for m in messages]):
+            if event.action and not action_sent:
+                action_sent = True
+                detected_action = event.action
+                await _emit_action(event.action)
+
+            if event.text_delta:
+                full_text += event.text_delta
+                yield event.text_delta
+
+            if event.is_complete:
+                logger.info("[%s] LLM complete: action=%s text=%s", call_id, detected_action, full_text)
+                if not full_text and event.parsed:
+                    full_text = event.parsed.get("text", "")
+    except asyncio.CancelledError:
+        logger.info("[%s] astream_reply_text cancelled", call_id)
+        raise
+    except Exception as e:
+        logger.error("[%s] streaming LLM failed: %s", call_id, e)
+
+    # 兜底: 确保 action 已发送
+    if not action_sent:
+        await _emit_action("say")
+
+    # 持久化本轮对话 (Redis LIST) + PG call_turn 双写，供下一轮/Console 审查
+    if full_text.strip():
+        await save_turn(call_id, biz_type, state.get("user_input", ""), full_text)
+
+        _user_key = state.get("user_key", "")
+        if state.get("user_input", "").strip():
+            fire_insert_turn(
+                call_id=call_id, fs_uuid=call_id, biz_type=biz_type,
+                user_id=_user_key, user_key=_user_key, role="user",
+                text=state.get("user_input", ""),
+            )
+        fire_insert_turn(
+            call_id=call_id, fs_uuid=call_id, biz_type=biz_type,
+            user_id=_user_key, user_key=_user_key, role="assistant", text=full_text,
+        )
