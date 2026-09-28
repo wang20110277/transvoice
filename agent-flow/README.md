@@ -8,8 +8,8 @@ LangGraph 通话编排管线 + livekit-agents AgentSession 流式对话 — Fast
 - **流式 LLM + TTS**: `TransvoiceAgent.llm_node` 复用 LangGraph 节点①-⑤（`run_pre_llm_phase`）+ 节点⑥（`astream_reply_text` LLM 流式 token）；节点⑦由 SDK tts_node 分句 → `TransvoiceTTS` 插件（flush 边界聚合整句）→ `TelephonyAudioOutput` 30ms 匀速帧输出
 - **Barge-in 打断**: silero VAD（`inference.VAD` 本地）+ `interruption.min_duration` 检测 → SDK 中断体系清空输出缓冲 → 新一轮对话（PG `call_event` 记 `barge_in`）
 - **提示词管理**: Redis 缓存（5min TTL）→ PostgreSQL `prompt_config` 表两级降级，每轮日志打印提示词内容
-- **WebSocket 传输**: ASR/TTS 均走 WebSocket 流式（`src/voice/stt_plugin.py` / `tts_plugin.py` 插件逐 call 自建连接，唯一传输）
-- **服务端 FSMN-VAD**: agent-asr 服务端分段 → 多 final 映射 STT FINAL/EOS 事件 → `turn_detection="stt"` 提交轮次
+- **WebSocket 传输**: ASR/TTS 均走 WebSocket（`src/voice/stt_plugin.py` / `tts_plugin.py` 插件逐 call 自建连接，唯一传输）
+- **STT 非流式切段**: TransvoiceSTT 非流式批量（每语音段一条 WS 连接，agent-asr 整段识别），SDK 默认 stt_node 自动以 session silero VAD 包 StreamAdapter 切段；`turn_detection="vad"` 提交轮次，`CALLBOT_VAD_MIN_SILENCE_DURATION` 控制端点静音阈值
 - **降噪**: 可配置前置降噪（highpass / noisereduce / rnnoise）
 - **ESL 自动重连**: 读异常自动重连 + heartbeat 检测，`break_media` fire-and-forget 绕过锁争用
 - **事件驱动音频 fork**: ESL 订阅 `CHANNEL_ANSWER` + `CHANNEL_HANGUP`，动态 `uuid_audio_fork` 启停
