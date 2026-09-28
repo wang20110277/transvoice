@@ -97,6 +97,11 @@ class Settings(BaseSettings):
     jitter_target_depth: int = 3
     jitter_max_depth: int = 10
 
+    # livekit AgentSession 轮次/打断参数（design.md §2.2：FSMN 分段已含端点判定，min_delay 远小于 SDK 默认 0.5）
+    endpointing_min_delay: float = 0.1
+    endpointing_max_delay: float = 2.0
+    interruption_min_duration: float = 0.5
+
     # Denoising (pre-VAD): "", "highpass", "noisereduce", "rnnoise"
     denoise_enabled: str = ""
     denoise_highpass_cutoff: float = 200.0
