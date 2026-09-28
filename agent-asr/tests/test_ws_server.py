@@ -1,6 +1,6 @@
-"""ASRWebSocketHandler 单测 — 验证多 final 主动推、reset、sample_rate resample、降级。
+"""ASRWebSocketHandler 单测 — 无状态整段识别协议：config → binary 累积 → end → 单 result → 终结。
 
-mock segmenter(返回固定段)+ mock engine(返回固定文本),不依赖真实模型。
+mock engine（返回固定文本），不依赖真实模型。
 """
 import asyncio
 import json
@@ -11,33 +11,13 @@ from asradapter.base import ASRResult
 from asradapter.ws_server import ASRWebSocketHandler
 
 
-class _FakeSegmenter:
-    def __init__(self, segments_by_feed):
-        self._seq = list(segments_by_feed)
-        self._i = 0
-        self.resets = 0
-        self.flushed = False
-
-    def feed(self, pcm):
-        if self._i < len(self._seq):
-            segs = self._seq[self._i]
-            self._i += 1
-            return segs
-        return []
-
-    def force_flush(self):
-        self.flushed = True
-        return []
-
-    def reset(self):
-        self.resets += 1
-
-
 class _FakeEngine:
     def __init__(self, text="你好"):
         self._text = text
+        self.audio: list[bytes] = []
 
     async def recognize(self, audio, params):
+        self.audio.append(audio)
         return ASRResult(text=self._text, confidence=0.95, is_final=True)
 
 
@@ -71,92 +51,35 @@ def _config_msg(**over):
 
 
 @pytest.mark.asyncio
-async def test_segment_drives_proactive_final(monkeypatch):
-    seg = _FakeSegmenter([[b"seg-a"], [b"seg-b"]])
-    handler = ASRWebSocketHandler(_FakeEngine("hi"), seg)
-    ws = _FakeWS([
-        _config_msg(),
-        b"frame1",  # feed 返回 [seg-a] → recognize → 推一个 final
-        b"frame2",  # feed 返回 [seg-b] → 再推一个 final
-        json.dumps({"type": "end"}),
-    ])
+async def test_frames_accumulate_then_end_single_result():
+    engine = _FakeEngine("整段文本")
+    handler = ASRWebSocketHandler(engine)
+    ws = _FakeWS([_config_msg(), b"frame1", b"frame2", json.dumps({"type": "end"})])
     await asyncio.wait_for(handler.handle(ws), timeout=2.0)
+    assert engine.audio == [b"frame1frame2"]  # 拼接后整段识别，恰好一次
     results = [m for m in ws.sent if m.get("type") == "result"]
-    assert len(results) >= 2  # 单连接多 final
-    assert all(m["is_final"] for m in results)
+    assert results == [{"type": "result", "text": "整段文本",
+                        "confidence": 0.95, "is_final": True}]
 
 
 @pytest.mark.asyncio
-async def test_reset_calls_segmenter_reset():
-    seg = _FakeSegmenter([])
-    handler = ASRWebSocketHandler(_FakeEngine(), seg)
-    ws = _FakeWS([_config_msg(), json.dumps({"type": "reset"}), json.dumps({"type": "end"})])
+async def test_sample_rate_8000_triggers_resample():
+    engine = _FakeEngine()
+    handler = ASRWebSocketHandler(engine)
+    ws = _FakeWS([_config_msg(sample_rate=8000),
+                  b"\x01\x00" * 160, json.dumps({"type": "end"})])
     await asyncio.wait_for(handler.handle(ws), timeout=2.0)
-    assert seg.resets == 1
+    # 160 samples @ 8k = 20ms；常量幅度线性插值不变 → 320 samples @ 16k = 640B
+    assert engine.audio == [b"\x01\x00" * 320]
 
 
 @pytest.mark.asyncio
-async def test_sample_rate_8000_triggers_resample(monkeypatch):
-    """declared 8k → 16k resample 后再喂 segmenter。"""
-    called_sr = []
-
-    class _Seg(_FakeSegmenter):
-        def feed(self, pcm):
-            called_sr.append(len(pcm))
-            return super().feed(pcm)
-
-    seg = _Seg([])
-    handler = ASRWebSocketHandler(_FakeEngine(), seg)
-    ws = _FakeWS([_config_msg(sample_rate=8000), b"\x01\x00" * 160, json.dumps({"type": "end"})])
+async def test_end_without_audio_returns_empty_result():
+    engine = _FakeEngine()
+    handler = ASRWebSocketHandler(engine)
+    ws = _FakeWS([_config_msg(), json.dumps({"type": "end"})])
     await asyncio.wait_for(handler.handle(ws), timeout=2.0)
-    # 160 samples @ 8k = 20ms;resample 到 16k = 320 samples = 640 bytes
-    assert any(n == 640 for n in called_sr)
-
-
-@pytest.mark.asyncio
-async def test_degrade_falls_back_to_end_batch(monkeypatch):
-    """segmenter.feed 抛异常 → 标记 degraded → 后续收 end 整段 recognize 兜底。"""
-
-    class _BoomSeg(_FakeSegmenter):
-        def feed(self, pcm):
-            raise RuntimeError("vad boom")
-
-    seg = _BoomSeg([])
-    handler = ASRWebSocketHandler(_FakeEngine("fallback"), seg)
-    ws = _FakeWS([_config_msg(), b"audiochunk", json.dumps({"type": "end"})])
-    await asyncio.wait_for(handler.handle(ws), timeout=2.0)
+    assert engine.audio == []  # 空音频不调 engine
     results = [m for m in ws.sent if m.get("type") == "result"]
-    assert len(results) == 1
-    assert results[0]["text"] == "fallback"
-
-
-@pytest.mark.asyncio
-async def test_after_degrade_stops_feeding_segmenter_and_accumulates():
-    """降级后:后续帧不再喂 segmenter(无重复 recognize),但仍累积进 end-batch。"""
-    feed_calls = []
-
-    class _BoomThenQuiet:
-        def __init__(self): self.resets = 0; self.flushed = False
-        def feed(self, pcm):
-            feed_calls.append(len(pcm))
-            if len(feed_calls) == 1:
-                raise RuntimeError("vad boom")  # first frame degrades
-            return []  # should NEVER be reached after degrade
-        def force_flush(self): self.flushed = True; return []
-        def reset(self): self.resets += 1
-
-    seg = _BoomThenQuiet()
-    handler = ASRWebSocketHandler(_FakeEngine("tail"), seg)
-    ws = _FakeWS([
-        _config_msg(),
-        b"frame-A",   # triggers degrade
-        b"frame-B",   # post-degrade: must NOT reach segmenter.feed; accumulates
-        b"frame-C",   # post-degrade: accumulates
-        json.dumps({"type": "end"}),  # batch-recognize accumulated
-    ])
-    await asyncio.wait_for(handler.handle(ws), timeout=2.0)
-    # segmenter.feed called exactly once (the frame that boomed); never again post-degrade
-    assert len(feed_calls) == 1
-    results = [m for m in ws.sent if m.get("type") == "result"]
-    assert len(results) == 1  # single end-batch result, no per-segment duplicates
-    assert results[0]["text"] == "tail"
+    assert results == [{"type": "result", "text": "",
+                        "confidence": 0.0, "is_final": True}]

@@ -4,14 +4,12 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket
 from asradapter.config import load_asr_engine
-from asradapter.vad_segmenter import FsmnVadSegmenter, load_fsmn_vad_model
 from asradapter.ws_server import ASRWebSocketHandler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 engine = None
-_vad_model = None
 
 
 def _load_config():
@@ -22,16 +20,12 @@ def _load_config():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global engine, _vad_model
+    global engine
     config = _load_config()
     engine = load_asr_engine(config["engine"]["asr"])
     if hasattr(engine, "load_model"):
         await engine.load_model()
     logger.info(f"ASR engine loaded: {config['engine']['asr']}")
-
-    # ── FSMN-VAD 模型(进程级单例,只读权重跨连接共享;每连接独立 segmenter)──
-    _vad_model = load_fsmn_vad_model()
-    logger.info("FSMN-VAD model loaded")
 
     yield
 
@@ -56,17 +50,17 @@ async def healthz():
 
 @app.websocket("/ws/asr/streaming-recognize")
 async def ws_streaming_recognize(websocket: WebSocket):
-    """流式语音识别（WebSocket）— 客户端逐帧发送音频，服务端在流结束时返回识别结果。
+    """整段语音识别（WebSocket）— 客户端切段，服务端无状态识别。
 
     协议:
         发送 (客户端 → 服务端):
-            - Text JSON 帧: {"type": "config", "call_id": "xxx", "language": "zh"}
-            - Binary 帧: PCM 16-bit 8kHz mono 音频数据
-            - Text JSON 帧: {"type": "end"} 标记流结束
+            - Text JSON 帧: {"type": "config", "call_id": "xxx", "language": "zh", "sample_rate": 16000}
+            - Binary 帧: PCM 16-bit mono 音频数据（可多帧，逐帧重采样到 16kHz 累积）
+            - Text JSON 帧: {"type": "end"} 触发整段识别
         接收 (服务端 → 客户端):
-            - Text JSON 帧: {"type": "result", "text": "...", "confidence": 0.95, ...}
+            - Text JSON 帧: {"type": "result", "text": "...", "confidence": 0.95, "is_final": true}
             - Text JSON 帧: {"type": "error", "message": "..."}
+        end 处理完服务端关闭连接。
     """
-    # 每连接独立 segmenter(共享 _vad_model 只读权重,流状态隔离防并发污染)
-    handler = ASRWebSocketHandler(engine, FsmnVadSegmenter(_vad_model))
+    handler = ASRWebSocketHandler(engine)
     await handler.handle(websocket)

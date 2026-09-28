@@ -1,14 +1,13 @@
-"""WebSocket ASR 服务 — FSMN-VAD 流式分段 + 段级 recognize + 主动多次推 final。
+"""WebSocket ASR 服务 — 无状态整段识别（切段职责在客户端）。
 
 协议:
     客户端 → 服务端:
         Text JSON: {"type":"config","call_id":"...","language":"zh","sample_rate":16000}
-        Binary:    PCM 16-bit 16kHz mono 音频帧(全量喂)
-        Text JSON: {"type":"end"}    (兜底:force_flush 冲刷尾部 / 降级整段识别)
-        Text JSON: {"type":"reset"}  (barge-in:丢服务端进行中段)
+        Binary:    PCM 16-bit mono 音频帧（逐帧重采样到 16kHz 后累积）
+        Text JSON: {"type":"end"}  整段识别触发
     服务端 → 客户端:
         Text JSON: {"type":"result","text":"...","confidence":0.95,"is_final":true}
-                    ↑ VAD 切段识别完主动推,单连接可多次(每语音段一个)
+                    ↑ end 后回单条 result 并关闭连接
         Text JSON: {"type":"error","message":"..."}
 """
 import json
@@ -17,14 +16,15 @@ import logging
 from fastapi import WebSocket, WebSocketDisconnect
 
 from asradapter.base import ASREngine
-from asradapter.vad_segmenter import FsmnVadSegmenter, SAMPLE_RATE as VAD_SAMPLE_RATE
 
 logger = logging.getLogger(__name__)
+
+SAMPLE_RATE = 16000
 
 
 def _resample_to_16k(pcm: bytes, declared_sr: int) -> bytes:
     """declared_sr → 16kHz 重采样(线性插值,够用;整数倍关系直接重采样)。"""
-    if declared_sr == VAD_SAMPLE_RATE or declared_sr <= 0:
+    if declared_sr == SAMPLE_RATE or declared_sr <= 0:
         return pcm
     # 16-bit mono samples;用 numpy 线性插值(已在依赖链:funasr 依赖 numpy)
     import numpy as np
@@ -32,30 +32,24 @@ def _resample_to_16k(pcm: bytes, declared_sr: int) -> bytes:
     if n_in == 0:
         return pcm
     samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
-    n_out = int(round(n_in * VAD_SAMPLE_RATE / declared_sr))
+    n_out = int(round(n_in * SAMPLE_RATE / declared_sr))
     idx = np.linspace(0, n_in - 1, n_out)
     resampled = np.interp(idx, np.arange(n_in), samples)
     return np.clip(resampled, -32768, 32767).astype(np.int16).tobytes()
 
 
 class ASRWebSocketHandler:
-    """WS handler — FSMN-VAD 分段层 + 段级 batch recognize。
+    """WS handler — 无状态整段识别：客户端切段（VAD 在客户端），服务端只累积识别。"""
 
-    服务端 VAD 自检端点:每收帧喂 segmenter,得已完成段即 recognize 并主动推 final
-    (不等 end)。segmenter 推理异常时降级:后续收 end 走整段 batch recognize 保可用。
-    """
-
-    def __init__(self, engine: ASREngine, segmenter: FsmnVadSegmenter):
+    def __init__(self, engine: ASREngine):
         self._engine = engine
-        self._segmenter = segmenter
 
     async def handle(self, websocket: WebSocket) -> None:
         await websocket.accept()
         call_id = ""
         language = "zh"
-        declared_sr = VAD_SAMPLE_RATE
-        degraded = False
-        pending_audio: list[bytes] = []  # 降级路径累积用
+        declared_sr = SAMPLE_RATE
+        audio = bytearray()
 
         try:
             while True:
@@ -68,38 +62,21 @@ class ASRWebSocketHandler:
                     if msg_type == "config":
                         call_id = msg.get("call_id", "")
                         language = msg.get("language", "zh")
-                        declared_sr = int(msg.get("sample_rate", VAD_SAMPLE_RATE))
+                        declared_sr = int(msg.get("sample_rate", SAMPLE_RATE))
                         logger.info("[WS-ASR] config call_id=%s sr=%d", call_id, declared_sr)
 
-                    elif msg_type == "reset":
-                        self._segmenter.reset()
-                        pending_audio.clear()
-
                     elif msg_type == "end":
-                        if degraded:
-                            await self._batch_recognize(
-                                websocket, b"".join(pending_audio), call_id, language)
-                        else:
-                            for seg in self._segmenter.force_flush():
-                                await self._recognize_and_push(
-                                    websocket, seg, call_id, language)
+                        if not audio:
+                            await websocket.send_json({
+                                "type": "result", "text": "",
+                                "confidence": 0.0, "is_final": True})
+                            return
+                        await self._recognize_and_push(
+                            websocket, bytes(audio), call_id, language)
                         return
 
                 elif "bytes" in data and data["bytes"]:
-                    pcm16k = _resample_to_16k(data["bytes"], declared_sr)
-                    # 降级后不再喂 segmenter(避免恢复时重复 result),仅累积等 end 整段 batch
-                    if degraded:
-                        pending_audio.append(pcm16k)
-                        continue
-                    try:
-                        segments = self._segmenter.feed(pcm16k)
-                    except Exception as e:
-                        logger.warning("[WS-ASR] VAD degraded call_id=%s: %s — fallback to end-batch", call_id, e)
-                        degraded = True
-                        pending_audio.append(pcm16k)  # 触发降级的帧保留进 batch
-                        segments = []
-                    for seg in segments:
-                        await self._recognize_and_push(websocket, seg, call_id, language)
+                    audio.extend(_resample_to_16k(data["bytes"], declared_sr))
 
         except WebSocketDisconnect:
             logger.info("[WS-ASR] client disconnected call_id=%s", call_id)
@@ -117,19 +94,10 @@ class ASRWebSocketHandler:
         try:
             result = await self._engine.recognize(audio, params)
         except Exception as e:
-            logger.error("[WS-ASR] segment recognize error call_id=%s: %s", call_id, e)
+            logger.error("[WS-ASR] recognize error call_id=%s: %s", call_id, e)
             await websocket.send_json({"type": "error", "message": str(e)})
             return
         await websocket.send_json({
             "type": "result", "text": result.text,
             "confidence": result.confidence, "is_final": True,
         })
-
-    async def _batch_recognize(
-        self, websocket: WebSocket, audio_bytes: bytes, call_id: str, language: str,
-    ) -> None:
-        if not audio_bytes:
-            await websocket.send_json({
-                "type": "result", "text": "", "confidence": 0.0, "is_final": True})
-            return
-        await self._recognize_and_push(websocket, audio_bytes, call_id, language)
