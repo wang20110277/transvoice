@@ -101,8 +101,8 @@ class Settings(BaseSettings):
     aec_agc_type: int = 1  # 0=关, 1=AdaptiveDigital, 2=AdaptiveAnalog
     aec_system_delay_ms: int = 80  # 回声延迟先验(毫秒)，has_echo 监控后标定
 
-    # ASR WebSocket —— voice 插件逐 call 自建连接（TransvoiceSTT）。
-    # WS 是端点检测的唯一来源:服务端 FSMN-VAD 分段后回推 result,经 on_final 触发轮次。
+    # ASR WebSocket —— 无状态整段识别端点，TransvoiceSTT 批量 recognize
+    # 每语音段自建一条连接（config → 音频 → end → 单 result）。
     asr_ws_url: str = "ws://127.0.0.1:8080/ws/asr/streaming-recognize"
 
     # TTS WebSocket —— voice 插件逐 call 自建连接（TransvoiceTTS）。
