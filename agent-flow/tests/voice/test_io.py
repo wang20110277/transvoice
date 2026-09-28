@@ -185,3 +185,40 @@ async def test_output_wait_for_playout_never_hangs():
     ev = await asyncio.wait_for(out.wait_for_playout(), timeout=1.0)
     assert ev.interrupted is True
     await out.aclose()
+
+
+@pytest.mark.asyncio
+async def test_output_clear_during_send_no_spurious_started():
+    """send_fn 挂起期间 clear_buffer：不得为已关段的帧触发 started，也不得压制下一段的 started。"""
+    from voice.io import TelephonyAudioOutput
+
+    sent: list = []
+    started: list = []
+    finished: list = []
+    first_audio_sent = asyncio.Event()
+    block_send = asyncio.Event()
+
+    async def send_fn(frame: bytes) -> None:
+        sent.append(frame)
+        if frame != _SILENCE and not first_audio_sent.is_set():
+            first_audio_sent.set()
+            await block_send.wait()  # 首个音频帧发送中挂起，制造 clear_buffer 竞态窗口
+
+    out = TelephonyAudioOutput(send_fn=send_fn, frame_interval=0.001)
+    out.on_attached()
+    out.on("playback_started", lambda e: started.append(e))
+    out.on("playback_finished", lambda e: finished.append(e))
+
+    await out.capture_frame(_frame(b"\x01\x02" * 480))
+    await first_audio_sent.wait()  # 循环已弹帧且停在 send_fn 内
+    out.clear_buffer()  # 发送期间打断
+    assert finished and finished[-1].interrupted is True
+    block_send.set()
+    await asyncio.sleep(0.05)  # 循环恢复：不得为已关段的帧触发 started
+    assert started == [], "段已关后不得触发虚假 playback_started"
+
+    await out.capture_frame(_frame(b"\x03\x04" * 480))  # 下一 segment
+    out.flush()
+    await asyncio.sleep(0.05)
+    assert len(started) == 1, "下一 segment 的 playback_started 恰好上报一次"
+    await out.aclose()

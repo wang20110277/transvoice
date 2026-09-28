@@ -230,6 +230,11 @@ class TelephonyAudioOutput(AudioOutput):
                     frame = self._buffer.popleft()
                     await self._send_fn(frame)
                     self.recent_reverse = frame  # AEC 远端参考 = 此刻发往线路的帧
+                    if not self._segment_open:
+                        # send 挂起期间 clear_buffer 已关段：帧物理发出但不归属任何
+                        # open segment，不得再触发 started/progressed（否则 finished
+                        # 之后出现无终止的 started，且 _playback_started 泄漏压制下一段）
+                        continue
                     now = time.time()
                     if not self._playback_started:
                         self._playback_started = True
