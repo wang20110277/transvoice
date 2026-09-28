@@ -28,7 +28,7 @@
 
 | # | 验收项 | 判定锚点（可操作） | 状态 |
 |---|--------|--------------------|------|
-| 2.1 | ≥3 轮对话正常 | FreeSWITCH 日志（`~/freeswitch/var/log/freeswitch/freeswitch.log`）无 mod_audio_fork 错误；agent-flow 日志每轮出现 `AgentSession started` 后跟 `pre-llm phase done in %.0fms` + `LLM complete: action=... text=...`（flow.py 两行时延日志为轮次完成等价锚点，改造中保留未动） | PENDING |
+| 2.1 | ≥3 轮对话正常 | FreeSWITCH 日志（`~/freeswitch/var/log/freeswitch/freeswitch.log`）无 mod_audio_fork 错误；agent-flow 日志每通话一次 `AgentSession started (tenant=... biz_type=... scenario=...)`，之后每轮 `pre-llm phase done in %.0fms` + `LLM complete: action=... text=...`（flow.py 两行时延日志为轮次完成等价锚点，改造中保留未动） | PENDING |
 | 2.2 | AI 播报中说话可打断，打断后新轮次正常 | PG 查询 `SELECT * FROM callbot.call_event WHERE event_type='barge_in' AND call_id='{uuid}'` 有行（`TransvoiceAgent.on_conversation_item_added` 检测 interrupted → `fire_insert_event("barge_in")`）；打断后下一轮 `pre-llm phase done` 正常出现 | PENDING |
 | 2.3 | 挂断后双声道录音 | `CALLBOT_RECORDINGS_DIR/{uuid}.wav` 存在，ffprobe 双声道（L=caller / R=AI） | PENDING |
 | 2.4 | MinIO 归档 + console 回放 | agent-flow 日志录音归档成功（或 `POST /calls/{uuid}/archive-recording` 兜底后 200）；console 通话详情页 presigned URL 可回放，左右声道可分辨人声/AI 声 | PENDING |

@@ -269,11 +269,13 @@ async def ws_media_fork(websocket: WebSocket, call_id: str):
     )
     audio_input = session.input.audio
     await websocket.accept()
-    await session.start(agent)
-    logger.info("[%s] AgentSession started (tenant=%s biz_type=%s scenario=%s)",
-                call_id, tenant_id, biz_type, scenario)
-
     try:
+        # start 在 try 内：SDK start 失败时 aclose 对未完成启动的 session 是安全 no-op
+        # （_aclose_locked 对 not _started 直接 return），清理路径仍完整执行
+        await session.start(agent)
+        logger.info("[%s] AgentSession started (tenant=%s biz_type=%s scenario=%s)",
+                    call_id, tenant_id, biz_type, scenario)
+
         while True:
             if call and call.cancel.is_set():
                 logger.info("[%s] CHANNEL_HANGUP, stopping", call_id)
@@ -295,6 +297,17 @@ async def ws_media_fork(websocket: WebSocket, call_id: str):
             await asyncio.wait_for(session.aclose(), timeout=10.0)
         except Exception as e:
             logger.warning("[%s] session aclose: %s", call_id, e)
+        # TransvoiceTTS 自管每 call 一条共享 WS（_SharedTtsConnection 跨流存活，
+        # SDK aclose 只拆 activity/流，不关插件实例）——不显式关则每通话泄漏一条
+        # agent-tts WS + 阻塞在 recv() 的 reader task。getattr 防御：session.tts
+        # 可能是测试替身（lk_tts.TTS 基类 aclose 为 no-op，调用无害）。
+        tts_plugin = getattr(session, "tts", None)
+        tts_aclose = getattr(tts_plugin, "aclose", None)
+        if tts_aclose is not None:
+            try:
+                await asyncio.wait_for(tts_aclose(), timeout=10.0)
+            except Exception as e:
+                logger.warning("[%s] tts plugin aclose: %s", call_id, e)
         # 主动收口：stop/cancel 路径下 FS 可能尚未断开 WS
         try:
             await websocket.close()

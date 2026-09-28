@@ -104,3 +104,49 @@ async def test_cancelled_segment_audio_dropped(monkeypatch):
     await asyncio.sleep(0.1)
     assert q1.empty(), "已取消 request 的迟到音频必须被丢弃"
     await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_shared_conn_close_reaps_reader_and_closes_ws(monkeypatch):
+    """close() 必须关 ws + 收 reader task（回归：每通话 TTS 共享 WS/reader 泄漏）。"""
+    import voice.tts_plugin as tp
+    fake = FakeTtsServer()
+
+    async def fake_connect(*a, **kw):
+        return fake
+    monkeypatch.setattr(tp.websockets, "connect", fake_connect)
+
+    conn = _SharedTtsConnection(ws_url="ws://fake")
+    await conn.connect()
+    reader = conn._reader
+    assert reader is not None and not reader.done()
+
+    await conn.close()
+
+    assert fake.closed, "ws 必须被关闭"
+    assert reader.done(), "reader task 必须被收回"
+    # 二次 close 幂等（拆除路径可能 session.aclose 后再触发）
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_tts_aclose_closes_shared_conn(monkeypatch):
+    """TransvoiceTTS.aclose() 关共享连接并释放引用（回归：SDK 只关流不关插件实例）。"""
+    import voice.tts_plugin as tp
+    fake = FakeTtsServer()
+
+    async def fake_connect(*a, **kw):
+        return fake
+    monkeypatch.setattr(tp.websockets, "connect", fake_connect)
+
+    tts = TransvoiceTTS(ws_url="ws://fake", biz_type="marketing", call_id="c1")
+    conn = tts._ensure_conn()
+    await conn.connect()
+    reader = conn._reader
+
+    await tts.aclose()
+
+    assert fake.closed and reader.done()
+    assert tts._conn is None
+    # aclose 后再建流会拿到新连接对象（不复用已关闭的）
+    assert tts._ensure_conn() is not conn
