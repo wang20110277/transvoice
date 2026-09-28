@@ -40,8 +40,9 @@ class _PipelineLLM(llm.LLM):
 
 def _turn_handling_options() -> dict:
     return {
-        # FSMN 服务端分段主导轮次提交，STT final 即终点（design.md §2.2）
-        "turn_detection": "stt",
+        # silero VAD 判定轮次起止（design.md D2）；转写经 StreamAdapter 包装的
+        # 非流式 STT 供给，轮次提交等待已就绪 final
+        "turn_detection": "vad",
         "endpointing": {
             "mode": "fixed",
             "min_delay": settings.endpointing_min_delay,
@@ -62,6 +63,7 @@ def build_agent_session(
     esl,
     apm=None,
     denoiser=None,
+    vad=None,
 ) -> tuple[AgentSession, TransvoiceAgent]:
     output = TelephonyAudioOutput(
         send_fn=websocket.send_bytes,
@@ -83,7 +85,10 @@ def build_agent_session(
         tts=TransvoiceTTS(ws_url=settings.tts_ws_url,
                           biz_type=ctx.biz_type, call_id=ctx.call_id),
         llm=_PipelineLLM(),  # SDK 回复调度门禁需要非 None；真实推理在 llm_node
-        vad=inference.VAD(),  # 本地 silero，仅辅助打断（design.md §2.2）
+        # 不手动包 StreamAdapter：默认 stt_node 对 streaming=False 的 STT 自动以
+        # session vad 包装；min_silence_duration 承接退役 FSMN-VAD 的尾静音端点角色
+        vad=vad or inference.VAD(
+            min_silence_duration=settings.vad_min_silence_duration),
         turn_handling=_turn_handling_options(),
         aec_warmup_duration=None,  # 关键：默认 3s 会屏蔽首轮 barge-in
         userdata={"call_ctx": ctx},

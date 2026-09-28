@@ -195,7 +195,7 @@ def test_turn_handling_options_keys_match_sdk():
     assert set(th) <= set(TurnHandlingOptions.__annotations__)
     assert set(th["endpointing"]) <= set(EndpointingOptions.__annotations__)
     assert set(th["interruption"]) <= set(InterruptionOptions.__annotations__)
-    assert th["turn_detection"] == "stt"
+    assert th["turn_detection"] == "vad"
     assert th["endpointing"]["mode"] == "fixed"
 
 

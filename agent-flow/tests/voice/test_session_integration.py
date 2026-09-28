@@ -4,20 +4,19 @@
 （测试内自含 Fake 类）：monkeypatch voice.session 命名空间里的
 TransvoiceSTT/TransvoiceTTS/TransvoiceAgent，绕开真实 agent-asr/agent-tts WS
 与 LangGraph 管线，其余全部真实——AgentSession 默认对话循环、turn_handling
-（stt 轮次提交）、TelephonyAudioInput（jitter→denoise→gain 链）、
-TelephonyAudioOutput（30ms 匀速 + playback_finished 契约）、事件接线均被覆盖。
-打断测试额外以 TriggerFakeVAD（仿 agents/tests/fake_vad.py 结构）替换
-inference.VAD，覆盖 VAD 触发 → 打断 → 下一轮推进的全链路（design.md §5）。
-
-Task 4 观察项（STT flush 重连）在此不适用：ScriptedStream 永不主动结束，
-flush 哨兵仅被消费，不存在服务端关连接路径。
+（vad 轮次提交）、非流式 STT 经默认 stt_node 自动 StreamAdapter 包装
+（TriggerFakeVAD END_OF_SPEECH 带 frames → recognize → FINAL）、
+TelephonyAudioInput（jitter→denoise→gain 链）、TelephonyAudioOutput（30ms 匀速 +
+playback_finished 契约）、事件接线均被覆盖。
+TriggerFakeVAD 经 build_agent_session(vad=...) 注入：StreamAdapter 分段与
+audio_recognition 轮次端点共用同一触发源（对齐真实 VAD 双流消费同一音频）。
 """
 import asyncio
 import time
 from types import SimpleNamespace
 
 import pytest
-
+from livekit import rtc
 from livekit.agents import APIConnectOptions
 from livekit.agents import llm as lk_llm
 from livekit.agents import stt as lk_stt
@@ -31,59 +30,44 @@ _TTS_SAMPLE_RATE = 22050  # 与 TransvoiceTTS 一致，走真实 22050→16000 �
 # 每段合成 0.24s 非零音频（12 × 10ms），非零字节用于与静音保活帧区分
 _TTS_CHUNKS = 12
 _TTS_CHUNK_SAMPLES = _TTS_SAMPLE_RATE // 100
+# VAD 段内帧：单帧 960B（30ms @16kHz），供 StreamAdapter merge 后喂 recognize
+_VAD_FRAME = rtc.AudioFrame(data=b"\x01\x02" * 480, sample_rate=16000,
+                            num_channels=1, samples_per_channel=480)
 
 
-class ScriptedRecognizeStream(lk_stt.RecognizeStream):
-    def __init__(self, *, stt, conn_options):
-        super().__init__(stt=stt, conn_options=conn_options, sample_rate=16000)
+class FakeBatchSTT(lk_stt.STT):
+    """非流式 STT fake：_recognize_impl 弹出 texts 队列脚本，记录收到音频字节数。
 
-    def push_turn(self, text: str) -> None:
-        rid = utils.shortuuid()
-        self._event_ch.send_nowait(lk_stt.SpeechEvent(
-            type=lk_stt.SpeechEventType.START_OF_SPEECH, request_id=rid))
-        self._event_ch.send_nowait(lk_stt.SpeechEvent(
-            type=lk_stt.SpeechEventType.FINAL_TRANSCRIPT, request_id=rid,
-            alternatives=[lk_stt.SpeechData(language="zh", text=text)]))
-        # 铁律：FINAL 之后才能 EOS（turn_detection="stt" 由 EOS 驱动轮次提交）
-        self._event_ch.send_nowait(lk_stt.SpeechEvent(
-            type=lk_stt.SpeechEventType.END_OF_SPEECH, request_id=rid))
+    经默认 stt_node 的 StreamAdapter 自动包装（streaming=False + session vad），
+    覆盖「VAD 切段 → recognize → FINAL」的真实链路。
+    """
 
-    async def _run(self) -> None:
-        # 仅消费输入通道（含 flush 哨兵），事件由测试经 push_turn 外部注入
-        async for _ in self._input_ch:
-            pass
-
-
-class ScriptedSTT(lk_stt.STT):
-    """build_agent_session 经 ws_url 参数构造；latest 暴露实例给测试驱动。"""
-
-    latest: "ScriptedSTT | None" = None
+    latest: "FakeBatchSTT | None" = None
 
     def __init__(self, *, ws_url: str = "", min_final_len: int = 2) -> None:
         super().__init__(capabilities=lk_stt.STTCapabilities(
-            streaming=True, interim_results=False))
-        self._stream: ScriptedRecognizeStream | None = None
-        ScriptedSTT.latest = self
-
-    def stream(self, *, language=None, conn_options=None, **kwargs):
-        self._stream = ScriptedRecognizeStream(
-            stt=self, conn_options=conn_options or APIConnectOptions())
-        return self._stream
+            streaming=False, interim_results=False))
+        self.texts: list[str] = []
+        self.recv_bytes: list[int] = []
+        FakeBatchSTT.latest = self
 
     async def _recognize_impl(self, buffer, *, language, conn_options):
-        raise NotImplementedError("batch 模式未启用")
+        frames = buffer if isinstance(buffer, list) else [buffer]
+        self.recv_bytes.append(sum(len(bytes(f.data)) for f in frames))
+        text = self.texts.pop(0) if self.texts else ""
+        alternatives = ([lk_stt.SpeechData(language="zh", text=text)]
+                        if text else [])
+        return lk_stt.SpeechEvent(
+            type=lk_stt.SpeechEventType.FINAL_TRANSCRIPT,
+            alternatives=alternatives)
 
     @property
     def model(self) -> str:
-        return "scripted"
+        return "fake-batch"
 
     @property
     def provider(self) -> str:
         return "test"
-
-    def push_turn(self, text: str) -> None:
-        assert self._stream is not None, "STT stream not created yet"
-        self._stream.push_turn(text)
 
 
 class FakeSynthesizeStream(lk_tts.SynthesizeStream):
@@ -154,7 +138,7 @@ class FakeTTS(lk_tts.TTS):
 
 
 class FakeAgentMixin:
-    """绕开 LangGraph 管线：按用户输入回固定文案，其余 TransvoiceAgent 行为保留。"""
+    """绕开 LangGraph 管线：按用户输入回显固定文案，其余 TransvoiceAgent 行为保留。"""
 
     async def _llm_node_impl(self, user_text: str):
         if user_text:
@@ -171,103 +155,28 @@ async def _wait_for(predicate, *, timeout: float = 10.0, what: str) -> None:
     raise AssertionError(f"timeout waiting for {what}")
 
 
-@pytest.mark.asyncio
-async def test_session_processes_two_turns(monkeypatch):
-    """两轮用户输入 → 两段 TTS 文本 + 两段非静音音频下行；aclose 不挂死。"""
-    import voice.session as voice_session
-    from voice.agent import CallContext, TransvoiceAgent
-    from ws.registry import ActiveCallRegistry
-
-    class FakeAgent(FakeAgentMixin, TransvoiceAgent):
-        pass
-
-    monkeypatch.setattr(voice_session, "TransvoiceSTT", ScriptedSTT)
-    monkeypatch.setattr(voice_session, "TransvoiceTTS", FakeTTS)
-    monkeypatch.setattr(voice_session, "TransvoiceAgent", FakeAgent)
-
-    ScriptedSTT.latest = None
-    FakeTTS.latest = None
-
-    ctx = CallContext(
-        call_id="itest", biz_type="collection", user_key="u1",
-        tenant_id="default", scenario="default",
-        call_task_vars={}, handoff_extension="1001",
-    )
-    sent: list[bytes] = []
-
-    async def send_bytes(frame: bytes) -> None:
-        sent.append(frame)
-
-    session, agent = voice_session.build_agent_session(
-        ctx=ctx, websocket=SimpleNamespace(send_bytes=send_bytes),
-        registry=ActiveCallRegistry(), esl=None,
-    )
-    audio_input = session.input.audio
-    await session.start(agent)
-
-    # 背景推上行静音帧：驱动真实 jitter→denoise→gain→VAD 链
-    async def push_loop() -> None:
-        while True:
-            audio_input.push_bytes(b"\x00" * FRAME_BYTES)
-            await asyncio.sleep(0.03)
-
-    pusher = asyncio.create_task(push_loop())
-    try:
-        await _wait_for(
-            lambda: ScriptedSTT.latest is not None
-            and ScriptedSTT.latest._stream is not None,
-            what="STT stream creation")
-
-        ScriptedSTT.latest.push_turn("你好")
-        await _wait_for(lambda: len(FakeTTS.latest.segments) >= 1,
-                        what="turn-1 reply synthesized")
-        await asyncio.sleep(0.8)  # 覆盖 0.24s 匀速 playout，确保段关闭后再开下一轮
-
-        ScriptedSTT.latest.push_turn("在吗")
-        await _wait_for(lambda: len(FakeTTS.latest.segments) >= 2,
-                        what="turn-2 reply synthesized")
-        await asyncio.sleep(0.8)
-    finally:
-        pusher.cancel()
-        audio_input.close()
-        # Task 3 约束验证点：aclose 不挂死（playback_finished 契约成立）
-        await asyncio.wait_for(session.aclose(), timeout=10.0)
-
-    assert FakeTTS.latest.segments == ["回复:你好", "回复:在吗"]
-
-    non_silent = [f for f in sent if any(f)]
-    # 两轮 × 0.24s ≈ 16 帧（30ms/帧）；放宽下限容忍重采样切帧差异
-    assert len(non_silent) >= 8, (
-        f"expected >=8 non-silent output frames, got {len(non_silent)}")
-
-    history_text = " ".join(
-        item.text_content or "" for item in session.history.items
-        if isinstance(item, lk_llm.ChatMessage))
-    assert "回复:你好" in history_text
-    assert "回复:在吗" in history_text
-
-
 # ═══════════════════════════════════════════════════════════════════
-# fake-VAD 打断集成测试（design.md §5 承诺项）
+# 可控 FakeVAD（仿 agents/tests/fake_vad.py 结构，改为显式触发）
 # ═══════════════════════════════════════════════════════════════════
 
 class TriggerFakeVAD(LK_VAD):
-    """可控 FakeVAD（仿 agents/tests/fake_vad.py 的结构，改为显式触发）。
+    """事件序列对齐真实 VAD：START_OF_SPEECH → 周期 INFERENCE_DONE（speech_duration
+    递增，≥ interruption.min_duration 命中 audio-activity 打断）→ END_OF_SPEECH
+    （带 frames，供 StreamAdapter merge 后调 recognize）。
 
-    事件序列对齐真实 VAD 驱动打断的语义：START_OF_SPEECH（清 _stt_eos_received）
-    → 周期 INFERENCE_DONE（speech_duration 递增、raw_accumulated_silence=0；
-    speech_duration ≥ interruption.min_duration 即命中 agent_activity
-    on_vad_inference_done → _interrupt_by_audio_activity）→ END_OF_SPEECH。
+    每个 stream() 独立流但共享同一 _trigger：轮次端点流（audio_recognition）与
+    StreamAdapter 分段流同时收到事件，等价真实 VAD 双流消费同一音频。
     """
 
     latest: "TriggerFakeVAD | None" = None
 
     def __init__(self, *, speech_duration: float = 0.6,
-                 inference_interval: float = 0.05) -> None:
+                 inference_interval: float = 0.05, **_ignored) -> None:
         super().__init__(capabilities=VADCapabilities(update_interval=inference_interval))
         self._speech_duration = speech_duration
         self._inference_interval = inference_interval
         self._trigger = asyncio.Event()
+        self.streams_created = 0
         TriggerFakeVAD.latest = self
 
     def trigger_speech(self) -> None:
@@ -275,6 +184,7 @@ class TriggerFakeVAD(LK_VAD):
         self._trigger.set()
 
     def stream(self) -> "TriggerFakeVADStream":
+        self.streams_created += 1
         return TriggerFakeVADStream(self)
 
 
@@ -301,7 +211,7 @@ class TriggerFakeVADStream(VADStream):
                                speaking=True, probability=0.99)
                 self._send(VADEventType.END_OF_SPEECH,
                            speech_duration=self._vad._speech_duration,
-                           silence_duration=0.05)
+                           silence_duration=0.05, frames=[_VAD_FRAME])
         finally:
             drain.cancel()
 
@@ -311,7 +221,7 @@ class TriggerFakeVADStream(VADStream):
 
     def _send(self, type: VADEventType, *, speech_duration: float,
               silence_duration: float = 0.0, speaking: bool = False,
-              probability: float = 0.0) -> None:
+              probability: float = 0.0, frames: list | None = None) -> None:
         now = time.perf_counter()
         self._event_ch.send_nowait(VADEvent(
             type=type, samples_index=0, timestamp=now,
@@ -319,20 +229,107 @@ class TriggerFakeVADStream(VADStream):
             probability=probability, speaking=speaking,
             raw_accumulated_speech=speech_duration,
             raw_accumulated_silence=silence_duration,
+            frames=frames or [],
         ))
 
 
 @pytest.mark.asyncio
+async def test_session_processes_two_turns(monkeypatch):
+    """两段 VAD 切分语音 → 两段 TTS 文本 + 两段非静音音频下行；aclose 不挂死。
+
+    R1 守护（design.md）：turn_detection="vad" 下轮次提交必须等已就绪 final——
+    FakeAgent 仅在收到非空完整转写时回显，FakeTTS 段内容断言即「用户轮次带完整
+    转写提交」的等价判据。
+    """
+    import voice.session as voice_session
+    from voice.agent import CallContext, TransvoiceAgent
+    from ws.registry import ActiveCallRegistry
+
+    class FakeAgent(FakeAgentMixin, TransvoiceAgent):
+        pass
+
+    monkeypatch.setattr(voice_session, "TransvoiceSTT", FakeBatchSTT)
+    monkeypatch.setattr(voice_session, "TransvoiceTTS", FakeTTS)
+    monkeypatch.setattr(voice_session, "TransvoiceAgent", FakeAgent)
+
+    FakeBatchSTT.latest = None
+    FakeTTS.latest = None
+    TriggerFakeVAD.latest = None
+
+    ctx = CallContext(
+        call_id="itest", biz_type="collection", user_key="u1",
+        tenant_id="default", scenario="default",
+        call_task_vars={}, handoff_extension="1001",
+    )
+    sent: list[bytes] = []
+
+    async def send_bytes(frame: bytes) -> None:
+        sent.append(frame)
+
+    session, agent = voice_session.build_agent_session(
+        ctx=ctx, websocket=SimpleNamespace(send_bytes=send_bytes),
+        registry=ActiveCallRegistry(), esl=None,
+        vad=TriggerFakeVAD(),
+    )
+    audio_input = session.input.audio
+    await session.start(agent)
+
+    # 背景推上行静音帧：驱动真实 jitter→denoise→gain 链
+    async def push_loop() -> None:
+        while True:
+            audio_input.push_bytes(b"\x00" * FRAME_BYTES)
+            await asyncio.sleep(0.03)
+
+    pusher = asyncio.create_task(push_loop())
+    try:
+        # 双 VAD 流就位（audio_recognition 轮次端点 + StreamAdapter 分段）
+        await _wait_for(lambda: TriggerFakeVAD.latest.streams_created >= 2,
+                        what="VAD streams creation (turn detection + StreamAdapter)")
+
+        FakeBatchSTT.latest.texts.append("你好")
+        TriggerFakeVAD.latest.trigger_speech()
+        await _wait_for(lambda: len(FakeTTS.latest.segments) >= 1,
+                        what="turn-1 reply synthesized")
+        await asyncio.sleep(0.8)  # 覆盖 0.24s 匀速 playout，段关闭后再开下一轮
+
+        FakeBatchSTT.latest.texts.append("在吗")
+        TriggerFakeVAD.latest.trigger_speech()
+        await _wait_for(lambda: len(FakeTTS.latest.segments) >= 2,
+                        what="turn-2 reply synthesized")
+        await asyncio.sleep(0.8)
+    finally:
+        pusher.cancel()
+        audio_input.close()
+        # aclose 不挂死（playback_finished 契约成立）
+        await asyncio.wait_for(session.aclose(), timeout=10.0)
+
+    assert FakeTTS.latest.segments == ["回复:你好", "回复:在吗"]
+
+    # StreamAdapter 把 VAD 段 frames 传给了 recognize（每段 960B 非空音频）
+    assert FakeBatchSTT.latest.recv_bytes, "recognize should receive VAD frames"
+    assert all(n > 0 for n in FakeBatchSTT.latest.recv_bytes)
+
+    non_silent = [f for f in sent if any(f)]
+    assert len(non_silent) >= 8, (
+        f"expected >=8 non-silent output frames, got {len(non_silent)}")
+
+    history_text = " ".join(
+        item.text_content or "" for item in session.history.items
+        if isinstance(item, lk_llm.ChatMessage))
+    assert "回复:你好" in history_text
+    assert "回复:在吗" in history_text
+
+
+@pytest.mark.asyncio
 async def test_barge_in_interrupts_playback_and_next_turn_proceeds(monkeypatch):
-    """TTS 播放中用户说话（fake VAD）→ 播放暂停 → 用户话语 final 化为真打断
+    """TTS 播放中用户说话（fake VAD）→ 播放暂停 → VAD 段 final 化为真打断
     （playback_finished(interrupted=True) + barge_in 落库 R2）→ 下一轮正常推进
     + aclose 不挂死。
 
     SDK 1.8.3 SOS-pause 语义（output.can_pause=True + resume_false_interruption）：
     ① VAD INFERENCE_DONE(speech_duration≥min_duration) 命中 → audio_output.pause()
-    （agent_state speaking→listening，播放立即停流）② 用户 FINAL transcript 到达
-    → _cancel_speech_pause(interrupt=True) → clear_buffer → interrupted 回报。
-    覆盖 design.md §5 全链路：VAD 触发半段 + SpeechHandle/clear_buffer 下游半段。
+    ② 段 FINAL transcript 到达（StreamAdapter recognize 完成即发）→
+    _cancel_speech_pause(interrupt=True) → clear_buffer → interrupted 回报。
     """
     import voice.agent as voice_agent
     import voice.session as voice_session
@@ -345,11 +342,9 @@ async def test_barge_in_interrupts_playback_and_next_turn_proceeds(monkeypatch):
     class LongPlayoutTTS(FakeTTS):
         chunks_per_segment = 100  # ~1.0s playout，保证打断触发时仍在播放
 
-    monkeypatch.setattr(voice_session, "TransvoiceSTT", ScriptedSTT)
+    monkeypatch.setattr(voice_session, "TransvoiceSTT", FakeBatchSTT)
     monkeypatch.setattr(voice_session, "TransvoiceTTS", LongPlayoutTTS)
     monkeypatch.setattr(voice_session, "TransvoiceAgent", FakeAgent)
-    # 替换 VAD 类：build_agent_session 内 inference.VAD() 即构造 TriggerFakeVAD
-    monkeypatch.setattr(voice_session.inference, "VAD", TriggerFakeVAD)
     # 缩短打断门限（默认 0.5s），让暂停稳定落在 1.0s playout 窗口内
     monkeypatch.setattr(voice_session.settings, "interruption_min_duration", 0.15)
 
@@ -361,7 +356,7 @@ async def test_barge_in_interrupts_playback_and_next_turn_proceeds(monkeypatch):
             barge_in_events.append(kwargs)
     monkeypatch.setattr(voice_agent, "fire_insert_event", record_event)
 
-    ScriptedSTT.latest = None
+    FakeBatchSTT.latest = None
     FakeTTS.latest = None
     TriggerFakeVAD.latest = None
 
@@ -377,6 +372,7 @@ async def test_barge_in_interrupts_playback_and_next_turn_proceeds(monkeypatch):
     session, agent = voice_session.build_agent_session(
         ctx=ctx, websocket=SimpleNamespace(send_bytes=send_bytes),
         registry=ActiveCallRegistry(), esl=None,
+        vad=TriggerFakeVAD(),
     )
     audio_input = session.input.audio
     playback_started: list = []
@@ -392,28 +388,23 @@ async def test_barge_in_interrupts_playback_and_next_turn_proceeds(monkeypatch):
 
     pusher = asyncio.create_task(push_loop())
     try:
-        await _wait_for(
-            lambda: ScriptedSTT.latest is not None
-            and ScriptedSTT.latest._stream is not None,
-            what="STT stream creation")
+        await _wait_for(lambda: TriggerFakeVAD.latest.streams_created >= 2,
+                        what="VAD streams creation (turn detection + StreamAdapter)")
 
-        # 轮次一：回复合成完成并进入物理播放
-        ScriptedSTT.latest.push_turn("第一句")
+        # 轮次一：队列文本后触发语音（EOS → recognize → FINAL → 轮次提交 → 回复播放）
+        FakeBatchSTT.latest.texts.append("第一句")
+        TriggerFakeVAD.latest.trigger_speech()
         await _wait_for(lambda: len(FakeTTS.latest.segments) >= 1,
                         what="turn-1 reply synthesized")
         await _wait_for(lambda: len(playback_started) >= 1,
                         what="turn-1 playback started")
 
-        # 用户开始说话：fake VAD 注入 0.6s 语音（> 门限 0.15s）→ SOS 暂停。
-        # 未收到任何 playback_finished 即转为 listening，说明暂停先于自然播完
+        # 用户开始说话（0.6s > 门限 0.15s）→ SOS 暂停；段 FINAL 随 EOS 到达升格打断
+        FakeBatchSTT.latest.texts.append("第二句")
         TriggerFakeVAD.latest.trigger_speech()
         await _wait_for(
             lambda: session.agent_state == "listening" and not playback_finished,
             what="playback paused by user speech (SOS pause)")
-
-        # 用户话语 final 到达 → 暂停升格为真打断（clear_buffer + interrupted 回报）
-        # → 新 turn 提交 → 新回复产出
-        ScriptedSTT.latest.push_turn("第二句")
         await _wait_for(
             lambda: any(ev.interrupted for ev in playback_finished),
             what="playback_finished(interrupted=True)")
@@ -422,7 +413,6 @@ async def test_barge_in_interrupts_playback_and_next_turn_proceeds(monkeypatch):
     finally:
         pusher.cancel()
         audio_input.close()
-        # aclose 不挂死（打断路径的 clear_buffer/playback_finished 契约成立）
         await asyncio.wait_for(session.aclose(), timeout=10.0)
 
     assert FakeTTS.latest.segments[0] == "回复:第一句"
@@ -430,6 +420,5 @@ async def test_barge_in_interrupts_playback_and_next_turn_proceeds(monkeypatch):
     interrupted_positions = [ev.playback_position for ev in playback_finished
                              if ev.interrupted]
     assert interrupted_positions, "应存在 interrupted=True 的 playback_finished"
-    # 打断发生在 ~0.2s（暂停即停流），远早于 1.0s 自然播完
     assert interrupted_positions[0] < 0.9
     assert barge_in_events, "interrupted assistant 消息应触发 barge_in 事件（R2）"
