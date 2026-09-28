@@ -1,14 +1,16 @@
-"""TransvoiceSTT：协议映射 + 事件序列 + 短 final 过滤 + 错误分类。
+"""TransvoiceSTT：非流式批量 recognize —— 协议交互 + 短文本过滤 + 分帧 + 错误分类。
 
-与 brief 的差异（SDK 1.8.3 实测）：
-- `stt.APIConnectionError` 不存在（livekit.agents.stt 包未 re-export），从 livekit.agents 顶层导入；
-- 结束时 `await stream.aclose()` 清理后台任务，避免 "Task was destroyed but it is pending" 噪音。
+与 design.md 的差异记录：
+- `_SINGLE_ATTEMPT_CONN_OPTIONS` 已随 stream() 路径删除（计划「偏差记录」）；
+- 直调 recognize 时传 `APIConnectOptions(max_retry=0)` 保证错误即抛（基类不重试）。
 """
 import asyncio
 import json
 
 import pytest
-from livekit.agents import APIConnectionError, stt
+import websockets
+from livekit import rtc
+from livekit.agents import APIConnectionError, APIConnectOptions
 
 
 class FakeUpstreamWs:
@@ -34,94 +36,87 @@ class FakeUpstreamWs:
         self.closed = True
 
 
-@pytest.mark.asyncio
-async def test_multi_final_event_sequence(monkeypatch):
+def _buffer(nbytes: int) -> rtc.AudioFrame:
+    return rtc.AudioFrame(data=b"\x01\x02" * (nbytes // 2), sample_rate=16000,
+                          num_channels=1, samples_per_channel=nbytes // 2)
+
+
+def _patch(monkeypatch, fake):
     import voice.stt_plugin as sp
+
+    async def fake_connect(*a, **kw):
+        return fake
+
+    monkeypatch.setattr(sp.websockets, "connect", fake_connect)
+    return sp
+
+
+_NO_RETRY = {"conn_options": APIConnectOptions(max_retry=0)}
+
+
+@pytest.mark.asyncio
+async def test_recognize_returns_final_event(monkeypatch):
     fake = FakeUpstreamWs([
-        json.dumps({"type": "result", "text": "你好请问", "confidence": 0.9}),
-        json.dumps({"type": "result", "text": "是张先生吗", "confidence": 0.9}),
-    ])
+        json.dumps({"type": "result", "text": "你好请问", "confidence": 0.9})])
+    sp = _patch(monkeypatch, fake)
 
-    async def fake_connect(*a, **kw):
-        return fake
-    monkeypatch.setattr(sp.websockets, "connect", fake_connect)
+    ev = await sp.TransvoiceSTT(ws_url="ws://fake").recognize(
+        _buffer(960), language="zh", **_NO_RETRY)
 
-    plugin = sp.TransvoiceSTT(ws_url="ws://fake")
-    stream = plugin.stream(language="zh")
-    events = []
-    consume = asyncio.create_task(_collect(stream, events, n=6))
-    await asyncio.sleep(0.1)
-    stream.push_frame(_audio_frame(b"\x01\x02" * 480))
-    await asyncio.wait_for(consume, timeout=2.0)
-    await stream.aclose()
-
-    types = [e.type for e in events]
-    assert types == [
-        stt.SpeechEventType.START_OF_SPEECH,
-        stt.SpeechEventType.FINAL_TRANSCRIPT,
-        stt.SpeechEventType.END_OF_SPEECH,
-    ] * 2
-    finals = [e for e in events if e.type == stt.SpeechEventType.FINAL_TRANSCRIPT]
-    assert finals[0].alternatives[0].text == "你好请问"
-    assert finals[1].alternatives[0].text == "是张先生吗"
+    assert ev.type == sp.SpeechEventType.FINAL_TRANSCRIPT
+    assert ev.alternatives[0].text == "你好请问"
+    assert ev.alternatives[0].confidence == 0.9
+    # 发帧序列：config → 音频 → end → 关连接
+    cfg = json.loads(fake.sent[0])
+    assert cfg["type"] == "config" and cfg["sample_rate"] == 16000
+    assert fake.sent[1] == b"\x01\x02" * 480
+    assert json.loads(fake.sent[-1])["type"] == "end"
+    assert fake.closed
 
 
 @pytest.mark.asyncio
-async def test_short_final_dropped_with_eos(monkeypatch):
-    import voice.stt_plugin as sp
+async def test_short_text_returns_empty_alternatives(monkeypatch):
     fake = FakeUpstreamWs([
-        json.dumps({"type": "result", "text": "嗯", "confidence": 0.5}),
-    ])
-    async def fake_connect(*a, **kw):
-        return fake
-    monkeypatch.setattr(sp.websockets, "connect", fake_connect)
+        json.dumps({"type": "result", "text": "嗯", "confidence": 0.5})])
+    sp = _patch(monkeypatch, fake)
 
-    plugin = sp.TransvoiceSTT(ws_url="ws://fake")
-    stream = plugin.stream(language="zh")
-    events = []
-    consume = asyncio.create_task(_collect(stream, events, n=1, timeout=0.3))
-    await asyncio.sleep(0.1)
-    stream.push_frame(_audio_frame(b"\x01\x02" * 480))
-    await consume  # 应超时收不到任何事件
-    await stream.aclose()
-    assert events == []
+    ev = await sp.TransvoiceSTT(ws_url="ws://fake").recognize(
+        _buffer(960), language="zh", **_NO_RETRY)
+
+    assert ev.type == sp.SpeechEventType.FINAL_TRANSCRIPT
+    assert ev.alternatives == []  # StreamAdapter 据此跳过 FINAL
 
 
 @pytest.mark.asyncio
-async def test_upstream_disconnect_raises_connection_error(monkeypatch):
-    import websockets
-    import voice.stt_plugin as sp
-    fake = FakeUpstreamWs([websockets.ConnectionClosed(None, None)])
-    async def fake_connect(*a, **kw):
-        return fake
-    monkeypatch.setattr(sp.websockets, "connect", fake_connect)
+async def test_large_audio_chunked_to_64k(monkeypatch):
+    fake = FakeUpstreamWs([
+        json.dumps({"type": "result", "text": "长段文本", "confidence": 0.9})])
+    sp = _patch(monkeypatch, fake)
 
-    plugin = sp.TransvoiceSTT(ws_url="ws://fake")
-    stream = plugin.stream(language="zh")
-    stream.push_frame(_audio_frame(b"\x01\x02" * 480))
+    total = 200 * 1024
+    await sp.TransvoiceSTT(ws_url="ws://fake").recognize(
+        _buffer(total), language="zh", **_NO_RETRY)
+
+    audio_frames = fake.sent[1:-1]
+    assert all(isinstance(f, bytes) and len(f) <= 64 * 1024 for f in audio_frames)
+    assert b"".join(audio_frames) == b"\x01\x02" * (total // 2)
+
+
+@pytest.mark.asyncio
+async def test_error_message_raises_connection_error(monkeypatch):
+    fake = FakeUpstreamWs([json.dumps({"type": "error", "message": "boom"})])
+    sp = _patch(monkeypatch, fake)
+
     with pytest.raises(APIConnectionError):
-        await asyncio.wait_for(_drain_stream(stream), timeout=2.0)
-    await stream.aclose()
+        await sp.TransvoiceSTT(ws_url="ws://fake").recognize(
+            _buffer(960), language="zh", **_NO_RETRY)
 
 
-def _audio_frame(pcm: bytes):
-    from livekit import rtc
-    return rtc.AudioFrame(data=pcm, sample_rate=16000, num_channels=1,
-                          samples_per_channel=len(pcm) // 2)
+@pytest.mark.asyncio
+async def test_disconnect_raises_connection_error(monkeypatch):
+    fake = FakeUpstreamWs([websockets.ConnectionClosed(None, None)])
+    sp = _patch(monkeypatch, fake)
 
-
-async def _collect(stream, out, n, timeout=2.0):
-    async def _t():
-        async for ev in stream:
-            out.append(ev)
-            if len(out) >= n:
-                return
-    try:
-        await asyncio.wait_for(_t(), timeout=timeout)
-    except asyncio.TimeoutError:
-        pass
-
-
-async def _drain_stream(stream):
-    async for _ in stream:
-        pass
+    with pytest.raises(APIConnectionError):
+        await sp.TransvoiceSTT(ws_url="ws://fake").recognize(
+            _buffer(960), language="zh", **_NO_RETRY)
