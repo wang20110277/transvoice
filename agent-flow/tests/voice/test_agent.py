@@ -130,6 +130,38 @@ async def test_llm_node_skips_empty_input(monkeypatch):
     assert agent._executed_actions == []
 
 
+@pytest.mark.asyncio
+async def test_terminal_task_failure_logged_and_ref_released(monkeypatch, caplog):
+    """done_callback 记错（对齐 _fire 约定）：任务异常不静默，引用正常回收。"""
+    import logging
+
+    agent = _make_agent()
+
+    async def fake_pre_llm(*a, **kw):
+        return {"user_input": "在吗", "biz_type": "collection", "call_id": "c1"}
+
+    async def fake_astream(state, on_action=None):
+        await on_action("end")
+        yield "再见"
+
+    async def boom(*a, **kw):
+        raise RuntimeError("esl down")
+
+    monkeypatch.setattr("voice.agent.run_pre_llm_phase", fake_pre_llm)
+    monkeypatch.setattr("voice.agent.astream_reply_text", fake_astream)
+    monkeypatch.setattr("voice.agent.execute_terminal_action", boom)
+
+    agent._test_session = SimpleNamespace(wait_for_playout=_async_ret(None))
+
+    with caplog.at_level(logging.ERROR, logger="voice.agent"):
+        tokens = [t async for t in agent._llm_node_impl("在吗")]
+        await asyncio.sleep(0.05)
+
+    assert tokens == ["再见"]
+    assert any("terminal action task failed" in r.message for r in caplog.records)
+    assert agent._terminal_tasks == set()  # 引用已回收
+
+
 def test_barge_in_fires_only_for_interrupted_assistant_message(monkeypatch):
     from livekit.agents import llm as lk_llm
 

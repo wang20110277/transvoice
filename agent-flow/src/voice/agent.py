@@ -132,7 +132,20 @@ class TransvoiceAgent(Agent):
                 name=f"terminal-action-{ctx.call_id}",
             )
             self._terminal_tasks.add(task)
-            task.add_done_callback(self._terminal_tasks.discard)
+            task.add_done_callback(self._on_terminal_task_done)
+
+    def _on_terminal_task_done(self, task: asyncio.Task) -> None:
+        """回收引用 + 记错（对齐 persistence_helpers._fire 约定，不静默吞异常）。
+
+        cancelled 单独放行：Task.exception() 对已取消任务抛 CancelledError，
+        会话拆除取消属正常路径，不该进 error 日志。"""
+        self._terminal_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("[%s] terminal action task failed: %s",
+                         self._ctx.call_id, exc)
 
     async def _run_action_after_playout(self, terminal: str) -> None:
         ctx = self._ctx
