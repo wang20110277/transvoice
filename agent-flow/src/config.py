@@ -79,10 +79,13 @@ class Settings(BaseSettings):
     jitter_target_depth: int = 3
     jitter_max_depth: int = 10
 
-    # livekit AgentSession 轮次/打断参数（design.md §2.2：FSMN 分段已含端点判定，min_delay 远小于 SDK 默认 0.5）
+    # livekit AgentSession 轮次/打断参数
     endpointing_min_delay: float = 0.1
     endpointing_max_delay: float = 2.0
     interruption_min_duration: float = 0.5
+    # silero 判定语音结束的静音时长（原 agent-asr FSMN-VAD 尾静音确认角色的承接配置；
+    # 0.25 = livekit-agents 1.8.3 inference.VAD 默认）
+    vad_min_silence_duration: float = 0.25
 
     # Denoising (pre-VAD): "", "highpass", "noisereduce", "rnnoise"
     denoise_enabled: str = ""
