@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-智能外呼系统 (Smart Outbound Call System) — a telephony AI platform using FreeSWITCH for SIP/RTP with mod_audio_fork WebSocket audio streaming, built-in GPU ASR/TTS inference (SenseVoice + CosyVoice3) plus cloud-based EdgeTTS (no GPU), FSMN-VAD server-side endpoint detection (agent-asr) + RMSGate barge-in (agent-flow), WebRTC APM (AEC +ANS + AGC), and a LangGraph-orchestrated Python agent driving LLM-powered conversations with full streaming pipeline, barge-in support, uvloop event loop, pre-VAD audio denoising, ESL auto-reconnect + heartbeat, Docker Compose deployment, dual-channel call recording, multi-tenant `(tenant_id, biz_type, scenario)` isolation, and a Next.js management console (`console/`).
+智能外呼系统 (Smart Outbound Call System) — a telephony AI platform using FreeSWITCH for SIP/RTP with mod_audio_fork WebSocket audio streaming, built-in GPU ASR/TTS inference (SenseVoice + CosyVoice3) plus cloud-based EdgeTTS (no GPU), FSMN-VAD server-side endpoint detection (agent-asr), a livekit-agents `AgentSession` streaming conversation pipeline in agent-flow (TelephonyIO bridge + STT/TTS plugins, silero-VAD barge-in), WebRTC APM (AEC +NS + AGC), and a LangGraph-orchestrated Python agent driving LLM-powered conversations, uvloop event loop, pre-VAD audio denoising, ESL auto-reconnect + heartbeat, Docker Compose deployment, dual-channel call recording, multi-tenant `(tenant_id, biz_type, scenario)` isolation, and a Next.js management console (`console/`).
 
 ## Coding Conventions
 
@@ -137,7 +137,7 @@ openspec/
 
 ### 审查清单
 
-- [ ] 变更是否影响流式通话路径（WebSocket → JitterBuffer → WebRTCAPM/Denoise → ASR 全量喂(服务端 FSMN-VAD 分段 → on_final)→ LLM → TTS → OutputBuffer）
+- [ ] 变更是否影响流式通话路径（WS `/media/{uuid}` → AgentSession(TelephonyIO → STT 插件 → llm_node/LangGraph → TTS 插件 → AudioOutput)）
 - [ ] ESL 连接管理（auto-reconnect、heartbeat）是否正确
 - [ ] asyncio 并发安全（共享状态是否正确使用 Lock/Event）
 - [ ] 新增配置项是否使用 `CALLBOT_` 前缀 + pydantic-settings（MinIO 也走 `CALLBOT_MINIO_*` 前缀，由 pydantic 加载；无前缀 `MINIO_*` 已废弃，仅 console 侧 Node.js 直读 `process.env.MINIO_*`）
@@ -256,7 +256,7 @@ SIP Caller → FreeSWITCH (mod_sofia, SIP/RTP)
     │   ├─ Node ①: agent-asr (:8080) 内置 GPU 推理 → 识别文本
     │   ├─ Node ②/③: MCP client → java-mcp-server (:9090) 用户中心
     │   ├─ Node ⑥: Qwen LLM (GPU2 :8083) → 流式回复文本
-    │   ├─ Node ⑦: agent-tts (:8081) 内置 GPU 推理 → 句级合成音频 → TTSOutputBuffer → 回传 FreeSWITCH
+    │   ├─ Node ⑦: agent-tts (:8081) 内置 GPU 推理 → 句级合成音频 → TelephonyAudioOutput → 回传 FreeSWITCH
     │   └─ FreeSWITCH uuid_record 录双声道 (L=caller / R=AI PCM)
     └─ ESL CHANNEL_HANGUP → uuid_audio_fork stop → ActiveCallRegistry 取消通话
         └─ fire-and-forget _archive_recording (延迟3s 读 FS wav → 上传 MinIO → insert_artifact)
@@ -264,21 +264,24 @@ SIP Caller → FreeSWITCH (mod_sofia, SIP/RTP)
 console (:3001) ⇄ PostgreSQL callbot schema + Redis (prompt 草稿/发布/回滚, DID 路由, 外呼任务, 通话记录, 租户运营)
 ```
 
-Data flow per turn (event-driven, dynamic uuid_audio_fork):
+Data flow per turn (event-driven, livekit AgentSession 无头管线 via dynamic uuid_audio_fork):
 ```
 [事件驱动流程]
 来电: FreeSWITCH 拨号计划 catch-all ^(\d+)$ → answer → playback silence_stream://-1 → 触发 CHANNEL_ANSWER 事件
 路由: ESL handler 提取 uuid/DID/user_key → _resolve_inbound_route(DID) → (tenant_id, biz_type, scenario)
 注册: ActiveCallRegistry.register(uuid, biz_type, user_key, tenant_id, scenario) + insert_call_session
-启动: esl.audio_fork_start() → FS 连接 WebSocket /media/{uuid}
+启动: esl.audio_fork_start() → FS 连接 WebSocket /media/{uuid} → build_agent_session() → session.start(agent)
 录音: FreeSWITCH uuid_record 录双声道（audio_fork_start 之后发起，record bug 排在 WRITE_REPLACE 之后 tap 到 AI 下行）
-音频: JitterBuffer → WebRTCAPM(AEC/NS/AGC)或 Denoiser 降噪 → ASR 全量喂(服务端 FSMN-VAD 分段 → on_final 触发轮次)→ 识别文本
-提示词: get_system_prompt(tenant_id, biz_type, scenario) Redis(5min)→DB 降级 + render.py 变量渲染
+上行: WS 帧 → TelephonyAudioInput.push_bytes → JitterBuffer 平滑 → WebRTCAPM(AEC/NS/AGC)或 Denoiser 降噪 → 增益 → AgentSession
+识别: TransvoiceSTT 插件 → agent-asr WS（FSMN-VAD 服务端分段多 final）→ STT FINAL/EOS 事件（turn_detection="stt" 提交轮次）
+提示词: TransvoiceAgent.llm_node → run_pre_llm_phase: get_system_prompt(tenant_id, biz_type, scenario) Redis(5min)→DB 降级 + render.py 变量渲染
 并行: MCP身份查询 ‖ 记忆召回 ‖ RAG检索 (fan-out 并发)
-决策: LLM 流式输出 → IncrementalJSONParser → SentenceSplitter → 句级文本
-合成: 每句并行 TTS(HTTP/WS) → WAV→PCM → _resample_pcm(22050→16000) → TTSOutputBuffer 稳态30ms帧(960B) → WebSocket → FreeSWITCH
-打断: 用户说话检测 → TTS buffer 清空（不调用 uuid_break，避免终止 dialplan playback）→ 冷却期防误触发 → 新一轮对话
-挂断: ESL CHANNEL_HANGUP → audio_fork_stop → record_stop → ActiveCallRegistry 取消 → _archive_recording(读 FS wav → MinIO) → 清理资源
+决策: astream_reply_text LLM 流式 token 输出（IncrementalJSONParser 提取结构化字段与 action）
+合成: SDK tts_node 分句 → TransvoiceTTS 插件（flush 边界聚合整句 → agent-tts WS，22050Hz PCM，SDK 负责下游重采样）
+下行: TelephonyAudioOutput 30ms 匀速帧(960B) + 静音帧保活(120s 窗口) → WebSocket → FreeSWITCH
+打断: silero VAD（inference.VAD 本地）+ interruption.min_duration → SDK 中断体系清空输出缓冲(clear_buffer) → 新一轮对话（PG call_event 记 barge_in）
+终端动作: LLM action end/handoff → 等 playout 排空(≤10s) → ESL hangup/transfer
+挂断: ESL CHANNEL_HANGUP → audio_fork_stop → record_stop → ActiveCallRegistry 取消 → _archive_recording(读 FS wav → MinIO) → session.aclose
 ```
 
 ### Five Components
@@ -287,13 +290,13 @@ Data flow per turn (event-driven, dynamic uuid_audio_fork):
 
 **agent-tts** — FastAPI + WebSocket service with pluggable TTS engines and built-in GPU inference. Loads CosyVoice3 model directly in-process, no separate inference server needed. Receives text from orchestrator, synthesizes audio, uploads to MinIO. Disk cache keyed by voice+text hash, biz_type voice profiles. Endpoints: `GET /healthz`, streaming text-to-speech WebSocket via `ws_server.py`.
 
-**agent-flow** — FastAPI WebSocket service (uvloop event loop). **Event-driven audio fork**: ESL subscribes to `CHANNEL_ANSWER` + `CHANNEL_HANGUP`. On CHANNEL_ANSWER: parses DID via `_resolve_inbound_route()` → `(tenant_id, biz_type, scenario)`, registers call in `ActiveCallRegistry`, writes `call_session` row (`recording_notice_played`), calls `esl.audio_fork_start()` → FreeSWITCH connects WebSocket to `/media/{uuid}` for bidirectional 16kHz audio. On CHANNEL_HANGUP: calls `esl.audio_fork_stop()` + `cancel_call()` + fire-and-forget `_archive_recording` (delay 3s read FS wav → MinIO upload → `insert_artifact`). **Prompt loading**: three-dimension `get_system_prompt(tenant_id, biz_type, scenario)` — Redis cache `cb:prompt:{tenant_id}:{biz_type}:{scenario}` (5min TTL) → PostgreSQL `callbot.prompt_config` two-level fallback via `prompt_config.py`, then `render.py` variable substitution; prompt content logged per turn. **Call recording**: FreeSWITCH `uuid_record` records dual-channel PCM (L=caller, R=AI TTS) for the whole call — started by agent-flow right after `audio_fork_start` (`RECORD_STEREO=true`), the record bug is registered after mod_audio_fork's `WRITE_REPLACE` bug so it taps the dubbed AI downstream; `CALLBOT_RECORDINGS_DIR/{uuid}.wav` is read by `_archive_recording` on hangup. Streaming mode: LLM tokens streamed via `IncrementalJSONParser`, split into sentences by `SentenceSplitter`, each sentence synthesized by TTS in parallel (WebSocket), resampled from 22050→16000 via `_resample_pcm()`, PCM audio paced through `TTSOutputBuffer` at steady 30ms frames (960B @ 16kHz). TTSOutputBuffer 无 TTS 数据时自动填充静音帧保活（silence_timeout=120s），与拨号计划 `silence_stream://-1` 双重保活。Barge-in: concurrent audio receive during AI speech with RMSGate (RMS+SNR 自适应门禁) detection, clears `TTSOutputBuffer` (not `uuid_break`) to avoid terminating dialplan playback, followed by cooldown period to prevent residual noise false positives. Input audio smoothed through `JitterBuffer`, pre-VAD audio processing via WebRTCAPM (AEC + NS + AGC, `audio_processing.py`) or configurable denoiser (highpass/noisereduce/rnnoise). Endpoints: `GET /healthz`, `WS /media/{uuid}`, `POST /calls/{uuid}/archive-recording` (手动录音归档兜底——自动归档在 MinIO 不可用时静默跳过，本接口事后补归档：读 FS wav → upload_recording → insert_artifact，404/409/410/502 状态码区分未找到/已归档/文件丢失/MinIO 不可用). ASR/TTS 均走 WebSocket(`asr_ws_client.py` / `tts_ws_client.py`)：ASR 经 FSMN-VAD 分段后回推 final → on_final 触发轮次；TTS 句级并发合成。
+**agent-flow** — FastAPI WebSocket service (uvloop event loop). **Event-driven audio fork**: ESL subscribes to `CHANNEL_ANSWER` + `CHANNEL_HANGUP`. On CHANNEL_ANSWER: parses DID via `_resolve_inbound_route()` → `(tenant_id, biz_type, scenario)`, registers call in `ActiveCallRegistry`, writes `call_session` row (`recording_notice_played`), calls `esl.audio_fork_start()` → FreeSWITCH connects WebSocket to `/media/{uuid}` for bidirectional 16kHz audio. On CHANNEL_HANGUP: calls `esl.audio_fork_stop()` + `cancel_call()` + fire-and-forget `_archive_recording` (delay 3s read FS wav → MinIO upload → `insert_artifact`). **Prompt loading**: three-dimension `get_system_prompt(tenant_id, biz_type, scenario)` — Redis cache `cb:prompt:{tenant_id}:{biz_type}:{scenario}` (5min TTL) → PostgreSQL `callbot.prompt_config` two-level fallback via `prompt_config.py`, then `render.py` variable substitution; prompt content logged per turn. **Call recording**: FreeSWITCH `uuid_record` records dual-channel PCM (L=caller, R=AI TTS) for the whole call — started by agent-flow right after `audio_fork_start` (`RECORD_STEREO=true`), the record bug is registered after mod_audio_fork's `WRITE_REPLACE` bug so it taps the dubbed AI downstream; `CALLBOT_RECORDINGS_DIR/{uuid}.wav` is read by `_archive_recording` on hangup. **Conversation pipeline**: livekit-agents `AgentSession` 无头管线（`main.py` `ws_media_fork` → `build_agent_session()` → `session.start(agent)`）——`TelephonyAudioInput`（`JitterBuffer` 平滑 → WebRTCAPM(AEC + NS + AGC, `audio_processing.py`) 或 denoiser (highpass/noisereduce/rnnoise) → 增益）与 `TelephonyAudioOutput`（30ms 匀速帧 960B @ 16kHz + 静音帧保活 silence_timeout=120s，与拨号计划 `silence_stream://-1` 双重保活）实现 SDK `AudioInput`/`AudioOutput` 契约；`TransvoiceAgent.llm_node` 复用 LangGraph 管线（`run_pre_llm_phase` 节点①-⑤ + `astream_reply_text` 节点⑥ 流式 token，`IncrementalJSONParser` 提取结构化字段），节点⑦由 SDK 默认 tts_node（`TransvoiceTTS` 插件）接管；`_PipelineLLM` 占位仅过 SDK 回复调度门禁，真实推理由 llm_node 全覆盖。Barge-in: silero VAD（`inference.VAD` 本地）+ `interruption.min_duration` 检测，SDK 中断体系清空输出缓冲（`clear_buffer`，不调用 `uuid_break`，避免终止 dialplan playback），打断事件经 `on_conversation_item_added` 落 PG `call_event`（`event_type=barge_in`）；轮次提交 `turn_detection="stt"`；终端动作（end/handoff）spawn 任务等 playout 排空（≤10s）后执行 ESL hangup/transfer. Endpoints: `GET /healthz`, `WS /media/{uuid}`, `POST /calls/{uuid}/archive-recording` (手动录音归档兜底——自动归档在 MinIO 不可用时静默跳过，本接口事后补归档：读 FS wav → upload_recording → insert_artifact，404/409/410/502 状态码区分未找到/已归档/文件丢失/MinIO 不可用). ASR/TTS 均走 WebSocket（`src/voice/stt_plugin.py` / `src/voice/tts_plugin.py` 插件逐 call 自建连接）：ASR 经 FSMN-VAD 分段后回推 final → STT EOS 驱动轮次；TTS flush 边界聚合整句合成（22050Hz，SDK 负责下游重采样）.
 
 **java-mcp-server** — Spring Boot 4.0 + Spring AI 2.0.0 (GA) stateless MCP server (WebMVC transport). Serves as the user center backend for orchestrator nodes ② and ③. Uses `@McpTool`/`@McpToolParam` annotations (from `spring-ai-mcp-annotations`) with `annotation-scanner` auto-detection, no manual `ToolCallbackProvider` bean needed. Exposes two MCP tools: `user_identity_query` (phone + biz_type → user_id, phone_masked, id_card_last_four) and `user_credit_query` (user_id → credit_qualified, risk_level). Endpoints: `POST /mcp` (MCP 协议) + `GET /healthz` (探活，供 scripts/local.sh 的 stop_svc 判活) on port 9090.
 
 **console** — Next.js 15 (App Router) + Drizzle ORM + Better Auth management console (port 3001, `console/server/`). Shares the same `callbot` PostgreSQL schema and Redis instance as agent-flow — publish/rollback directly deletes Redis key `cb:prompt:{tenant_id}:{biz_type}:{scenario}` for zero-latency config propagation. Capabilities: three-dimension prompt management (draft/publish/version-rollback/clone/variable-render test), DID inbound route CRUD (`callbot.inbound_route`), outbound call task definitions (`callbot.call_task`) — execution by agent-flow `OutboundExecutor` (tick 轮询 + 时段/并发控制 + CAS 认领 + originate + redial), read-only call records list + detail + recording replay (MinIO presigned URL), and multi-tenant + RBAC (`prompt:*` / `route:*` / `calltask:*` / `call:view` / `tenant:*`). Data model: Drizzle maps `callbot.*` tables read-only (same snake_case column names as agent-flow SQLAlchemy); `prompt_config` / `prompt_version` / `inbound_route` / `call_task` are built by agent-flow alembic, `console.*` (Better Auth + tenant/user_tenant/session) built by console migrations. DID routing: triple `(tenant_id, biz_type, scenario)` resolved by agent-flow at CHANNEL_ANSWER (not hardcoded in dialplan), so adding DIDs/tenants/scenarios in console takes effect immediately without touching FreeSWITCH.
 
-### LangGraph 7-Node Pipeline
+### LangGraph 通话管线（节点①-⑥；⑦ 由 AgentSession tts_node 接管）
 
 ```
 ① receive_asr    — 接收 ASR 文本，加载 Redis 对话历史
@@ -302,14 +305,14 @@ Data flow per turn (event-driven, dynamic uuid_audio_fork):
 ④ recall_memory  — Redis 热记忆 + PG 长期记忆
 ⑤ rag_retrieve   — Agentic RAG (自适应检索 → 文档评分 → 查询改写)
 ⑥ llm_decide     — LLM 结构化输出
-⑦ tts_synthesize — 调用 TTS adapter，保存对话历史
+⑦ tts_synthesize — 已由 AgentSession 默认 tts_node（TransvoiceTTS 插件）接管；对话历史持久化移至 astream_reply_text 流末
 ```
 
-The `(tenant_id, biz_type, scenario, user_key)` tuple threads through the whole pipeline: ① loads the system prompt via `get_system_prompt(tenant_id, biz_type, scenario)` (Redis→DB) + `render.py` variable substitution; turns are persisted to PG via fire-and-forget `fire_insert_turn` (`persistence_helpers.py`).
+The `(tenant_id, biz_type, scenario, user_key)` tuple threads through the whole pipeline: ⑥ `astream_reply_text` loads the system prompt via `get_system_prompt(tenant_id, biz_type, scenario)` (Redis→DB) + `render.py` variable substitution; turns are persisted to PG via fire-and-forget `fire_insert_turn` (`persistence_helpers.py`) at stream end.
 
 Parallel fan-out: nodes ② mcp_identity, ④ recall_memory, ⑤ rag_retrieve execute concurrently after ① receive_asr.
 
-**Streaming mode** (WebSocket path): `run_pre_llm_phase()` runs ① + parallel fan-out, then `run_streaming_pipeline()` streams LLM tokens through `SentenceSplitter`, spawning parallel TTS tasks per sentence with `audio_callback(pcm, index)` for ordered delivery via `TTSOutputBuffer`.
+**Streaming mode** (AgentSession path): `TransvoiceAgent.llm_node` runs `run_pre_llm_phase()` (① + parallel fan-out), then `astream_reply_text(state, on_action)` streams LLM tokens to the SDK（tokenizer 接管分句 → TransvoiceTTS 整句合成）; terminal actions (end/handoff) captured via `on_action` and executed after playout drain.
 
 ### Engine Plugin Pattern (ASR & TTS)
 
@@ -353,22 +356,17 @@ Full adaptive + corrective RAG inside `rag_retrieve_node`:
 - **RAG**: `CALLBOT_RAG_TOP_K` (default 3), `CALLBOT_RAG_SIMILARITY_THRESHOLD` (default 0.7), `CALLBOT_RAG_MAX_RETRIES` (default 2)
 - **ESL**: `CALLBOT_ESL_HOST`, `CALLBOT_ESL_PORT` (default 8021), `CALLBOT_ESL_PASSWORD`, `CALLBOT_HANDOFF_EXT` (default 1001)
 - **Outbound 外呼执行器**: `CALLBOT_OUTBOUND_ENDPOINT_TEMPLATE` (default `user/{phone}@{domain}` — 本地注册分机直连；外呼真实号码需改 `sofia/gateway/<gw>/{phone}`), `CALLBOT_OUTBOUND_DOMAIN` (软电话注册域，= FS `local_ip_v4`；留空则启动时 `_detect_local_ip()` 自动探测本机主网卡 IP——agent-flow 与 FS 同机即注册域零配置可用，端点模板含 `{domain}` 时必填，切 gateway 模板 `sofia/gateway/<gw>/{phone}` 后此项失效), `CALLBOT_OUTBOUND_CODEC_STRING` (default `PCMA`), `CALLBOT_OUTBOUND_CALLER_ID` (主叫号，分机验证阶段可空), `CALLBOT_OUTBOUND_SCHEDULER_TICK_SEC` (default 10), `CALLBOT_OUTBOUND_GLOBAL_CONCURRENCY` (default 0 = 不限，仅 per-task `concurrent_limit` 生效)
-- **RMS gate(barge-in 检测,agent-flow 本地)**: `CALLBOT_RMS_GATE_THRESHOLD` (default 300.0, 帧能量低于此视为静音), `CALLBOT_RMS_GATE_SNR_FACTOR` (default 3.0, 自适应门限 = noise_floor × snr_factor), `CALLBOT_RMS_GATE_NOISE_FLOOR_INIT` (default 300.0), `CALLBOT_RMS_GATE_NOISE_ADAPT_RATE` (default 0.1, EMA 底噪更新率)
-- **VAD 端点检测**: 由 agent-asr FSMN-VAD 服务端分段 → 主动推 `result/is_final` → agent-flow `on_final` 回调触发轮次(无本地 VAD 引擎)
-- **Barge-in cooldown**: `CALLBOT_COOLDOWN_AFTER_BARGEIN` (default 0.5s, barge-in 后丢弃残余音频防误触发)
-- **Barge-in**: `CALLBOT_BARGE_IN_MIN_AUDIO_BYTES` (default 1600, 触发 barge-in 的最小累积音频量)
-- **Media**: `CALLBOT_MEDIA_SAMPLE_RATE` (default 16000), 全链路 16kHz，帧大小 960B (30ms @ 16kHz 16-bit)，TTS 输出 22050Hz 经 `_resample_pcm()` 降采样到 16kHz，FreeSWITCH 内部下采样到 G.711 8kHz
+- **VAD 端点检测/打断**: 轮次端点由 agent-asr FSMN-VAD 服务端分段 → TransvoiceSTT 映射为 STT FINAL/EOS 事件驱动（`turn_detection="stt"`）；打断检测为本地 silero VAD（`inference.VAD`，随 livekit-agents 自带模型），仅辅助打断、不参与轮次判定
+- **Endpointing**: `CALLBOT_ENDPOINTING_MIN_DELAY` (default 0.1s, STT EOS 后到提交轮次的等待窗口下限——FSMN 分段已含端点判定，故远小于 SDK 默认 0.5), `CALLBOT_ENDPOINTING_MAX_DELAY` (default 2.0s, 窗口上限)
+- **Interruption**: `CALLBOT_INTERRUPTION_MIN_DURATION` (default 0.5s, 触发 barge-in 的最小说话时长，短于此视作噪声不触发打断)
+- **Media**: `CALLBOT_MEDIA_SAMPLE_RATE` (default 16000), 全链路 16kHz，帧大小 960B (30ms @ 16kHz 16-bit)，TTS 输出 22050Hz 由 SDK 重采样到 16kHz（TelephonyAudioOutput 30ms 匀速排出），FreeSWITCH 内部下采样到 G.711 8kHz
 - **Jitter Buffer**: `CALLBOT_JITTER_TARGET_DEPTH` (default 3), `CALLBOT_JITTER_MAX_DEPTH` (default 10)
 - **Denoise**: `CALLBOT_DENOISE_ENABLED` (`""` disabled, `"highpass"`, `"noisereduce"`, `"rnnoise"`), `CALLBOT_DENOISE_HIGHPASS_CUTOFF` (default 200.0 Hz) — 互斥于 AEC：开启 WebRTCAPM 时不再走 denoiser
 - **WebRTC APM (AEC + NS + AGC)**: `CALLBOT_AEC_ENABLED` (default false, 替换 denoise + 固定增益), `CALLBOT_AEC_TYPE` (default 2, 1=AECM 移动端 / 2=老AEC), `CALLBOT_AEC_NS_LEVEL` (default 2, 0-3), `CALLBOT_AEC_AGC_TYPE` (default 1, 0=关/1=AdaptiveDigital/2=AdaptiveAnalog), `CALLBOT_AEC_SYSTEM_DELAY_MS` (default 80, 回声延迟先验)
 - **Audio gain**: `CALLBOT_AUDIO_GAIN` (default 1.0, pre-ASR amplification for quiet SIP audio; AEC 开启时 AGC 由 WebRTCAPM 逐帧处理，不再叠加固定增益)
-- **ASR WebSocket**: `CALLBOT_ASR_WS_URL` (default `ws://127.0.0.1:8080/ws/asr/streaming-recognize`, 唯一传输)
-- **TTS WebSocket**: `CALLBOT_TTS_WS_URL` (default `ws://127.0.0.1:8081/ws/tts/streaming-synthesize`, 唯一传输)
-- **Streaming ASR**: `CALLBOT_ASR_STREAMING_ENABLED` (default false, engine-level streaming)
-- **Streaming TTS**: `CALLBOT_TTS_STREAMING_ENABLED` (default false, chunk-level streaming)
-- **TTS pre-buffer**: `CALLBOT_TTS_PREBUFFER_FRAMES` (default 0, accumulate N 30ms frames before playback)
-- **TTS skip**: `CALLBOT_TTS_SKIP` (default false, local testing without GPU)
-- **Sentence splitter**: `CALLBOT_SPLITTER_MIN_LENGTH` (default 2), `CALLBOT_SPLITTER_FLUSH_TIMEOUT` (default 0.2), `CALLBOT_SPLITTER_EAGER_FIRST` (default true)
+- **ASR WebSocket**: `CALLBOT_ASR_WS_URL` (default `ws://127.0.0.1:8080/ws/asr/streaming-recognize`, 唯一传输，TransvoiceSTT 插件逐 call 自建连接)
+- **TTS WebSocket**: `CALLBOT_TTS_WS_URL` (default `ws://127.0.0.1:8081/ws/tts/streaming-synthesize`, 唯一传输，TransvoiceTTS 插件逐 call 自建共享连接 + request_id 解复用)
+- **TTS pre-buffer**: `CALLBOT_TTS_PREBUFFER_FRAMES` (default 0, accumulate N 30ms frames before playback，TelephonyAudioOutput 每段重新预缓冲)
 - **CosyVoice device**: `COSYVOICE_DEVICE` (engine-level, `cpu`/`mps`/`auto`, local.sh defaults to `cpu` on Mac to avoid MPS fallback overhead)
 - **uvloop**: enabled via Dockerfile CMD `--loop uvloop`, no config needed
 - **MCP Server**: `application.yaml` with `spring.ai.mcp.server.*` properties, STATELESS protocol, WebMVC transport, `annotation-scanner.enabled: true`, port 9090
@@ -379,25 +377,26 @@ Full adaptive + corrective RAG inside `rag_retrieve_node`:
 
 | Module | Role |
 |--------|------|
-| `main.py` | FastAPI app with lifespan init, ESL lifecycle, `WS /media/{uuid}` (event-driven audio fork), `GET /healthz`, `POST /calls/{uuid}/archive-recording` (手动录音归档兜底) |
+| `main.py` | FastAPI app with lifespan init, ESL lifecycle, `WS /media/{uuid}` (uuid_audio_fork 端点 → `build_agent_session` → `session.start`，收帧 `push_bytes`/stop/挂断检测 → `session.aclose`), `GET /healthz`, `POST /calls/{uuid}/archive-recording` (手动录音归档兜底) |
 | `src/config.py` | pydantic-settings, all config via `CALLBOT_` env prefix |
 | `src/database.py` | SQLAlchemy 2.0 async engine + session factory |
-| `src/graph/flow.py` | LangGraph 7-node StateGraph pipeline + `run_pre_llm_phase` / `run_streaming_pipeline` for streaming mode |
+| `src/graph/flow.py` | 通话管线节点函数（①-⑤ asr/mcp_identity/credit_query/recall_memory/rag_retrieve）+ `run_pre_llm_phase`（①+并行扇出组装 state）/ `astream_reply_text`（⑥ prompt 三维加载+LLM 流式 token+action 回调，流末持久化历史）——供 `TransvoiceAgent.llm_node` 消费 |
 | `src/graph/prompt.py` | System prompt + RAG + memory + chat history assembly |
 | `src/graph/prompt_config.py` | Prompt loading — Redis cache (5min TTL) → DB `prompt_config` table two-level fallback |
 | `src/clients/mcp.py` | MCP client → java-mcp-server (identity/credit query via langchain-mcp-adapters) |
 | `src/clients/esl.py` | Async ESL client → FreeSWITCH Event Socket (auto-reconnect, heartbeat, hangup, transfer, break_media, event subscription) |
-| `src/clients/asr_ws_client.py` | ASR WebSocket client — streaming audio recognition (唯一传输) |
-| `src/clients/tts_ws_client.py` | TTS WebSocket client — streaming text-to-speech (唯一传输) |
-| `src/ws/handler.py` | WebSocket handler: `StreamingCallHandler` (streaming + barge-in, event-driven audio processing, wires WebRTCAPM) |
-| `src/ws/rms_gate.py` | `RMSGate` — RMS+SNR 自适应门禁(barge-in 检测) |
+| `src/voice/io.py` | `TelephonyAudioInput`（push_bytes → JitterBuffer → WebRTCAPM/denoiser → 增益 → AudioFrame）/ `TelephonyAudioOutput`（capture_frame/flush/clear_buffer/pause/resume + 播放事件契约 + 30ms 匀速 + 静音保活 + AEC 远端参考 recent_reverse）— mod_audio_fork WS ↔ AgentSession 音频桥 |
+| `src/voice/stt_plugin.py` | `TransvoiceSTT` 插件 — agent-asr WS（FSMN-VAD 服务端分段多 final）→ STT 事件流（SOS/FINAL/EOS 映射、短 final 丢弃、上游故障可重试分类） |
+| `src/voice/tts_plugin.py` | `TransvoiceTTS` 插件 — flush 边界聚合整句 → agent-tts WS 合成（22050Hz），共享连接 + request_id 解复用，segment 取消迟到音频过滤 |
+| `src/voice/agent.py` | `TransvoiceAgent` — llm_node 复用 LangGraph 管线（run_pre_llm_phase + astream_reply_text）；`CallContext`；终端动作等 playout 排空后执行；`on_conversation_item_added` 打断落 PG；`execute_terminal_action` ESL hangup/transfer |
+| `src/voice/session.py` | `build_agent_session` 工厂 — AgentSession 装配（STT/TTS 插件、silero VAD、turn_handling 映射 endpointing/interruption 配置、`aec_warmup_duration=None`、`_PipelineLLM` 占位） |
+| `src/ws/esl_events.py` | ESL 事件处理（CHANNEL_ANSWER → 路由解析/注册/audio_fork_start/录音；CHANNEL_HANGUP → 录音归档 fire-and-forget/外呼重拨终态判定/停止注销） |
 | `src/ws/denoise.py` | Configurable pre-VAD denoiser (highpass/noisereduce/rnnoise), factory via `CALLBOT_DENOISE_ENABLED` |
 | `src/ws/audio_processing.py` | `WebRTCAPM` — livekit AudioProcessingModule 帧级封装 (AEC + NS + AGC + HPF), replaces denoise + fixed gain when `CALLBOT_AEC_ENABLED=true`; `create_audio_processing()` factory |
-| `src/ws/jitter_buffer.py` | `JitterBuffer` (input smoothing, 960B frames @ 16kHz) + `TTSOutputBuffer` (steady 30ms frame delivery) |
+| `src/ws/jitter_buffer.py` | `JitterBuffer` (input smoothing, 960B frames @ 16kHz) + 帧常量（`FRAME_BYTES`/`FRAME_DURATION_MS`/`SILENCE_FRAME`，供 `voice/io.py` 复用） |
 | `src/ws/registry.py` | `ActiveCallRegistry` — per-call `asyncio.Event` for CHANNEL_HANGUP cancellation; carries `(tenant_id, biz_type, scenario)` + `call_target_vars`（外呼每号码 render 变量，呼入恒 {}） |
 | `src/llm/service.py` | LangChain ChatOpenAI with structured output + streaming + embeddings |
 | `src/llm/json_stream.py` | `IncrementalJSONParser` — extracts structured fields from LLM token stream |
-| `src/llm/sentence_splitter.py` | `SentenceSplitter` — splits streaming tokens into TTS-ready sentences |
 | `src/memory/assembler.py` | Aggregates Redis hot facts + PG long-term facts |
 | `src/memory/chat_history.py` | langchain-redis `RedisChatMessageHistory` conversation memory |
 | `src/memory/redis_memory.py` | Per-user hot fact storage (Redis hash) |
@@ -436,17 +435,19 @@ aiphone/
 │   ├── Dockerfile       # PyTorch GPU image, model download
 │   ├── README.md        # Component docs
 │   └── tests/           # (empty, pending)
-├── agent-flow/  # LangGraph 7-node pipeline (FastAPI HTTP + WebSocket)
+├── agent-flow/  # LangGraph 管线 + livekit AgentSession (FastAPI HTTP + WebSocket)
 │   ├── main.py          # FastAPI entry point (HTTP + WebSocket + ESL lifecycle)
 │   ├── src/             # 核心源码 (PYTHONPATH includes src/)
-│   │   ├── config.py    # pydantic-settings (ESL/VAD/jitter/barge-in/AEC/recording configs)
+│   │   ├── config.py    # pydantic-settings (ESL/endpointing/interruption/jitter/AEC/recording configs)
 │   │   ├── database.py  # SQLAlchemy async engine
-│   │   ├── clients/     # mcp.py, esl.py, asr_ws_client.py, tts_ws_client.py
-│   │   ├── ws/          # handler.py (StreamingCallHandler, TurnController+on_final+barge-in+APM), rms_gate.py (RMS 门禁),
-│   │   │                # audio_processing.py (WebRTCAPM AEC),
+│   │   ├── clients/     # mcp.py, esl.py
+│   │   ├── voice/       # livekit AgentSession 管线层: io.py (TelephonyAudioInput/Output),
+│   │   │                # stt_plugin.py (TransvoiceSTT), tts_plugin.py (TransvoiceTTS),
+│   │   │                # agent.py (TransvoiceAgent/CallContext), session.py (build_agent_session)
+│   │   ├── ws/          # audio_processing.py (WebRTCAPM AEC), esl_events.py (ESL 事件+归档),
 │   │   │                # jitter_buffer.py, registry.py (ActiveCallRegistry), denoise.py
-│   │   ├── graph/       # flow.py, prompt.py, prompt_config.py (Redis→DB prompt loading), render.py (变量渲染)
-│   │   ├── llm/         # service.py, json_stream.py, sentence_splitter.py
+│   │   ├── graph/       # flow.py (run_pre_llm_phase/astream_reply_text), prompt.py, prompt_config.py (Redis→DB prompt loading), render.py (变量渲染)
+│   │   ├── llm/         # service.py, json_stream.py
 │   │   ├── memory/      # assembler.py, chat_history.py, redis_memory.py, store.py
 │   │   ├── rag/         # retriever.py (Agentic RAG)
 │   │   ├── db/          # models.py (ORM, 13 tables)
@@ -454,10 +455,10 @@ aiphone/
 │   ├── llm/             # Qwen LLM 推理引擎 Dockerfile (vLLM)
 │   ├── alembic/         # DB migrations (0001_init_full_schema — 合并旧 0001-0005 全量初始化)
 │   ├── alembic.ini      # Alembic config
-│   ├── requirements.txt # Python dependencies
+│   ├── requirements.txt # Python dependencies (livekit-agents>=1.8.3,<1.9)
 │   ├── Dockerfile       # Application image (auto alembic upgrade head)
 │   ├── README.md        # Component docs
-│   └── tests/           # (empty, pending)
+│   └── tests/           # voice/ (io/插件/agent/集成), ws/, graph/, outbound/ + 归档/MinIO/persistence 用例
 ├── agent-mcp/                # MCP servers (user center backend)
 │   └── java-mcp-server/ # Spring Boot 4.0 + Spring AI 2.0.0 (GA) stateless MCP server
 │       ├── src/main/java/com/trans/mcp/
@@ -508,6 +509,6 @@ aiphone/
 - **Java MCP Server** Spring Boot 4.0 + Spring AI 2.0.0 (GA), Java 21, Maven build, `@McpTool` annotation-driven tool registration
 - **GPU allocation**: ASR=GPU0 (agent-asr内置), TTS=GPU1 (agent-tts内置), LLM(Qwen3.5:4B-instruct)=GPU2(:8083)
 - **uvloop**: libuv C-based event loop replacing std asyncio in agent-flow (via `--loop uvloop`), reduces GC pauses under high concurrency
-- **WebSocket**: ASR/TTS 唯一传输 (`ws_server.py` in agent-asr/agent-tts, `asr_ws_client.py`/`tts_ws_client.py` in agent-flow)；ASR 经 FSMN-VAD 分段 + 多 final 驱动 agent-flow 轮次。
+- **WebSocket**: ASR/TTS 唯一传输 (`ws_server.py` in agent-asr/agent-tts, `src/voice/stt_plugin.py`/`src/voice/tts_plugin.py` 插件 in agent-flow)；ASR 经 FSMN-VAD 分段 + 多 final 映射为 STT 事件驱动 AgentSession 轮次（`turn_detection="stt"`）。
 - **ESL**: Auto-reconnect with heartbeat detection (read error triggers reconnect), subscribes to CHANNEL_ANSWER + CHANNEL_HANGUP; dynamic `uuid_audio_fork` start/stop per call lifecycle; `break_media` uses fire-and-forget (bypasses lock contention)
 - **Docker Compose**: `docker-compose.yml` (base) + `docker-compose.prod.yml` (production overrides with MCP server), GPU pinning, health checks, ordered startup
