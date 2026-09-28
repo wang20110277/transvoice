@@ -94,8 +94,8 @@ async def lifespan(app: FastAPI):
     # ── ① 核心服务 ──
     assembler, mcp = await _init_core_services()
 
-    # ── ② 注入 flow.py 服务单例（ASR/TTS WS 客户端参数 Task 9 收敛，暂传 None）──
-    set_services(assembler, mcp, tts_ws=None, asr_ws=None)
+    # ── ② 注入 flow.py 服务单例 ──
+    set_services(assembler, mcp)
     logger.info("ASR/TTS WS clients: per-call, owned by voice plugins (%s / %s)",
                 settings.asr_ws_url, settings.tts_ws_url)
 
@@ -135,19 +135,18 @@ async def lifespan(app: FastAPI):
 def _log_startup_summary() -> None:
     """输出启动配置摘要。"""
     logger.info("──────────────────────────────────────")
-    logger.info("  RMS gate: threshold=%.0f snr=%.1f", settings.rms_gate_threshold, settings.rms_gate_snr_factor)
+    logger.info("  Pipeline: livekit AgentSession (TransvoiceSTT → Agent → TransvoiceTTS)")
+    logger.info("  Endpointing: min=%.1fs max=%.1fs  Interruption: min_duration=%.1fs",
+                settings.endpointing_min_delay, settings.endpointing_max_delay,
+                settings.interruption_min_duration)
     logger.info("  Denoise: %s", settings.denoise_enabled or "disabled")
     logger.info("  AEC/APM: enabled=%s type=%d ns=%d agc=%d delay=%dms",
                 settings.aec_enabled, settings.aec_type,
                 settings.aec_ns_level, settings.aec_agc_type, settings.aec_system_delay_ms)
-    logger.info("  ASR streaming: %s", settings.asr_streaming_enabled)
-    logger.info("  TTS streaming: %s", settings.tts_streaming_enabled)
-    logger.info("  Splitter: min=%d timeout=%.1fs eager_first=%s",
-                settings.splitter_min_length, settings.splitter_flush_timeout, settings.splitter_eager_first)
-    logger.info("  Audio: sample_rate=%d gain=%.1fx jitter=%d-%d",
+    logger.info("  Audio: sample_rate=%d gain=%.1fx jitter=%d-%d prebuffer=%d frames",
                 settings.media_sample_rate, settings.audio_gain,
-                settings.jitter_target_depth, settings.jitter_max_depth)
-    logger.info("  Barge-in: min_bytes=%d", settings.barge_in_min_audio_bytes)
+                settings.jitter_target_depth, settings.jitter_max_depth,
+                settings.tts_prebuffer_frames)
     logger.info("──────────────────────────────────────")
     logger.info("  Agent Orchestrator ready (port %d)", settings.media_ws_port)
     logger.info("══════════════════════════════════════")

@@ -75,24 +75,6 @@ class Settings(BaseSettings):
     # Audio temp
     temp_dir: str = "/tmp/aiphone_tts"
 
-    # RMS 门禁(barge-in 低延迟语音检测,RMS+SNR 自适应底噪)
-    # 帧能量低于 threshold 视为静音(过滤 SIP 底噪);snr_factor>0 时门限=noise_floor*snr_factor
-    rms_gate_threshold: float = 300.0
-    # 自适应噪声底噪:门限随环境底噪浮动(安静时低、嘈杂时抬高),解决固定门限在嘈杂环境失效
-    rms_gate_snr_factor: float = 3.0
-    # 初始噪声底噪估计(启动/换通话的 warm-up 基线)
-    rms_gate_noise_floor_init: float = 300.0
-    # 底噪 EMA 更新率(0-1,越大越快收敛);0.1 ≈ 1s 收敛
-    rms_gate_noise_adapt_rate: float = 0.1
-
-    # Barge-in
-    barge_in_min_audio_bytes: int = 1600
-    # Barge-in RMS 阈值:AEC 场景调高(过滤残留回声尖峰),默认 300;.env 实测调优 1500
-    barge_in_rms_threshold: int = 300
-
-    # Barge-in 后冷却(秒):丢弃残余音频防 RMS 误触发
-    cooldown_after_bargein: float = 0.5
-
     # Jitter Buffer
     jitter_target_depth: int = 3
     jitter_max_depth: int = 10
@@ -116,30 +98,16 @@ class Settings(BaseSettings):
     aec_agc_type: int = 1  # 0=关, 1=AdaptiveDigital, 2=AdaptiveAnalog
     aec_system_delay_ms: int = 80  # 回声延迟先验(毫秒)，has_echo 监控后标定
 
-    # TTS skip (local testing without GPU)
-    tts_skip: bool = False
-
-    # ASR WebSocket —— 唯一传输方式。
+    # ASR WebSocket —— voice 插件逐 call 自建连接（TransvoiceSTT）。
     # WS 是端点检测的唯一来源:服务端 FSMN-VAD 分段后回推 result,经 on_final 触发轮次。
     asr_ws_url: str = "ws://127.0.0.1:8080/ws/asr/streaming-recognize"
 
-    # TTS WebSocket —— 唯一传输方式。
+    # TTS WebSocket —— voice 插件逐 call 自建连接（TransvoiceTTS）。
     tts_ws_url: str = "ws://127.0.0.1:8081/ws/tts/streaming-synthesize"
-
-    # Streaming ASR (engine-level streaming, requires streaming-capable engine)
-    asr_streaming_enabled: bool = False
-
-    # Streaming TTS (chunk-level streaming, requires CosyVoice stream=True)
-    tts_streaming_enabled: bool = False
 
     # TTS pre-buffering: accumulate N 30ms frames before starting playback
     # 0 = no pre-buffering, 10 = 300ms latency for smoother inter-sentence output
     tts_prebuffer_frames: int = 0
-
-    # Sentence splitter tuning (streaming optimization)
-    splitter_min_length: int = 2
-    splitter_flush_timeout: float = 0.2
-    splitter_eager_first: bool = True
 
     # 录音归档（FS record_session 写入路径，agent-flow 读取路径）
     recordings_dir: str = "/Users/lindaw/freeswitch/var/lib/freeswitch/recordings"

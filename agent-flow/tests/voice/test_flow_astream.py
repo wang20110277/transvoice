@@ -74,4 +74,4 @@ async def test_action_default_say_when_missing(monkeypatch):
              "chat_history": [], "call_task_vars": {}}
     actions: list[str] = []
     _ = [t async for t in flow.astream_reply_text(state, on_action=actions.append)]
-    assert actions == ["say"]  # 兜底（对齐原 run_streaming_pipeline 行为）
+    assert actions == ["say"]  # 兜底：LLM 未产出 action 时默认 say

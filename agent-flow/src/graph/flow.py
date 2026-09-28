@@ -1,15 +1,13 @@
-"""通话编排管线 — Pre-LLM 阶段 + 流式 LLM/TTS 管线。
+"""通话编排管线 — Pre-LLM 阶段 + 流式文本输出。
 
-对外暴露两个函数，由 handler.py 通过函数注入调用：
-  - run_pre_llm_phase()   — ASR 识别 + 并行扇出（MCP/记忆/RAG）
-  - run_streaming_pipeline() — LLM 流式输出 → 句级 TTS → 音频回调
+对外暴露两个函数，由 voice 插件（TransvoiceAgent llm_node）调用：
+  - run_pre_llm_phase()  — ASR 文本接入 + 并行扇出（MCP/记忆/RAG）
+  - astream_reply_text() — LLM 流式回复文本迭代器（SDK tokenizer 接管分句→TTS）
 
 调用链路：
-  main.py::lifespan()
-    → StreamingCallHandler(pre_llm_fn=run_pre_llm_phase, streaming_fn=run_streaming_pipeline)
-    → handler._process_streaming_turn()
-        ├── run_pre_llm_phase()       ← Phase 1: ASR + MCP/Memory/RAG 并行
-        └── run_streaming_pipeline()  ← Phase 2: LLM 流式 → SentenceSplitter → 句级 TTS
+  main.py::ws_media_fork() → AgentSession → TransvoiceAgent.llm_node
+    ├── run_pre_llm_phase()   ← Phase 1: ASR 接入 + MCP/Memory 并行
+    └── astream_reply_text()  ← Phase 2: LLM 流式 token → yield（节点 ⑦ 由 SDK TTS 接管）
 """
 import asyncio
 import logging
@@ -18,12 +16,9 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from inspect import isawaitable
 from typing import TypedDict
 
-import numpy as np
-
 from langchain_core.messages import BaseMessage
 
-from llm.service import LLMAction, get_llm_service
-from llm.sentence_splitter import Sentence
+from llm.service import get_llm_service
 from config import settings
 from rag.retriever import retrieve_scripts, build_rag_block, should_retrieve, grade_documents, rewrite_query
 from graph.prompt import build_messages
@@ -31,8 +26,6 @@ from graph.render import render
 from memory.assembler import MemoryAssembler
 from memory.chat_history import load_chat_history, save_turn
 from clients.mcp import MCPClient
-from clients.tts_ws_client import TTSWebSocketClient
-from clients.asr_ws_client import ASRWebSocketClient
 from storage import minio_storage
 from storage.persistence_helpers import fire_insert_turn
 
@@ -44,23 +37,13 @@ logger = logging.getLogger(__name__)
 
 _assembler: MemoryAssembler | None = None
 _mcp_client: MCPClient | None = None
-_tts_ws_client: TTSWebSocketClient | None = None
-_asr_ws_client: ASRWebSocketClient | None = None
 
 
-def set_services(
-    assembler: MemoryAssembler,
-    mcp: MCPClient,
-    tts_ws: TTSWebSocketClient | None = None,
-    asr_ws: ASRWebSocketClient | None = None,
-) -> None:
-    global _assembler, _mcp_client, _tts_ws_client, _asr_ws_client
+def set_services(assembler: MemoryAssembler, mcp: MCPClient) -> None:
+    global _assembler, _mcp_client
     _assembler = assembler
     _mcp_client = mcp
-    _tts_ws_client = tts_ws
-    _asr_ws_client = asr_ws
-    logger.info("flow services injected: mcp=%s tts_ws=%s asr_ws=%s",
-                mcp is not None, tts_ws is not None, asr_ws is not None)
+    logger.info("flow services injected: mcp=%s", mcp is not None)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -82,41 +65,11 @@ class CallGraphState(TypedDict, total=False):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 内部工具函数
-# ═══════════════════════════════════════════════════════════════════
-
-WAV_HEADER_SIZE = 44
-
-
-def _strip_wav_header(wav_bytes: bytes) -> bytes:
-    """剥离 44 字节 WAV 头，返回原始 PCM。"""
-    if len(wav_bytes) > WAV_HEADER_SIZE and wav_bytes[:4] == b'RIFF':
-        return wav_bytes[WAV_HEADER_SIZE:]
-    return wav_bytes
-
-
-def _resample_pcm(pcm: bytes, orig_rate: int, target_rate: int) -> bytes:
-    """PCM int16 重采样 (numpy 线性插值)。"""
-    if orig_rate == target_rate or not pcm:
-        return pcm
-    samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
-    target_len = int(len(samples) * target_rate / orig_rate)
-    if target_len == 0:
-        return b""
-    resampled = np.interp(
-        np.linspace(0, len(samples) - 1, target_len),
-        np.arange(len(samples)),
-        samples,
-    )
-    return resampled.astype(np.int16).tobytes()
-
-
-# ═══════════════════════════════════════════════════════════════════
 # Node 函数 — 被 run_pre_llm_phase 调用
 # ═══════════════════════════════════════════════════════════════════
 
 async def _asr_node(state: CallGraphState) -> dict:
-    """Node ①: ASR 语音识别（WebSocket 传输）。"""
+    """Node ①: ASR 文本接入（识别由 TransvoiceSTT 逐 call WS 完成，audio_bytes 仅归档）。"""
     call_id = state.get("call_id", "?")
     audio_bytes = state.get("audio_bytes")
 
@@ -124,21 +77,8 @@ async def _asr_node(state: CallGraphState) -> dict:
         asr_minio_key = minio_storage.build_object_key(prefix="asr", call_id=call_id)
         if asr_minio_key:
             asyncio.create_task(minio_storage.upload_audio_async(audio_bytes, asr_minio_key))
-        if _asr_ws_client is None:
-            logger.warning("[%s] no ASR WS client available", call_id)
-            user_input = ""
-        else:
-            try:
-                asr_result = await _asr_ws_client.recognize(audio_bytes, call_id)
-                user_input = asr_result.get("text", "") if asr_result else ""
-                logger.info("[%s] ASR: %s", call_id, user_input[:50])
-            except Exception as e:
-                logger.error("[%s] ASR failed: %s", call_id, e)
-                user_input = ""
-    else:
-        user_input = state.get("user_input", "")
 
-    return {"user_input": user_input}
+    return {"user_input": state.get("user_input", "")}
 
 
 async def _mcp_identity_node(state: CallGraphState) -> dict:
@@ -256,7 +196,7 @@ async def run_pre_llm_phase(
             呼入/无变量时 {} (flow.py 下游 state.get 已就绪消费)
 
     Returns:
-        组装好的 CallGraphState，供 run_streaming_pipeline 使用
+        组装好的 CallGraphState，供 astream_reply_text 使用
     """
     t0 = time.monotonic()
     logger.info(
@@ -314,172 +254,7 @@ async def run_pre_llm_phase(
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Phase 2: 流式 LLM + TTS 管线
-# ═══════════════════════════════════════════════════════════════════
-
-async def run_streaming_pipeline(
-    state: CallGraphState,
-    audio_callback: Callable[[bytes, int], Awaitable[None]],
-    action_callback: Callable[[str], Awaitable[None]] | None = None,
-) -> LLMAction:
-    """Phase 2: LLM 流式输出 → SentenceSplitter 句级切分 → 并行 TTS → 音频回调。
-
-    Args:
-        state: run_pre_llm_phase 返回的 state（含 memory_block, rag_block 等）
-        audio_callback: (pcm_bytes, sentence_index) 每句 TTS 音频就绪时调用
-        action_callback: action 类型确定时调用
-    """
-    from llm.sentence_splitter import SentenceSplitter
-
-    llm = get_llm_service()
-    call_id = state.get("call_id", "?")
-    biz_type = state["biz_type"]
-    t0 = time.monotonic()
-
-    # ── 构建 Prompt ──
-    from graph.prompt_config import get_system_prompt
-    tenant_id = state.get("tenant_id", "default")
-    scenario = state.get("scenario", "default")
-    system_prompt = await get_system_prompt(tenant_id, biz_type, scenario)
-    logger.info(
-        "[%s] tenant=%s biz_type=%s scenario=%s prompt loaded: %d chars",
-        call_id, tenant_id, biz_type, scenario, len(system_prompt),
-    )
-
-    # 聚合变量上下文:MCP 身份 ‖ 记忆 ‖ 外呼 call_task.vars(渲染 {占位符})
-    vars_context: dict = {}
-    identity = state.get("identity")
-    if isinstance(identity, dict):
-        vars_context.update(identity)
-    call_task_vars = state.get("call_task_vars")
-    if isinstance(call_task_vars, dict):
-        vars_context.update(call_task_vars)
-    rendered_prompt = render(system_prompt, vars_context)
-    logger.info("[%s] rendered system_prompt (vars=%s):\n%s", call_id, list(vars_context), rendered_prompt)
-
-    messages = build_messages(
-        biz_type=biz_type,
-        system_prompt=rendered_prompt,
-        user_input=state["user_input"],
-        memory_block=state.get("memory_block", ""),
-        rag_block=state.get("rag_block", ""),
-        chat_history=state.get("chat_history", []),
-    )
-
-    # ── TTS 句级合成 ──
-    splitter = SentenceSplitter(
-        min_length=settings.splitter_min_length,
-        flush_timeout=settings.splitter_flush_timeout,
-        eager_first=settings.splitter_eager_first,
-    )
-    action_sent = False
-    detected_action: str = "say"
-    full_text = ""
-    tts_tasks: list[asyncio.Task] = []
-
-    async def _tts_sentence(sentence: Sentence) -> None:
-        """TTS 合成单句 → 重采样 → 回调发送。"""
-        if not sentence.text:
-            return
-
-        # Streaming TTS: WS 逐块返回原始 PCM
-        if settings.tts_streaming_enabled and _tts_ws_client:
-            try:
-                async for chunk in _tts_ws_client.synthesize_streaming_raw(
-                    sentence.text, call_id, biz_type,
-                ):
-                    if chunk:
-                        resampled = _resample_pcm(chunk, 22050, settings.media_sample_rate)
-                        await audio_callback(resampled, sentence.index)
-                return
-            except Exception as e:
-                logger.error("[%s] streaming TTS sentence %d failed: %s", call_id, sentence.index, e)
-                return
-
-        # Batch TTS: WS 合成（句级并发）
-        if _tts_ws_client is None:
-            logger.warning("[%s] no TTS WS client for sentence %d", call_id, sentence.index)
-            return
-        try:
-            wav = await _tts_ws_client.synthesize_raw(sentence.text, call_id, biz_type)
-            if wav:
-                pcm = _strip_wav_header(wav)
-                pcm = _resample_pcm(pcm, 22050, settings.media_sample_rate)
-                await audio_callback(pcm, sentence.index)
-                logger.debug("[%s] TTS sentence %d: %d bytes", call_id, sentence.index, len(pcm))
-        except Exception as e:
-            logger.error("[%s] TTS sentence %d failed: %s", call_id, sentence.index, e)
-
-    # ── 流式 LLM ──
-    try:
-        async for event in llm.astream_action([m.model_dump() for m in messages]):
-            if event.action and not action_sent:
-                action_sent = True
-                detected_action = event.action
-                if action_callback:
-                    await action_callback(event.action)
-
-            if event.text_delta:
-                full_text += event.text_delta
-                for s in splitter.feed(event.text_delta):
-                    tts_tasks.append(asyncio.create_task(_tts_sentence(s)))
-
-            for s in splitter.check_timeout():
-                tts_tasks.append(asyncio.create_task(_tts_sentence(s)))
-
-            if event.is_complete:
-                logger.info("[%s] LLM complete: action=%s text=%s", call_id, detected_action, full_text)
-                final_sent = splitter.flush()
-                if final_sent:
-                    tts_tasks.append(asyncio.create_task(_tts_sentence(final_sent)))
-                if not full_text and event.parsed:
-                    full_text = event.parsed.get("text", "")
-
-    except asyncio.CancelledError:
-        logger.info("[%s] streaming pipeline cancelled, cancelling %d TTS tasks", call_id, len(tts_tasks))
-        for t in tts_tasks:
-            if not t.done():
-                t.cancel()
-        if tts_tasks:
-            await asyncio.gather(*tts_tasks, return_exceptions=True)
-        raise
-    except Exception as e:
-        logger.error("[%s] streaming LLM failed: %s", call_id, e)
-
-    # 兜底: 确保 action 已发送
-    if not action_sent and action_callback:
-        await action_callback("say")
-
-    # 等待所有 TTS 任务完成
-    if tts_tasks:
-        await asyncio.gather(*tts_tasks, return_exceptions=True)
-
-    # 持久化本轮对话 (plain Redis LIST),供下一轮加载,避免 LLM 每轮丢失上下文/重复问候
-    if full_text.strip():
-        await save_turn(call_id, biz_type, state.get("user_input", ""), full_text)
-
-        # PG call_turn 双写（console 审查持久化；fire-and-forget 不阻断下一轮）
-        _user_key = state.get("user_key", "")
-        if state.get("user_input", "").strip():
-            fire_insert_turn(
-                call_id=call_id, fs_uuid=call_id, biz_type=biz_type,
-                user_id=_user_key, user_key=_user_key, role="user",
-                text=state.get("user_input", ""),
-            )
-        fire_insert_turn(
-            call_id=call_id, fs_uuid=call_id, biz_type=biz_type,
-            user_id=_user_key, user_key=_user_key, role="assistant", text=full_text,
-        )
-
-    elapsed = (time.monotonic() - t0) * 1000
-    logger.info("[%s] streaming pipeline done in %.0fms, %d sentences TTS'd",
-                call_id, elapsed, len(tts_tasks))
-
-    return LLMAction(action=detected_action, text=full_text)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Phase 2 (livekit): 文本流化输出 — run_streaming_pipeline 的输出改造
+# Phase 2: LLM 流式文本输出（livekit llm_node 消费）
 # ═══════════════════════════════════════════════════════════════════
 
 async def astream_reply_text(
@@ -488,7 +263,7 @@ async def astream_reply_text(
 ) -> AsyncIterator[str]:
     """LLM 流式回复文本迭代器（livekit llm_node 消费，design.md §3.6）。
 
-    节点 ⑥：prompt 三维加载 + 变量渲染与 run_streaming_pipeline 完全一致；
+    节点 ⑥：prompt 三维加载 + 变量渲染；
     输出改为逐 token yield（SDK tokenizer 接管分句→TTS，节点 ⑦ 拆除）。
     action 经 on_action 回调（end/handoff 由 TransvoiceAgent 在 playout 排空后执行）。
     流末持久化对话历史（Redis save_turn + PG fire_insert_turn）。
@@ -508,7 +283,7 @@ async def astream_reply_text(
     tenant_id = state.get("tenant_id", "default")
     scenario = state.get("scenario", "default")
 
-    # ── 构建 Prompt（与 run_streaming_pipeline 逐行一致）──
+    # ── 构建 Prompt ──
     system_prompt = await get_system_prompt(tenant_id, biz_type, scenario)
     logger.info(
         "[%s] tenant=%s biz_type=%s scenario=%s prompt loaded: %d chars",

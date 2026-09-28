@@ -1,7 +1,7 @@
 """Telephony IO 测试。
 
 上行：TelephonyAudioInput 处理链（jitter 平滑 → 降噪直通 → 增益 → AudioFrame）。
-下行：TelephonyAudioOutput（TTSOutputBuffer 语义迁移 + SDK 播放事件硬契约）。
+下行：TelephonyAudioOutput（30ms 匀速排出 + 静音帧保活 + SDK 播放事件硬契约）。
 """
 import asyncio
 

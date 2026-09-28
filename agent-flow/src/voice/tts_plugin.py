@@ -35,7 +35,7 @@ _SINGLE_ATTEMPT_CONN_OPTIONS = APIConnectOptions(max_retry=0)
 
 
 class _SharedTtsConnection:
-    """每 call 一条共享 WS + request_id 解复用（移植自原 tts_ws_client 语义）。
+    """每 call 一条共享 WS + request_id 解复用（句级并发合成共用连接，按 id 路由回包）。
 
     GPU 推理会长时间阻塞 recv，连接参数须容忍慢响应（ping_interval/timeout 放宽、
     max_size 不限），与服务端 ws_server.py 的配置对齐。

@@ -1,8 +1,7 @@
 """Telephony IO —— mod_audio_fork WebSocket ↔ livekit AgentSession 音频桥。
 
-上行链复刻原 StreamingCallHandler._process_near_frame 语义：
-JitterBuffer 平滑 → WebRTCAPM（AEC，远端参考=下行最近帧）或 denoiser → 增益。
-下行链为原 TTSOutputBuffer 语义迁移：30ms 匀速排出 + 静音帧保活 + prebuffer，
+上行链：JitterBuffer 平滑 → WebRTCAPM（AEC，远端参考=下行最近帧）或 denoiser → 增益。
+下行链：30ms 匀速排出 + 静音帧保活 + prebuffer，
 并满足 SDK AudioOutput 播放事件硬契约（flush/clear_buffer 必报 playback_finished，
 漏报会导致 AgentSession wait_for_playout 永久挂死）。
 """
@@ -27,7 +26,7 @@ _SAMPLE_RATE = 16000
 _BYTES_PER_SAMPLE = 2
 _FRAME_DURATION = FRAME_DURATION_MS / 1000.0
 # write 后静音填充窗口：覆盖打断 → ASR → LLM → 首句 TTS 全链路延迟；
-# 静音帧 RMS=0 不触发 barge-in，超窗停发避免回声路径持续活跃（原 TTSOutputBuffer 语义）
+# 静音帧 RMS=0 不触发打断，超窗停发避免回声路径持续活跃
 _SILENCE_TIMEOUT = 120.0
 
 
@@ -98,9 +97,8 @@ class TelephonyAudioInput(AudioInput):
 class TelephonyAudioOutput(AudioOutput):
     """下行 sink：capture_frame 可快于实时 → 内部 30ms 匀速排出 + 静音帧保活。
 
-    原 TTSOutputBuffer 的 paced 循环整体迁移；SDK 契约补充：每个 segment
-    （capture_frame…flush / clear_buffer 界定）必须恰好回报一次 playback_finished，
-    漏报 → AgentSession.wait_for_playout 永久挂死。
+    SDK 契约：每个 segment（capture_frame…flush / clear_buffer 界定）
+    必须恰好回报一次 playback_finished，漏报 → AgentSession.wait_for_playout 永久挂死。
     """
 
     def __init__(
@@ -213,7 +211,7 @@ class TelephonyAudioOutput(AudioOutput):
         self._playback_started = False
         self._frames_sent = 0
 
-    # ── 匀速发送循环（原 TTSOutputBuffer._send_loop 语义）──
+    # ── 匀速发送循环（30ms 匀速排出 + 静音帧保活）──
 
     async def _send_loop(self) -> None:
         try:

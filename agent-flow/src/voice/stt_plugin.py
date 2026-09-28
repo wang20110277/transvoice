@@ -2,7 +2,7 @@
 
 协议：agents 参考映射表 design.md §3.4。要点：
 - 每段 result → SOS→FINAL→EOS 三连（服务端无 onset 信号，SOS 合成于 final 时刻）
-- 文本 < min_final_len 的段整组丢弃（FINAL 与配对 EOS 一并丢，替代原 TurnController.min_text_len）
+- 文本 < min_final_len 的段整组丢弃（FINAL 与配对 EOS 一并丢，过滤无意义短促噪声段）
 - "reset" 协议不映射（SDK 打断体系接管）
 - 上游故障一律 APIConnectionError（SDK 默认 retryable）→ RecognizeStream._main_task
   按 conn_options 重试，防 AgentSession 连续错误计数熔断拆通话
